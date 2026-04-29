@@ -46,9 +46,8 @@ sudo apt install -y nodejs
 ```
 
 ```sh
-INSTALL_AMENT_WS_URL=https://raw.githubusercontent.com/hello-robot/stretch_ros2/refs/heads/humble/stretch_simulation/stretch_create_ament_workspace.sh
-curl -sL $INSTALL_AMENT_WS_URL > /tmp/stretch_create_ament_workspace.sh 
-bash /tmp/stretch_create_ament_workspace.sh
+
+curl -sL https://raw.githubusercontent.com/hello-robot/stretch_ros2/refs/heads/humble/stretch_simulation/stretch_create_ament_workspace.sh > /tmp/stretch_create_ament_workspace.sh && sudo bash /tmp/stretch_create_ament_workspace.sh
 
 # Optional: add source install/setup.bash to .bashrc:
 echo 'source ~/ament_ws/install/setup.bash' >> ~/.bashrc
@@ -101,11 +100,13 @@ pip3 install --upgrade pip #This is important after a fresh install of Ubuntu, f
 
 source ~/ament_ws/install/setup.bash
 # This script is interactive, it will ask you if you want to install robocasa model files:
-bash ~/ament_ws/src/stretch_ros2/stretch_simulation/stretch_mujoco_driver/setup.sh
+sh ~/ament_ws/src/stretch_ros2/stretch_simulation/stretch_mujoco_driver/setup.sh
 
 pip install PyOpenGL==3.1.4 # Fixes AttributeError: module 'OpenGL.EGL' has no attribute 'EGLDeviceEXT'
 
 cd ~/ament_ws
+source ./install/setup.bash
+colcon build
 ros2 launch stretch_simulation stretch_mujoco_driver.launch.py mode:=navigation
 ```
 

@@ -3,6 +3,7 @@
 from functools import cache
 import time
 import copy
+import math
 import pickle
 from pathlib import Path
 from hello_helpers.hello_misc import *
@@ -25,6 +26,10 @@ from trajectory_msgs.msg import (
 )
 
 import hello_helpers.hello_misc as hm
+
+from nav_msgs.msg import Path as NavPath
+from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker
 
 from typing import TYPE_CHECKING
 
@@ -62,18 +67,17 @@ class JointTrajectoryAction:
 
         self.latest_goal_id = 0
 
-    def handle_accepted_callback(self, goal_handle: ServerGoalHandle):
-        # This server only allows one goal at a time
-        if self._goal_handle is not None and self._goal_handle.is_active:
-            self.node.get_logger().info("Aborting previous goal")
-            # Abort the existing goal
-            # self._goal_handle.abort() \TODO(@hello-atharva): This is causing state transition issues.
-        self._goal_handle = goal_handle
+        self.nav_plan_pub = self.node.create_publisher(NavPath, '/nav_plan', 1)
+        self.nav_marker_pub = self.node.create_publisher(Marker, '/nav_plan_marker', 1)
 
-        # Increment goal ID
+    def handle_accepted_callback(self, goal_handle: ServerGoalHandle):
+        # Increment goal ID — signals any running execute_callback to preempt
         self.latest_goal_id += 1
 
-        # Launch an asynch coroutine to execute the goal
+        # Stop the base immediately so the previous goal's motion doesn't continue
+        self.node.sim.set_base_velocity(0.0, 0.0)
+
+        self._goal_handle = goal_handle
         goal_handle.execute()
 
     def goal_callback(self, goal_request):
@@ -101,12 +105,17 @@ class JointTrajectoryAction:
 
     def execute_callback(self, goal_handle):
         self.node.get_logger().info("Executing trajectory...")
+        my_goal_id = self.latest_goal_id
 
         trajectory = goal_handle.request.trajectory
         joint_names = trajectory.joint_names
         last_positions = {name: 0.0 for name in joint_names}
 
         for point in trajectory.points:
+            if self.latest_goal_id != my_goal_id:
+                result = FollowJointTrajectory.Result()
+                goal_handle.abort()
+                return result
             positions: list[float] = point.positions
             velocities: list[float | None] = (
                 point.velocities if point.velocities else [None] * len(joint_names)
@@ -130,15 +139,28 @@ class JointTrajectoryAction:
                     self.node.sim.set_base_velocity(velocity, 0)
                     continue
 
-                self.node.sim.move_to(actuator, target_position)
+                if actuator in (Actuators.base_rotate, Actuators.base_translate):
+                    self._publish_nav_plan(actuator, delta)
+                    self.node.sim.move_by(actuator, delta)
+                else:
+                    self.node.sim.move_to(actuator, target_position)
 
                 actuators_in_use.append(actuator)
 
+            base_commanded = any(
+                a in (Actuators.base_rotate, Actuators.base_translate)
+                for a in actuators_in_use
+            )
+
             for actuator in actuators_in_use:
-                self.node.sim.wait_until_at_setpoint(actuator)
+                if actuator not in (Actuators.base_rotate, Actuators.base_translate):
+                    self.node.sim.wait_until_at_setpoint(actuator)
+
+            if base_commanded:
+                self._wait_for_base_stopped(my_goal_id)
 
             for actuator in [Actuators.left_wheel_vel, Actuators.right_wheel_vel]:
-                self.node.sim.wait_while_is_moving(actuator)
+                self.node.sim.wait_while_is_moving(actuator, position_tolerance=0.01)
 
             # Simulate wait until point.time_from_start
             # self._wait_until(
@@ -149,6 +171,69 @@ class JointTrajectoryAction:
         result = FollowJointTrajectory.Result()
         self.node.get_logger().info("Trajectory execution complete")
         return result
+
+    def _publish_nav_plan(self, actuator: Actuators, delta: float):
+        """Publish a planned path/marker for a base command so it is visible in RViz."""
+        status = self.node.sim.pull_status()
+        x, y, theta = status.base.x, status.base.y, status.base.theta
+        stamp = self.node.get_clock().now().to_msg()
+
+        if actuator == Actuators.base_translate:
+            # Straight-line path from current pose to target pose
+            steps = 10
+            path = NavPath()
+            path.header.stamp = stamp
+            path.header.frame_id = 'odom'
+            for i in range(steps + 1):
+                t = i / steps
+                ps = PoseStamped()
+                ps.header = path.header
+                ps.pose.position.x = x + t * delta * math.cos(theta)
+                ps.pose.position.y = y + t * delta * math.sin(theta)
+                ps.pose.orientation.w = 1.0
+                path.poses.append(ps)
+            self.nav_plan_pub.publish(path)
+
+        elif actuator == Actuators.base_rotate:
+            # Arrow marker showing the new heading after rotation
+            target_theta = theta + delta
+            marker = Marker()
+            marker.header.stamp = stamp
+            marker.header.frame_id = 'odom'
+            marker.ns = 'nav_plan'
+            marker.id = 0
+            marker.type = Marker.ARROW
+            marker.action = Marker.ADD
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+            marker.pose.position.z = 0.1
+            # Quaternion for target heading (rotation around Z)
+            marker.pose.orientation.z = math.sin(target_theta / 2.0)
+            marker.pose.orientation.w = math.cos(target_theta / 2.0)
+            marker.scale.x = 0.4   # arrow length
+            marker.scale.y = 0.05  # arrow width
+            marker.scale.z = 0.05  # arrow height
+            marker.color.r = 1.0
+            marker.color.g = 0.5
+            marker.color.a = 1.0
+            self.nav_marker_pub.publish(marker)
+
+    def _wait_for_base_stopped(self, my_goal_id: int, timeout: float = 10.0, vel_tolerance: float = 0.01):
+        """Wait until both linear and angular base velocities drop to near zero, or goal is preempted."""
+        # Give the mujoco server time to process the command and start moving before
+        # we begin polling velocity — without this the base reads 0 vel and returns immediately.
+        time.sleep(0.3)
+        t_start = time.time()
+        while time.time() - t_start < timeout:
+            if self.latest_goal_id != my_goal_id:
+                return
+            status = self.node.sim.pull_status()
+            x_vel = abs(status.base.x_vel)
+            theta_vel = abs(status.base.theta_vel)
+            if x_vel < vel_tolerance and theta_vel < vel_tolerance:
+                return
+            time.sleep(0.05)
+        self.node.get_logger().warn('_wait_for_base_stopped: timeout waiting for base to stop')
 
     def _wait_until(self, seconds):
         loop_rate = self.node.create_rate(10)

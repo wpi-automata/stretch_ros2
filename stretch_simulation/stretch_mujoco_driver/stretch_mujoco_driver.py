@@ -38,7 +38,8 @@ from geometry_msgs.msg import TransformStamped
 from std_srvs.srv import Trigger
 from std_srvs.srv import SetBool
 
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import LaserScan
 from sensor_msgs.msg import Image
@@ -665,6 +666,15 @@ class StretchMujocoDriver(Node):
         odom.twist.twist.angular.z = theta_vel
         self.odom_pub.publish(odom)
 
+        # Accumulate and publish trajectory path
+        pose_stamped = PoseStamped()
+        pose_stamped.header.stamp = current_time
+        pose_stamped.header.frame_id = self.odom_frame_id
+        pose_stamped.pose = odom.pose.pose
+        self._trajectory_path.header.stamp = current_time
+        self._trajectory_path.poses.append(pose_stamped)
+        self.path_pub.publish(self._trajectory_path)
+
         ##################################################
         # Publish Stretch Gamepad status
         # b = Bool()
@@ -1147,6 +1157,9 @@ class StretchMujocoDriver(Node):
         self.max_arm_height = 1.1
 
         self.odom_pub = self.create_publisher(Odometry, "odom", 1)
+        self.path_pub = self.create_publisher(Path, "/robot_trajectory", 1)
+        self._trajectory_path = Path()
+        self._trajectory_path.header.frame_id = "odom"
         self.laser_scan_pub = self.create_publisher(
             LaserScan,
             "/scan_filtered",

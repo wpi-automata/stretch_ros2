@@ -69,7 +69,7 @@ def generate_launch_description():
     )
     ld.add_action(
         DeclareLaunchArgument(
-            "use_cameras", default_value="false", choices=["true", "false"]
+            "use_cameras", default_value="true", choices=["true", "false"]
         )
     )
     ld.add_action(

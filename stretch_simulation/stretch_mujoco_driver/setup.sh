@@ -1,9 +1,11 @@
-#!/usr/bin/env bash
+#!/bin/sh
+
+SCRIPT_DIR=$(dirname "$0")
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
 
 # ------------------------------------------------------------------
 # Force mujoco version required by robocasa/stretch_mujoco
@@ -12,7 +14,9 @@ CONSTRAINT_FILE=/tmp/stretch_mujoco_constraints.txt
 echo "mujoco==3.2.6" > $CONSTRAINT_FILE
 export PIP_CONSTRAINT=$CONSTRAINT_FILE
 
-cd ~/repos
+mkdir -p dependencies
+
+cd dependencies
 
 # Install stretch_mujoco and robocasa:
 git clone https://github.com/hello-robot/stretch_mujoco.git --depth 1

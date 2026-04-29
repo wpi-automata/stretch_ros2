@@ -4,8 +4,7 @@ This guide provides instructions for setting up and running the Stretch Simulati
 
 ## Prerequisites
 
-Note: This tutorial was written for Ubuntu 22.04 (or compatible Linux distribution). It is possible to run this Dockerfile on Windows or MacOS, however, this tutorial does not cover enabling hardware acceleration for those platforms.
-
+- Ubuntu 22.04 (or compatible Linux distribution)
 - Nvidia GPU with recent drivers installed
 - Docker installed on your system
 - Minimum 16GB RAM (32GB recommended)
@@ -21,7 +20,7 @@ The following commands will install the Nvidia Container Toolkit, test GPU acces
 
 
 ```bash
-# 1. Install Nvidia Container Toolkit (Ubuntu only)
+# 1. Install Nvidia Container Toolkit
 make install-nvidia-toolkit
 
 # 2. Test GPU access
@@ -72,8 +71,6 @@ newgrp docker
 ```
 
 ## 2. Install Nvidia Container Toolkit
-
-Note: This tutorial was written for Ubuntu 22.04 (or compatible Linux distribution). It is possible to run this Dockerfile on Windows or MacOS, however, this tutorial does not cover enabling hardware acceleration for those platforms.
 
 The Nvidia Container Toolkit allows Docker containers to access your GPU for hardware acceleration.
 
@@ -135,7 +132,7 @@ The same `stretch_create_ament_workspace.sh` script works in both Docker and man
 Run the container with GPU support and X11 forwarding for GUI applications:
 
 ```bash
-# Allow X11 connections from Docker (Ubuntu Only)
+# Allow X11 connections from Docker
 xhost +local:docker
 
 # Run the container
@@ -233,13 +230,12 @@ docker compose up
 ros2 launch stretch_simulation stretch_mujoco_driver.launch.py \
     use_mujoco_viewer:=true \
     mode:=navigation \
-    use_rviz:=false \
     robocasa_layout:='G-shaped' \
     robocasa_style:=Modern_1
 
 # Terminal 2: Launch navigation
 ros2 launch stretch_nav2 navigation.launch.py \
-    map:=/root/ament_ws/src/stretch_ros2/stretch_simulation/maps/gshaped_modern1_robocasa.yaml \
+    map:=~/ament_ws/src/stretch_ros2/stretch_simulation/maps/gshaped_modern1_robocasa.yaml \
     use_sim_time:=true \
     use_rviz:=true \
     teleop_type:=none
