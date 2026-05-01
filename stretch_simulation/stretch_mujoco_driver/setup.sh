@@ -19,7 +19,7 @@ mkdir -p dependencies
 cd dependencies
 
 # Install stretch_mujoco and robocasa:
-git clone https://github.com/hello-robot/stretch_mujoco.git --depth 1
+git clone git@github.com:wpi-automata/stretch_mujoco.git --depth 1
 
 cd stretch_mujoco
 
