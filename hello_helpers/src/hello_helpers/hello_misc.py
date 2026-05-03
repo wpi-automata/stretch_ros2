@@ -30,6 +30,7 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import String
 import threading
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
 
@@ -396,7 +397,8 @@ class HelloNode(Node):
         self.joint_states_subscriber = self.create_subscription(JointState, '/stretch/joint_states', self.joint_states_callback, 10, callback_group=reentrant_cb)
         self.mode_subscriber = self.create_subscription(String, '/mode', self.mode_callback, 10, callback_group=reentrant_cb)
         
-        self.point_cloud_subscriber = self.create_subscription(PointCloud2, '/camera/depth/color/points', self.point_cloud_callback, 10, callback_group=reentrant_cb)
+        sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.point_cloud_subscriber = self.create_subscription(PointCloud2, '/camera/depth/color/points', self.point_cloud_callback, sensor_qos, callback_group=reentrant_cb)
         self.point_cloud_pub = self.create_publisher(PointCloud2, '/' + node_topic_namespace + '/point_cloud2', 10, callback_group=reentrant_cb)
 
         self.home_the_robot_service = self.create_client(Trigger, '/home_the_robot', callback_group=reentrant_cb)

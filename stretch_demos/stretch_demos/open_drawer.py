@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import rclpy
 import rclpy.logging
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from cv_bridge import CvBridge
 from rclpy.callback_groups import ReentrantCallbackGroup
 from sensor_msgs.msg import Image, JointState
@@ -56,8 +56,6 @@ class OpenDrawerNode(hm.HelloNode):
         self.lift_position = lift_position
 
     def color_image_callback(self, msg):
-        print('[OpenDrawer]   got image', flush=True)
-        print(f'[OpenDrawer]   image lock: {self.image_lock}', flush=True)
         with self.image_lock:
             self.color_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
@@ -416,26 +414,21 @@ class OpenDrawerNode(hm.HelloNode):
         self.move_base = nv.MoveBase(self)
         self.callback_group = ReentrantCallbackGroup()
 
-        reliable_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
-
         self.joint_states_subscriber = self.create_subscription(
             JointState, '/stretch/joint_states',
-            self.joint_states_callback, qos_profile=reliable_qos,
+            self.joint_states_callback, qos_profile=0,
             callback_group=self.callback_group
         )
 
+        sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
             Image, '/camera/color/image_raw',
-            self.color_image_callback, qos_profile=10,
+            self.color_image_callback, qos_profile=sensor_qos,
             callback_group=self.callback_group
         )
         self.create_subscription(
             Image, '/camera/depth/image_rect_raw',
-            self.depth_image_callback, qos_profile=1,
+            self.depth_image_callback, qos_profile=sensor_qos,
             callback_group=self.callback_group
         )
 

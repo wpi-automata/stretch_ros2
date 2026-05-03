@@ -27,7 +27,11 @@ setup(
             'open_drawer = stretch_demos.open_drawer:main',
             'grasp_object = stretch_demos.grasp_object:main',
             'handover_object = stretch_demos.handover_object:main',
-            'hello_world = stretch_demos.hello_world:main'
+            'hello_world = stretch_demos.hello_world:main',
+            'drawer_grasp_server = stretch_demos.drawer_grasp_server:main',
+            'drawer_explorer = stretch_demos.drawer_explorer:main',
+            'search_for_drawers = stretch_demos.search_for_drawers:main',
+            'open_drawers = stretch_demos.open_drawers:main'
         ],
     },
 )

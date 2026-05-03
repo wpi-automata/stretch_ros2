@@ -1,0 +1,16 @@
+# Request: image of detected drawer + 3D bounding box
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image
+# 3D bounding box corners (8 points, world frame)
+geometry_msgs/Point[8] bbox_corners
+# Centroid of the detected drawer face
+geometry_msgs/Point drawer_centroid
+# Normal vector of the drawer face (pull direction)
+geometry_msgs/Vector3 pull_direction
+# Camera-to-world transform used for projection
+geometry_msgs/Transform camera_to_world
+---
+# Response: grasp point and result
+geometry_msgs/Point grasp_point
+bool success
+string message

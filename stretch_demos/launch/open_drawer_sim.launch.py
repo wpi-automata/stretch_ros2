@@ -35,5 +35,5 @@ def generate_launch_description():
 
     return LaunchDescription(declare_configurable_parameters(configurable_parameters) + [
         stretch_funmap,
-        open_drawer
+        open_drawer,
         ])

@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>stretch_drawer_interfaces</name>
+  <version>0.1.0</version>
+  <description>Service interfaces for Stretch3 drawer manipulation</description>
+  <maintainer email="tabergeron@wpi.edu">Tim Bergeron</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

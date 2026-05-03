@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""
+Search for Drawers: ROS2 node that explores the environment, runs Detic
+(with LVIS vocabulary from deticdatasets) on both cameras to detect drawers
+and handles, back-projects to world (odom) coordinates, deduplicates in global
+frame, checks reachability, and publishes a list of discovered drawers.
+
+Two exploration modes (set via 'exploration_mode' ROS2 parameter):
+  - 'wall_following' (default): lidar-based wall following around the room perimeter
+  - 'frontier': funmap's built-in frontier exploration (drive-to-scan + head-scan)
+
+All drawer positions are stored in the odom frame. Deduplication compares
+new detections against ALL previously found drawers in odom coordinates,
+ensuring drawers are never double-counted regardless of which camera or
+position discovered them.
+
+Subscribes to:
+  /camera/color/image_raw (head camera RGB)
+  /camera/depth/image_rect_raw (head camera depth)
+  /camera/color/camera_info (head camera intrinsics)
+  /gripper_camera/image_raw (wrist camera RGB)
+  /gripper_camera/depth/image_rect_raw (wrist camera depth)
+  /gripper_camera/camera_info (wrist camera intrinsics)
+  /scan (lidar — wall_following mode only)
+
+Publishes:
+  /search_drawers/discovered_drawers (visualization_msgs/MarkerArray)
+  /search_drawers/detection_image (sensor_msgs/Image)
+
+Services provided:
+  /search_drawers/get_drawers (std_srvs/srv/Trigger) — returns JSON of all drawers
+
+Services called (frontier mode only):
+  /funmap/trigger_head_scan (std_srvs/srv/Trigger)
+  /funmap/trigger_drive_to_scan (std_srvs/srv/Trigger)
+"""
+
+import json
+import math
+import os
+import sys
+import threading
+import time
+
+import cv2
+import numpy as np
+import rclpy
+import rclpy.logging
+from cv_bridge import CvBridge
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image, CameraInfo, JointState, LaserScan
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker, MarkerArray
+from std_srvs.srv import Trigger
+
+import hello_helpers.hello_misc as hm
+
+import torch
+from detectron2.config import get_cfg
+from detectron2.engine import DefaultPredictor
+from detectron2.data import MetadataCatalog
+
+sys.path.insert(0, os.path.expanduser('~/Detic'))
+sys.path.insert(0, os.path.expanduser('~/Detic/third_party/CenterNet2'))
+from detic.config import add_detic_config
+from centernet.config import add_centernet_config
+
+# --- Configuration ---
+
+DETIC_DATASETS_PATH = os.environ.get(
+    'DETIC_DATASETS_PATH',
+    os.path.expanduser('~/ament_ws/src/stretch_ros2/deticdatasets'))
+
+DETIC_MODEL_WEIGHTS = os.environ.get(
+    'DETIC_MODEL_WEIGHTS',
+    os.path.expanduser('~/Detic/models/Detic_LVISBASE_IN21k_SwinB_896b32_4x_ft4x_max-size.pth'))
+
+DETIC_CONFIG_FILE = os.environ.get(
+    'DETIC_CONFIG_FILE',
+    os.path.expanduser('~/Detic/configs/Detic_LbaseCCcam_SwinB_896b32_4x_ft4x_max-size.yaml'))
+
+LVIS_CLIP_EMBEDDINGS = os.path.join(DETIC_DATASETS_PATH, 'metadata', 'lvis_v1_clip_a+cname.npy')
+
+# Camera topics
+HEAD_COLOR_TOPIC = '/camera/color/image_raw'
+HEAD_DEPTH_TOPIC = '/camera/depth/image_rect_raw'
+HEAD_INFO_TOPIC = '/camera/color/camera_info'
+HEAD_OPTICAL_FRAME = 'camera_color_optical_frame'
+
+WRIST_COLOR_TOPIC = '/gripper_camera/image_raw'
+WRIST_DEPTH_TOPIC = '/gripper_camera/depth/image_rect_raw'
+WRIST_INFO_TOPIC = '/gripper_camera/camera_info'
+WRIST_OPTICAL_FRAME = 'gripper_camera_color_optical_frame'
+
+# Head scan positions
+HEAD_PAN_POSITIONS = [-1.2, -0.8, -0.4, 0.0, 0.4, 0.8]
+HEAD_TILT_SEARCH = -0.5
+
+# Reachability workspace limits (Stretch3 lateral arm)
+EEF_HEIGHT_MIN = 0.2
+EEF_HEIGHT_MAX = 1.3
+MAX_LATERAL_REACH = 0.93
+MIN_LATERAL_REACH = 0.45
+
+# Deduplication threshold in odom frame (meters)
+DUPLICATE_DISTANCE_THRESHOLD_M = 0.5
+
+# Wall-following parameters
+WALL_FOLLOW_DISTANCE_M = 1.0
+FORWARD_SPEED_M = 0.3
+MIN_STEPS_BEFORE_LOOP_CHECK = 20
+
+# Frontier parameters
+MAX_FRONTIER_FAILURES = 3
+
+# Detic class names of interest
+DRAWER_CLASS_NAMES = ['drawer', 'cabinet', 'chest_of_drawers', 'filing_cabinet']
+HANDLE_CLASS_NAMES = ['handle', 'knob', 'doorknob', 'door_handle', 'pull']
+
+
+def build_detic_predictor(confidence_threshold=0.3):
+    """Build a Detic predictor configured for LVIS open-vocabulary detection."""
+    cfg = get_cfg()
+    add_centernet_config(cfg)
+    add_detic_config(cfg)
+    cfg.merge_from_file(DETIC_CONFIG_FILE)
+
+    cfg.MODEL.WEIGHTS = DETIC_MODEL_WEIGHTS
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = confidence_threshold
+    cfg.MODEL.ROI_BOX_HEAD.ZEROSHOT_WEIGHT_PATH = 'rand'
+    cfg.MODEL.ROI_HEADS.ONE_CLASS_PER_PROPOSAL = True
+
+    cfg.MODEL.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg.freeze()
+
+    predictor = DefaultPredictor(cfg)
+
+    metadata = MetadataCatalog.get(cfg.DATASETS.TEST[0])
+    classifier = np.load(LVIS_CLIP_EMBEDDINGS)
+    classifier = torch.tensor(classifier, dtype=torch.float32)
+    classifier = torch.nn.functional.normalize(classifier, p=2, dim=1)
+    predictor.model.roi_heads.box_predictor[0].cls_score.zeroshot_weight = classifier.to(cfg.MODEL.DEVICE)
+    predictor.model.roi_heads.box_predictor[0].cls_score.zeroshot_weight.requires_grad = False
+
+    return predictor, metadata
+
+
+class DrawerDetection:
+    """A single detected drawer with its handle."""
+
+    def __init__(self, drawer_bbox_px, handle_center_px, confidence, camera_name):
+        self.drawer_bbox_px = drawer_bbox_px
+        self.handle_center_px = handle_center_px
+        self.confidence = confidence
+        self.camera_name = camera_name
+
+
+class DiscoveredDrawer:
+    """A drawer registered in the odom (world) frame."""
+
+    def __init__(self, handle_world_xyz, rgb_image, drawer_bbox_px, handle_bbox_px, reachable):
+        self.handle_world_xyz = handle_world_xyz  # np.array(3,) in odom frame
+        self.rgb_image = rgb_image
+        self.drawer_bbox_px = drawer_bbox_px
+        self.handle_bbox_px = handle_bbox_px
+        self.reachable = reachable
+
+
+class SearchForDrawersNode(hm.HelloNode):
+
+    def __init__(self):
+        hm.HelloNode.__init__(self)
+        self.rate = 10.0
+        self.bridge = CvBridge()
+        self.callback_group = None
+
+        # Camera data
+        self.head_color = None
+        self.head_depth = None
+        self.head_info = None
+        self.wrist_color = None
+        self.wrist_depth = None
+        self.wrist_info = None
+        self.image_lock = threading.Lock()
+
+        # Lidar (wall_following mode)
+        self.latest_scan = None
+        self.scan_lock = threading.Lock()
+
+        # Joint state
+        self.joint_states = None
+        self.joint_states_lock = threading.Lock()
+
+        # Discovered drawers (all in odom frame for global deduplication)
+        self.discovered_drawers = []
+        self.drawers_lock = threading.Lock()
+
+        # Detic
+        self.predictor = None
+        self.metadata = None
+        self.class_names = None
+
+        # Funmap service clients (frontier mode)
+        self.head_scan_client = None
+        self.drive_to_scan_client = None
+
+        # Exploration state
+        self.exploration_complete = False
+        self.exploration_mode = 'wall_following'
+
+    # --- Callbacks ---
+
+    def joint_states_callback(self, msg):
+        with self.joint_states_lock:
+            self.joint_states = msg
+
+    def head_color_cb(self, msg):
+        with self.image_lock:
+            self.head_color = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+    def head_depth_cb(self, msg):
+        with self.image_lock:
+            self.head_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
+
+    def head_info_cb(self, msg):
+        self.head_info = msg
+
+    def wrist_color_cb(self, msg):
+        with self.image_lock:
+            self.wrist_color = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+    def wrist_depth_cb(self, msg):
+        with self.image_lock:
+            self.wrist_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
+
+    def wrist_info_cb(self, msg):
+        self.wrist_info = msg
+
+    def scan_cb(self, msg):
+        with self.scan_lock:
+            self.latest_scan = msg
+
+    # --- Detic Detection ---
+
+    def run_detic(self, rgb_image):
+        """
+        Run Detic on an RGB image. Returns list of DrawerDetection objects.
+        Each drawer detection includes the handle center if a handle is found
+        within the drawer bounding box.
+        """
+        outputs = self.predictor(rgb_image)
+        instances = outputs['instances'].to('cpu')
+
+        boxes = instances.pred_boxes.tensor.numpy()
+        scores = instances.scores.numpy()
+        classes = instances.pred_classes.numpy()
+
+        drawer_detections = []
+        handle_detections = []
+
+        for i in range(len(classes)):
+            class_name = self.class_names[classes[i]]
+            box = boxes[i]
+
+            if class_name in DRAWER_CLASS_NAMES:
+                drawer_detections.append({
+                    'bbox': box,
+                    'score': float(scores[i]),
+                    'class': class_name,
+                })
+            elif class_name in HANDLE_CLASS_NAMES:
+                handle_detections.append({
+                    'bbox': box,
+                    'score': float(scores[i]),
+                    'class': class_name,
+                    'center': ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2),
+                })
+
+        results = []
+        for drawer in drawer_detections:
+            db = drawer['bbox']
+            matched_handle = None
+            best_handle_score = 0.0
+
+            for handle in handle_detections:
+                hc = handle['center']
+                if db[0] <= hc[0] <= db[2] and db[1] <= hc[1] <= db[3]:
+                    if handle['score'] > best_handle_score:
+                        best_handle_score = handle['score']
+                        matched_handle = handle
+
+            handle_center = None
+            if matched_handle is not None:
+                handle_center = matched_handle['center']
+
+            results.append(DrawerDetection(
+                drawer_bbox_px=tuple(db.astype(int)),
+                handle_center_px=handle_center,
+                confidence=drawer['score'],
+                camera_name='',
+            ))
+
+        results.sort(key=lambda d: d.confidence, reverse=True)
+        return results
+
+    # --- 3D Geometry (all transforms go to odom frame) ---
+
+    def pixel_to_odom(self, px, py, depth_image, camera_info, optical_frame):
+        """
+        Back-project a single pixel to the odom (world) frame.
+        All drawer positions are stored in odom for consistent global deduplication.
+        Returns np.array(3,) or None.
+        """
+        if camera_info is None or depth_image is None:
+            return None
+
+        fx = camera_info.k[0]
+        fy = camera_info.k[4]
+        cx = camera_info.k[2]
+        cy = camera_info.k[5]
+        if fx == 0 or fy == 0:
+            return None
+
+        px_int, py_int = int(round(px)), int(round(py))
+        h, w = depth_image.shape[:2]
+        if px_int < 0 or px_int >= w or py_int < 0 or py_int >= h:
+            return None
+
+        radius = 5
+        y_min = max(0, py_int - radius)
+        y_max = min(h, py_int + radius + 1)
+        x_min = max(0, px_int - radius)
+        x_max = min(w, px_int + radius + 1)
+        depth_patch = depth_image[y_min:y_max, x_min:x_max]
+        valid_depths = depth_patch[
+            (depth_patch > 0.1) & (depth_patch < 5.0) & np.isfinite(depth_patch)]
+
+        if len(valid_depths) == 0:
+            return None
+
+        depth = float(np.median(valid_depths))
+
+        x_cam = (px - cx) * depth / fx
+        y_cam = (py - cy) * depth / fy
+        z_cam = depth
+
+        cam_to_odom, _ = hm.get_p1_to_p2_matrix(
+            optical_frame, 'odom', self.tf2_buffer, timeout_s=1.0)
+        if cam_to_odom is None:
+            return None
+
+        pt_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        pt_odom = (cam_to_odom @ pt_cam)[:3]
+
+        if pt_odom[2] < 0.0 or pt_odom[2] > 3.0:
+            return None
+
+        return pt_odom
+
+    # --- Global Deduplication (in odom frame) ---
+
+    def is_duplicate(self, world_xyz):
+        """
+        Check if a drawer at this odom-frame position was already discovered.
+        Compares against ALL previously found drawers using Euclidean distance
+        in 3D world coordinates. This ensures the same physical drawer is never
+        counted twice, regardless of which camera or robot position detected it.
+        """
+        with self.drawers_lock:
+            for d in self.discovered_drawers:
+                dist = np.linalg.norm(d.handle_world_xyz - world_xyz)
+                if dist < DUPLICATE_DISTANCE_THRESHOLD_M:
+                    return True
+        return False
+
+    # --- Reachability ---
+
+    def is_reachable(self, world_xyz):
+        """
+        Check if a point in odom frame is within the Stretch3 end-effector workspace.
+        """
+        z = world_xyz[2]
+        if z < EEF_HEIGHT_MIN or z > EEF_HEIGHT_MAX:
+            return False
+
+        base_to_odom, _ = hm.get_p1_to_p2_matrix(
+            'base_link', 'odom', self.tf2_buffer, timeout_s=1.0)
+        if base_to_odom is None:
+            return False
+
+        robot_pos = base_to_odom[:3, 3]
+        dx = world_xyz[0] - robot_pos[0]
+        dy = world_xyz[1] - robot_pos[1]
+        lateral_dist = math.sqrt(dx * dx + dy * dy)
+
+        return MIN_LATERAL_REACH <= lateral_dist <= MAX_LATERAL_REACH
+
+    # --- Detection + Registration Pipeline ---
+
+    def process_camera(self, color, depth, info, optical_frame, camera_name):
+        """
+        Run Detic on a camera frame. For each detected drawer, back-project
+        the handle (or drawer center) to the odom frame, check for duplicates
+        against the global list, and register new drawers.
+        """
+        if color is None or depth is None or info is None:
+            return
+
+        detections = self.run_detic(color)
+        if not detections:
+            return
+
+        for det in detections:
+            det.camera_name = camera_name
+
+            if det.handle_center_px is not None:
+                px, py = det.handle_center_px
+            else:
+                bbox = det.drawer_bbox_px
+                px = (bbox[0] + bbox[2]) / 2.0
+                py = (bbox[1] + bbox[3]) / 2.0
+
+            world_xyz = self.pixel_to_odom(px, py, depth, info, optical_frame)
+            if world_xyz is None:
+                self.logger.info(f'[{camera_name}] Could not back-project detection to odom frame')
+                continue
+
+            if self.is_duplicate(world_xyz):
+                self.logger.info(
+                    f'[{camera_name}] Drawer at odom ({world_xyz[0]:.2f}, '
+                    f'{world_xyz[1]:.2f}, {world_xyz[2]:.2f}) already known — skipping')
+                continue
+
+            reachable = self.is_reachable(world_xyz)
+
+            annotated = color.copy()
+            db = det.drawer_bbox_px
+            box_color = (0, 255, 0) if reachable else (0, 0, 255)
+            cv2.rectangle(annotated, (db[0], db[1]), (db[2], db[3]), box_color, 2)
+            cv2.putText(annotated, f'drawer {det.confidence:.2f}',
+                        (db[0], db[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
+
+            if det.handle_center_px is not None:
+                hx, hy = int(det.handle_center_px[0]), int(det.handle_center_px[1])
+                cv2.circle(annotated, (hx, hy), 8, (255, 0, 255), 2)
+                cv2.putText(annotated, 'handle', (hx + 10, hy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
+            drawer = DiscoveredDrawer(
+                handle_world_xyz=world_xyz,
+                rgb_image=annotated,
+                drawer_bbox_px=det.drawer_bbox_px,
+                handle_bbox_px=det.handle_center_px,
+                reachable=reachable,
+            )
+
+            with self.drawers_lock:
+                self.discovered_drawers.append(drawer)
+                idx = len(self.discovered_drawers)
+
+            self.logger.info(
+                f'[{camera_name}] NEW drawer #{idx} at odom '
+                f'({world_xyz[0]:.2f}, {world_xyz[1]:.2f}, {world_xyz[2]:.2f}) '
+                f'reachable={reachable}')
+
+            try:
+                det_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
+                self.detection_pub.publish(det_msg)
+            except Exception:
+                pass
+
+        self.publish_drawer_markers()
+
+    # --- Camera Scanning (shared by both modes) ---
+
+    def scan_with_cameras(self):
+        """Pan head camera across positions and check both cameras for drawers."""
+        self.move_to_pose({'joint_head_tilt': HEAD_TILT_SEARCH})
+        time.sleep(0.3)
+
+        for pan_angle in HEAD_PAN_POSITIONS:
+            self.move_to_pose({'joint_head_pan': pan_angle})
+            time.sleep(0.8)
+
+            with self.image_lock:
+                h_color = self.head_color.copy() if self.head_color is not None else None
+                h_depth = self.head_depth.copy() if self.head_depth is not None else None
+
+            self.process_camera(h_color, h_depth, self.head_info,
+                                HEAD_OPTICAL_FRAME, 'head')
+
+        self.move_to_pose({'joint_head_pan': 0.0, 'joint_wrist_yaw': 1.57})
+        time.sleep(0.8)
+
+        with self.image_lock:
+            w_color = self.wrist_color.copy() if self.wrist_color is not None else None
+            w_depth = self.wrist_depth.copy() if self.wrist_depth is not None else None
+
+        self.process_camera(w_color, w_depth, self.wrist_info,
+                            WRIST_OPTICAL_FRAME, 'wrist')
+
+    # ===================================================================
+    # Wall-Following Exploration
+    # ===================================================================
+
+    def get_wall_distance_right(self):
+        """Get average distance to the wall on the right side from lidar scan."""
+        with self.scan_lock:
+            if self.latest_scan is None:
+                return None
+            scan = self.latest_scan
+
+        angle_min = scan.angle_min
+        angle_increment = scan.angle_increment
+        ranges = np.array(scan.ranges)
+
+        target_min_angle = -2.094  # -120 deg
+        target_max_angle = -1.047  # -60 deg
+
+        idx_min = max(0, int((target_min_angle - angle_min) / angle_increment))
+        idx_max = min(len(ranges) - 1, int((target_max_angle - angle_min) / angle_increment))
+
+        if idx_min >= idx_max:
+            return None
+
+        right_ranges = ranges[idx_min:idx_max]
+        valid = right_ranges[np.isfinite(right_ranges) & (right_ranges > 0.1) & (right_ranges < 10.0)]
+
+        if len(valid) == 0:
+            return None
+
+        return float(np.median(valid))
+
+    def get_front_clearance(self):
+        """Get minimum distance in front of the robot from lidar."""
+        with self.scan_lock:
+            if self.latest_scan is None:
+                return None
+            scan = self.latest_scan
+
+        angle_min = scan.angle_min
+        angle_increment = scan.angle_increment
+        ranges = np.array(scan.ranges)
+
+        target_min_angle = -0.35  # -20 deg
+        target_max_angle = 0.35   # +20 deg
+
+        idx_min = max(0, int((target_min_angle - angle_min) / angle_increment))
+        idx_max = min(len(ranges) - 1, int((target_max_angle - angle_min) / angle_increment))
+
+        if idx_min >= idx_max:
+            return None
+
+        front_ranges = ranges[idx_min:idx_max]
+        valid = front_ranges[np.isfinite(front_ranges) & (front_ranges > 0.1) & (front_ranges < 10.0)]
+
+        if len(valid) == 0:
+            return None
+
+        return float(np.min(valid))
+
+    def follow_perimeter_step(self):
+        """
+        One step of wall-following to circle the room perimeter.
+        Keeps the wall on the right at ~WALL_FOLLOW_DISTANCE_M.
+        """
+        right_dist = self.get_wall_distance_right()
+        front_dist = self.get_front_clearance()
+
+        if front_dist is not None and front_dist < 0.5:
+            self.logger.info(f'Front obstacle at {front_dist:.2f}m, turning left')
+            self.move_to_pose({'rotate_mobile_base': 0.6})
+            time.sleep(0.8)
+            return
+
+        if right_dist is None:
+            self.move_to_pose({'rotate_mobile_base': -0.3})
+            time.sleep(0.5)
+            return
+
+        error = right_dist - WALL_FOLLOW_DISTANCE_M
+        if abs(error) > 0.2:
+            correction = -0.3 if error > 0 else 0.3
+            self.move_to_pose({'rotate_mobile_base': correction})
+            time.sleep(0.4)
+
+        self.move_to_pose({'translate_mobile_base': FORWARD_SPEED_M})
+        time.sleep(0.8)
+
+    def wall_following_loop(self):
+        """
+        Explore by following walls around the room perimeter.
+        Scans cameras at each stop, detects when a full loop is completed.
+        """
+        self.logger.info('Starting wall-following exploration')
+
+        start_to_odom, _ = hm.get_p1_to_p2_matrix(
+            'base_link', 'odom', self.tf2_buffer, timeout_s=2.0)
+        start_position = start_to_odom[:3, 3] if start_to_odom is not None else None
+        step_count = 0
+
+        while rclpy.ok() and not self.exploration_complete:
+            step_count += 1
+            self.logger.info(f'=== Wall-following step {step_count} ===')
+
+            # Scan cameras with Detic
+            self.scan_with_cameras()
+
+            # Stow arm after scanning
+            self.move_to_pose({
+                'wrist_extension': 0.01,
+                'joint_head_pan': 0.0,
+                'joint_head_tilt': 0.0,
+            })
+            time.sleep(0.3)
+
+            # Move along perimeter
+            self.follow_perimeter_step()
+
+            # Check if we've completed the loop
+            if start_position is not None and step_count > MIN_STEPS_BEFORE_LOOP_CHECK:
+                current_to_odom, _ = hm.get_p1_to_p2_matrix(
+                    'base_link', 'odom', self.tf2_buffer, timeout_s=1.0)
+                if current_to_odom is not None:
+                    current_pos = current_to_odom[:3, 3]
+                    dist_to_start = np.linalg.norm(current_pos[:2] - start_position[:2])
+                    if dist_to_start < 0.5:
+                        self.logger.info('Completed perimeter loop!')
+                        self.exploration_complete = True
+
+    # ===================================================================
+    # Frontier Exploration (via funmap)
+    # ===================================================================
+
+    def call_funmap_head_scan(self):
+        """Call funmap's head scan service to map from current position."""
+        if not self.head_scan_client.wait_for_service(timeout_sec=5.0):
+            self.logger.warn('/funmap/trigger_head_scan service not available')
+            return False
+
+        req = Trigger.Request()
+        future = self.head_scan_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=60.0)
+
+        if future.result() is not None:
+            result = future.result()
+            self.logger.info(f'Head scan: success={result.success}, msg="{result.message}"')
+            return result.success
+        self.logger.warn('Head scan service call timed out')
+        return False
+
+    def call_funmap_drive_to_scan(self):
+        """
+        Call funmap's drive-to-scan service. Finds the next unexplored frontier
+        and navigates there. Returns False if no more frontiers exist.
+        """
+        if not self.drive_to_scan_client.wait_for_service(timeout_sec=5.0):
+            self.logger.warn('/funmap/trigger_drive_to_scan service not available')
+            return False
+
+        req = Trigger.Request()
+        future = self.drive_to_scan_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=120.0)
+
+        if future.result() is not None:
+            result = future.result()
+            self.logger.info(f'Drive to scan: success={result.success}, msg="{result.message}"')
+            return result.success
+        self.logger.warn('Drive to scan service call timed out')
+        return False
+
+    def frontier_loop(self):
+        """
+        Explore using funmap frontier exploration:
+        1. Head scan to build/update lidar map
+        2. Scan cameras with Detic
+        3. Drive to next frontier
+        4. Repeat until no more frontiers
+        """
+        self.logger.info('Starting frontier exploration with funmap')
+
+        consecutive_failures = 0
+        scan_count = 0
+
+        while rclpy.ok() and not self.exploration_complete:
+            scan_count += 1
+            self.logger.info(f'=== Frontier exploration step {scan_count} ===')
+
+            # Build/update lidar map
+            self.logger.info('Calling funmap head scan...')
+            self.call_funmap_head_scan()
+            time.sleep(0.5)
+
+            # Scan cameras with Detic
+            self.logger.info('Scanning cameras with Detic...')
+            self.scan_with_cameras()
+
+            # Stow arm after scanning
+            self.move_to_pose({
+                'wrist_extension': 0.01,
+                'joint_head_pan': 0.0,
+                'joint_head_tilt': 0.0,
+            })
+            time.sleep(0.3)
+
+            # Drive to next frontier
+            self.logger.info('Calling funmap drive-to-scan (frontier exploration)...')
+            success = self.call_funmap_drive_to_scan()
+
+            if success:
+                consecutive_failures = 0
+                time.sleep(0.5)
+            else:
+                consecutive_failures += 1
+                self.logger.info(
+                    f'No frontier found ({consecutive_failures}/{MAX_FRONTIER_FAILURES})')
+
+                if consecutive_failures >= MAX_FRONTIER_FAILURES:
+                    self.logger.info('No more frontiers — room fully explored!')
+                    self.exploration_complete = True
+
+    # ===================================================================
+    # Visualization
+    # ===================================================================
+
+    def publish_drawer_markers(self):
+        """Publish visualization markers for all discovered drawers in odom frame."""
+        marker_array = MarkerArray()
+        with self.drawers_lock:
+            for i, d in enumerate(self.discovered_drawers):
+                m = Marker()
+                m.header.frame_id = 'odom'
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = 'search_drawers'
+                m.id = i
+                m.type = Marker.SPHERE
+                m.action = Marker.ADD
+                m.pose.position.x = float(d.handle_world_xyz[0])
+                m.pose.position.y = float(d.handle_world_xyz[1])
+                m.pose.position.z = float(d.handle_world_xyz[2])
+                m.pose.orientation.w = 1.0
+                m.scale.x = 0.1
+                m.scale.y = 0.1
+                m.scale.z = 0.1
+                if d.reachable:
+                    m.color.r = 0.0
+                    m.color.g = 1.0
+                    m.color.b = 0.0
+                else:
+                    m.color.r = 1.0
+                    m.color.g = 0.0
+                    m.color.b = 0.0
+                m.color.a = 0.8
+                m.lifetime.sec = 0
+                marker_array.markers.append(m)
+        self.marker_pub.publish(marker_array)
+
+    # ===================================================================
+    # Service: Return Drawers
+    # ===================================================================
+
+    def get_drawers_callback(self, request, response):
+        """Service callback that returns all discovered drawers as JSON."""
+        with self.drawers_lock:
+            drawers_list = []
+            for i, d in enumerate(self.discovered_drawers):
+                drawers_list.append({
+                    'id': i,
+                    'handle_center_world_coordinates': {
+                        'x': float(d.handle_world_xyz[0]),
+                        'y': float(d.handle_world_xyz[1]),
+                        'z': float(d.handle_world_xyz[2]),
+                    },
+                    'reachable': d.reachable,
+                })
+        response.success = True
+        response.message = json.dumps(drawers_list)
+        return response
+
+    # ===================================================================
+    # Main Exploration Loop (dispatches to wall_following or frontier)
+    # ===================================================================
+
+    def exploration_loop(self):
+        """Wait for cameras, stow arm, then run the selected exploration mode."""
+        self.logger.info('Waiting for camera images...')
+        for _ in range(200):
+            with self.image_lock:
+                if self.head_color is not None:
+                    break
+            time.sleep(0.1)
+
+        if self.head_color is None:
+            self.logger.error('No camera images received. Aborting.')
+            return
+
+        # Stow arm for safe travel
+        self.move_to_pose({
+            'wrist_extension': 0.01,
+            'joint_lift': 0.5,
+            'joint_wrist_yaw': 0.0,
+            'gripper_aperture': -0.05,
+        })
+        time.sleep(0.5)
+
+        self.logger.info(f'Exploration mode: {self.exploration_mode}')
+
+        if self.exploration_mode == 'frontier':
+            self.frontier_loop()
+        else:
+            self.wall_following_loop()
+
+        # Final report
+        with self.drawers_lock:
+            total = len(self.discovered_drawers)
+            reachable_count = sum(1 for d in self.discovered_drawers if d.reachable)
+
+        self.logger.info(
+            f'Exploration complete. Found {total} drawers ({reachable_count} reachable)')
+        self.publish_drawer_markers()
+
+    def get_all_drawers(self):
+        """Return the list of discovered drawers."""
+        with self.drawers_lock:
+            return list(self.discovered_drawers)
+
+    # ===================================================================
+    # Node Setup
+    # ===================================================================
+
+    def main(self):
+        hm.HelloNode.main(self, 'search_for_drawers', 'search_for_drawers',
+                          wait_for_first_pointcloud=False)
+
+        self.logger = self.get_logger()
+        self.callback_group = ReentrantCallbackGroup()
+        sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        # Read exploration_mode parameter: 'wall_following' (default) or 'frontier'
+        self.declare_parameter('exploration_mode', 'wall_following')
+        self.exploration_mode = self.get_parameter(
+            'exploration_mode').get_parameter_value().string_value
+        if self.exploration_mode not in ('wall_following', 'frontier'):
+            self.logger.warn(
+                f'Unknown exploration_mode "{self.exploration_mode}", '
+                f'defaulting to wall_following')
+            self.exploration_mode = 'wall_following'
+
+        # Initialize Detic
+        self.logger.info('Loading Detic model...')
+        self.predictor, self.metadata = build_detic_predictor()
+        self.class_names = self.metadata.get('thing_classes', None)
+        if self.class_names is None:
+            from detectron2.data.datasets.lvis import get_lvis_instances_meta
+            meta = get_lvis_instances_meta('lvis_v1')
+            self.class_names = meta['thing_classes']
+        self.logger.info(f'Detic loaded with {len(self.class_names)} classes')
+
+        # Joint states
+        self.create_subscription(
+            JointState, '/stretch/joint_states',
+            self.joint_states_callback, qos_profile=0,
+            callback_group=self.callback_group)
+
+        # Head camera
+        self.create_subscription(
+            Image, HEAD_COLOR_TOPIC, self.head_color_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+        self.create_subscription(
+            Image, HEAD_DEPTH_TOPIC, self.head_depth_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+        self.create_subscription(
+            CameraInfo, HEAD_INFO_TOPIC, self.head_info_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+
+        # Wrist camera
+        self.create_subscription(
+            Image, WRIST_COLOR_TOPIC, self.wrist_color_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+        self.create_subscription(
+            Image, WRIST_DEPTH_TOPIC, self.wrist_depth_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+        self.create_subscription(
+            CameraInfo, WRIST_INFO_TOPIC, self.wrist_info_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+
+        # Lidar (used by wall_following mode)
+        self.create_subscription(
+            LaserScan, '/scan', self.scan_cb,
+            qos_profile=sensor_qos, callback_group=self.callback_group)
+
+        # Publishers
+        self.marker_pub = self.create_publisher(
+            MarkerArray, '/search_drawers/discovered_drawers', 10,
+            callback_group=self.callback_group)
+        self.detection_pub = self.create_publisher(
+            Image, '/search_drawers/detection_image', 10,
+            callback_group=self.callback_group)
+
+        # Funmap frontier exploration service clients (used by frontier mode)
+        self.head_scan_client = self.create_client(
+            Trigger, '/funmap/trigger_head_scan',
+            callback_group=self.callback_group)
+        self.drive_to_scan_client = self.create_client(
+            Trigger, '/funmap/trigger_drive_to_scan',
+            callback_group=self.callback_group)
+
+        # Service to return discovered drawers
+        self.create_service(
+            Trigger, '/search_drawers/get_drawers',
+            self.get_drawers_callback,
+            callback_group=self.callback_group)
+
+        self.logger.info(
+            f'SearchForDrawersNode ready (mode={self.exploration_mode}). '
+            f'Starting exploration...')
+
+        self.explore_thread = threading.Thread(
+            target=self.exploration_loop, daemon=True)
+        self.explore_thread.start()
+
+
+def main():
+    try:
+        node = SearchForDrawersNode()
+        node.main()
+        node.new_thread.join()
+    except KeyboardInterrupt:
+        rclpy.logging.get_logger('search_for_drawers').info('Shutting down')
+
+
+if __name__ == '__main__':
+    main()
