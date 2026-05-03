@@ -36,3 +36,6 @@ log/
 
 # VSCode
 .vscode/
+
+# Detic datasets
+deticdatasets/
