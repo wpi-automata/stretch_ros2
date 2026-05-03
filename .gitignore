@@ -39,3 +39,8 @@ log/
 
 # Detic datasets
 deticdatasets/
+
+# Claude
+.claude/
+CLAUDE.md
+CLAUDE.local.md

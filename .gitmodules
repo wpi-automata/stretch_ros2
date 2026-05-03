@@ -1,0 +1,4 @@
+[submodule "semantic-object-container-room"]
+	path = semantic-object-container-room
+	url = git@github.com:wpi-automata/semantic-object-container-room.git
+	branch = realrobot
