@@ -3,6 +3,9 @@
 import array
 import copy
 from functools import cache
+import math
+import time
+
 import cv2
 import numpy as np
 import threading
@@ -34,6 +37,7 @@ from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import Twist
 from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 from std_srvs.srv import Trigger
 from std_srvs.srv import SetBool
@@ -198,6 +202,103 @@ class StretchMujocoDriver(Node):
         self.last_gamepad_joy_time = self.get_clock().now()
         self.robot_mode_rwlock.release_read()
 
+    # RVIZ 2D POSE GOAL ############
+
+    def goal_pose_callback(self, msg):
+        """Handle RViz '2D Nav Goal' — rotate toward goal then drive straight."""
+        gx = msg.pose.position.x
+        gy = msg.pose.position.y
+        self.get_logger().info(f'Goal pose received: ({gx:.2f}, {gy:.2f})')
+        threading.Thread(
+            target=self._drive_to_goal, args=(gx, gy), daemon=True
+        ).start()
+
+    def _publish_goal_path(self, rx, ry, gx, gy):
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = "odom"
+        start = PoseStamped()
+        start.header = path.header
+        start.pose.position.x = rx
+        start.pose.position.y = ry
+        goal = PoseStamped()
+        goal.header = path.header
+        goal.pose.position.x = gx
+        goal.pose.position.y = gy
+        path.poses = [start, goal]
+        self.goal_path_pub.publish(path)
+
+    def _drive_to_goal(self, gx, gy):
+        rate_hz = 10
+        linear_speed = 0.8
+        angular_speed = 3.0
+
+        self.robot_mode_rwlock.acquire_write()
+        saved_mode = self.robot_mode
+        self.robot_mode = "navigation"
+        self.robot_mode_rwlock.release_write()
+        self.get_logger().info(
+            f'_drive_to_goal: mode {saved_mode} -> navigation, target ({gx:.2f}, {gy:.2f})')
+
+        try:
+            while True:
+                base = self.sim.pull_status().base
+                rx, ry, rtheta = base.x, base.y, base.theta
+                dx, dy = gx - rx, gy - ry
+                dist = math.sqrt(dx * dx + dy * dy)
+
+                self._publish_goal_path(rx, ry, gx, gy)
+
+                if dist < 0.1:
+                    self.get_logger().info(f'_drive_to_goal: within 0.1m, stopping')
+                    break
+
+                angle_to_goal = math.atan2(dy, dx)
+                angle_err = math.atan2(
+                    math.sin(angle_to_goal - rtheta),
+                    math.cos(angle_to_goal - rtheta),
+                )
+
+                # Drive backward if goal is mostly behind us
+                if abs(angle_err) > math.pi / 2:
+                    backward_err = math.atan2(
+                        math.sin(angle_to_goal - rtheta - math.pi),
+                        math.cos(angle_to_goal - rtheta - math.pi),
+                    )
+                    if abs(backward_err) > 0.15:
+                        self.linear_velocity_mps = 0.0
+                        self.angular_velocity_radps = angular_speed if backward_err > 0 else -angular_speed
+                    else:
+                        self.linear_velocity_mps = -min(linear_speed, dist)
+                        self.angular_velocity_radps = backward_err * 2.0
+                elif abs(angle_err) > 0.15:
+                    self.linear_velocity_mps = 0.0
+                    self.angular_velocity_radps = angular_speed if angle_err > 0 else -angular_speed
+                else:
+                    self.linear_velocity_mps = min(linear_speed, dist)
+                    self.angular_velocity_radps = angle_err * 2.0
+
+                self.get_logger().info(
+                    f'_drive_to_goal: pos=({rx:.2f},{ry:.2f},{rtheta:.2f}) '
+                    f'dist={dist:.2f} ang_err={angle_err:.2f} '
+                    f'v={self.linear_velocity_mps:.2f} w={self.angular_velocity_radps:.2f}')
+
+                self.last_twist_time = self.get_clock().now()
+                time.sleep(1.0 / rate_hz)
+        finally:
+            self.linear_velocity_mps = 0.0
+            self.angular_velocity_radps = 0.0
+            self.last_twist_time = self.get_clock().now()
+            # Clear the goal path
+            empty = Path()
+            empty.header.stamp = self.get_clock().now().to_msg()
+            empty.header.frame_id = "odom"
+            self.goal_path_pub.publish(empty)
+            self.robot_mode_rwlock.acquire_write()
+            self.robot_mode = saved_mode
+            self.robot_mode_rwlock.release_write()
+            self.get_logger().info(f'_drive_to_goal: done, mode restored to {saved_mode}')
+
     # MOBILE BASE VELOCITY METHODS ############
 
     def set_mobile_base_velocity_callback(self, twist):
@@ -321,11 +422,14 @@ class StretchMujocoDriver(Node):
         if self.robot_mode == "navigation":
             time_since_last_twist = self.get_clock().now() - self.last_twist_time
             if time_since_last_twist < self.timeout:
+                self.get_logger().info(
+                    f'VEL DISPATCH: v={self.linear_velocity_mps:.3f} w={self.angular_velocity_radps:.3f} '
+                    f'age={time_since_last_twist.nanoseconds/1e6:.0f}ms')
                 self.sim.set_base_velocity(
                     self.linear_velocity_mps, self.angular_velocity_radps
                 )
             elif time_since_last_twist < Duration(seconds=self.timeout_s + 1.0):  # type: ignore
-                # self.sim.set_base_velocity(0.0, 0.0)
+                self.get_logger().info(f'VEL DISPATCH: timed out, move_by(0)')
                 self.sim.move_by(Actuators.base_translate, 0.0)
             else:
                 self.sim.set_base_velocity(0.0, 0.0)
@@ -383,9 +487,12 @@ class StretchMujocoDriver(Node):
             b.header.frame_id = self.base_frame_id
             b.child_frame_id = "base_footprint"
             self.tf_static_broadcaster.sendTransform(b)
-            b.header.frame_id = "map"
-            b.child_frame_id = self.odom_frame_id
-            self.tf_static_broadcaster.sendTransform(b)
+
+            # Only publish map→odom identity if no SLAM node is providing it
+            if not self.use_slam:
+                b.header.frame_id = "map"
+                b.child_frame_id = self.odom_frame_id
+                self.tf_static_broadcaster.sendTransform(b)
 
         # assign relevant arm status to variables
         arm_status = robot_status.arm
@@ -1088,6 +1195,11 @@ class StretchMujocoDriver(Node):
         self.declare_parameter("broadcast_odom_tf", False)
         self.broadcast_odom_tf = self.get_parameter("broadcast_odom_tf").value
         self.get_logger().info("broadcast_odom_tf = " + str(self.broadcast_odom_tf))
+
+        self.declare_parameter("use_slam", False)
+        self.use_slam = self.get_parameter("use_slam").value
+        self.get_logger().info("use_slam = " + str(self.use_slam))
+
         if self.broadcast_odom_tf:
             self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
             self.tf_static_broadcaster = StaticTransformBroadcaster(self)
@@ -1160,6 +1272,7 @@ class StretchMujocoDriver(Node):
         self.path_pub = self.create_publisher(Path, "/robot_trajectory", 1)
         self._trajectory_path = Path()
         self._trajectory_path.header.frame_id = "odom"
+        self.goal_path_pub = self.create_publisher(Path, "/goal_path", 10)
         self.laser_scan_pub = self.create_publisher(
             LaserScan,
             "/scan_filtered",
@@ -1254,6 +1367,14 @@ class StretchMujocoDriver(Node):
             Float64MultiArray,
             "joint_pose_cmd",
             self.set_robot_streaming_position_callback,
+            1,
+            callback_group=self.main_group,
+        )
+
+        self.create_subscription(
+            PoseStamped,
+            "/goal_pose",
+            self.goal_pose_callback,
             1,
             callback_group=self.main_group,
         )
@@ -1441,7 +1562,13 @@ class StretchMujocoDriver(Node):
 
 
 def create_laser_scan_msg(lidar_data: np.ndarray, timestamp: TimeMsg, frame_id: str):
-    ranges = lidar_data.tolist()
+    ranges = lidar_data.copy()
+    # MuJoCo rangefinders return -1 for no-hit; replace with inf.
+    # Also filter out self-hits on the robot body (range < range_min).
+    range_min = 0.2
+    range_max = 12.0
+    ranges[(ranges < range_min) | (ranges < 0)] = float('inf')
+    ranges[ranges > range_max] = float('inf')
 
     laser_scan_msg = (
         LaserScan()
@@ -1452,9 +1579,9 @@ def create_laser_scan_msg(lidar_data: np.ndarray, timestamp: TimeMsg, frame_id: 
     laser_scan_msg.angle_min = 0.0
     laser_scan_msg.angle_max = np.pi * 2
     laser_scan_msg.angle_increment = laser_scan_msg.angle_max / len(ranges)
-    laser_scan_msg.range_min = 0.2
-    laser_scan_msg.range_max = 20.0
-    laser_scan_msg.ranges = ranges
+    laser_scan_msg.range_min = range_min
+    laser_scan_msg.range_max = range_max
+    laser_scan_msg.ranges = ranges.tolist()
 
     return laser_scan_msg
 

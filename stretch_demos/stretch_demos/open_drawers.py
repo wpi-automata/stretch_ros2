@@ -36,11 +36,17 @@ PULL_DISTANCE_M = 0.3048  # 1 foot
 # Approach: how far from the drawer face the robot should stop
 APPROACH_DISTANCE_M = 0.55
 
-# Arm extension effort threshold for contact detection (Nm)
-EXTENSION_EFFORT_THRESHOLD = 40.0
+# Force feedback thresholds (work in both sim and real via /stretch/joint_states effort)
+EXTENSION_EFFORT_THRESHOLD = 40.0   # Nm — stop extending if arm hits something
+PULL_EFFORT_THRESHOLD = 50.0        # Nm — stop pulling if drawer is stuck/locked
+GRIPPER_EFFORT_THRESHOLD = 20.0     # Nm — detect when gripper has gripped something
 
 # Lift height offset from handle (meters below handle for gripper clearance)
 LIFT_OFFSET_M = 0.0
+
+# Timing for effort monitoring
+EFFORT_POLL_RATE_S = 0.05  # 20Hz effort check during extension/retraction
+EFFORT_SETTLE_S = 0.3      # wait after motion command before reading effort
 
 
 class OpenDrawersNode(hm.HelloNode):
@@ -53,7 +59,9 @@ class OpenDrawersNode(hm.HelloNode):
         self.joint_states = None
         self.joint_states_lock = threading.Lock()
         self.wrist_position = None
+        self.wrist_effort = None
         self.lift_position = None
+        self.gripper_effort = None
 
         self.drawers = []
 
@@ -62,10 +70,14 @@ class OpenDrawersNode(hm.HelloNode):
     def joint_states_callback(self, msg):
         with self.joint_states_lock:
             self.joint_states = msg
-        wrist_position, _, _ = hm.get_wrist_state(msg)
+        wrist_position, wrist_velocity, wrist_effort = hm.get_wrist_state(msg)
         self.wrist_position = wrist_position
+        self.wrist_effort = wrist_effort
         lift_position, _, _ = hm.get_lift_state(msg)
         self.lift_position = lift_position
+        if 'gripper_aperture' in msg.name:
+            idx = list(msg.name).index('gripper_aperture')
+            self.gripper_effort = msg.effort[idx] if idx < len(msg.effort) else None
 
     # --- Orientation ---
 
@@ -145,11 +157,74 @@ class OpenDrawersNode(hm.HelloNode):
 
         return True
 
+    # --- Force Feedback (works identically in sim and real) ---
+
+    def get_wrist_effort(self):
+        """Read current wrist extension effort from joint_states."""
+        return self.wrist_effort or 0.0
+
+    def extend_until_contact(self, target_extension, effort_threshold=EXTENSION_EFFORT_THRESHOLD):
+        """
+        Extend arm incrementally, stopping early if effort exceeds threshold.
+        Returns (final_extension, contacted) — works in both sim and real
+        because both publish effort via /stretch/joint_states.
+        """
+        step_size = 0.02  # 2cm increments
+        current = self.wrist_position or 0.01
+
+        while current < target_extension:
+            next_pos = min(current + step_size, target_extension)
+            self.move_to_pose({'wrist_extension': next_pos})
+            time.sleep(EFFORT_POLL_RATE_S)
+
+            effort = abs(self.get_wrist_effort())
+            if effort > effort_threshold:
+                self.logger.info(
+                    f'Contact detected: effort={effort:.1f}Nm > threshold={effort_threshold}Nm '
+                    f'at extension={next_pos:.3f}m')
+                return next_pos, True
+
+            current = next_pos
+
+        time.sleep(EFFORT_SETTLE_S)
+        return target_extension, False
+
+    def retract_with_force_check(self, from_extension, pull_distance,
+                                 effort_threshold=PULL_EFFORT_THRESHOLD):
+        """
+        Retract arm incrementally, stopping if effort exceeds threshold
+        (drawer stuck/locked). Returns (retracted_distance, stalled).
+        """
+        step_size = 0.02
+        current = from_extension
+        target = max(0.01, from_extension - pull_distance)
+        total_retracted = 0.0
+
+        while current > target:
+            next_pos = max(current - step_size, target)
+            self.move_to_pose({'wrist_extension': next_pos})
+            time.sleep(EFFORT_POLL_RATE_S)
+
+            effort = abs(self.get_wrist_effort())
+            if effort > effort_threshold:
+                self.logger.info(
+                    f'Pull stalled: effort={effort:.1f}Nm > threshold={effort_threshold}Nm '
+                    f'after pulling {total_retracted:.3f}m')
+                return total_retracted, True
+
+            total_retracted += (current - next_pos)
+            current = next_pos
+
+        time.sleep(EFFORT_SETTLE_S)
+        return total_retracted, False
+
     # --- Grasp and Pull ---
 
-    def grasp_and_pull(self, handle_xyz):
+    def grasp_and_pull(self, handle_xyz, handle_orientation='horizontal'):
         """
         Extend arm to grasp the handle, close gripper, retract by 1 foot.
+        Uses force feedback (effort from /stretch/joint_states) to detect
+        contact and handle stuck drawers. Works identically in sim and real.
         """
         # 1. Set lift height to handle height
         target_lift = float(handle_xyz[2]) + LIFT_OFFSET_M
@@ -163,12 +238,19 @@ class OpenDrawersNode(hm.HelloNode):
         self.move_to_pose({'gripper_aperture': 0.09})
         time.sleep(0.3)
 
-        # 3. Point wrist straight out
-        self.move_to_pose({'joint_wrist_yaw': 0.0})
+        # 3. Set wrist yaw based on handle orientation
+        # Vertical handle → gripper horizontal (wrist_yaw = 0)
+        # Horizontal handle → gripper vertical (wrist_yaw = pi/2)
+        if handle_orientation == 'vertical':
+            wrist_yaw = 0.0
+        else:
+            wrist_yaw = math.pi / 2.0
+        self.logger.info(
+            f'Setting wrist yaw to {math.degrees(wrist_yaw):.0f}° for {handle_orientation} handle')
+        self.move_to_pose({'joint_wrist_yaw': wrist_yaw})
         time.sleep(0.3)
 
-        # 4. Extend arm toward handle
-        # Estimate extension needed from lateral distance
+        # 4. Estimate extension needed from lateral distance
         pose = self.get_robot_pose_xya()
         if pose is not None:
             rx, ry, _ = pose
@@ -179,28 +261,37 @@ class OpenDrawersNode(hm.HelloNode):
         else:
             target_extension = 0.3
 
-        self.logger.info(f'Extending arm to {target_extension:.3f}m')
-        self.move_to_pose({'wrist_extension': target_extension})
-        time.sleep(0.5)
+        # 5. Extend arm with force feedback — stops on contact
+        self.logger.info(f'Extending arm toward handle (target={target_extension:.3f}m)')
+        reached_ext, contacted = self.extend_until_contact(
+            target_extension + 0.05,  # overshoot slightly to ensure contact
+            effort_threshold=EXTENSION_EFFORT_THRESHOLD,
+        )
 
-        # 5. Extend a bit more to make contact with handle
-        contact_extension = min(0.52, target_extension + 0.05)
-        self.logger.info(f'Extending into handle contact at {contact_extension:.3f}m')
-        self.move_to_pose({'wrist_extension': contact_extension})
-        time.sleep(0.4)
+        if contacted:
+            self.logger.info(f'Handle contact at {reached_ext:.3f}m')
+        else:
+            self.logger.info(f'Reached target extension {reached_ext:.3f}m (no early contact)')
 
         # 6. Close gripper on handle
         self.logger.info('Closing gripper on handle')
         self.move_to_pose({'gripper_aperture': -0.05})
         time.sleep(0.5)
 
-        # 7. Pull back by 1 foot (retract arm)
-        retract_target = max(0.01, contact_extension - PULL_DISTANCE_M)
+        # 7. Pull back with force monitoring — stops if drawer is stuck
         self.logger.info(
-            f'Pulling drawer open: retracting from {contact_extension:.3f}m '
-            f'to {retract_target:.3f}m (pull={PULL_DISTANCE_M:.3f}m / 1 foot)')
-        self.move_to_pose({'wrist_extension': retract_target})
-        time.sleep(1.0)
+            f'Pulling drawer open (target pull={PULL_DISTANCE_M:.3f}m / 1 foot)')
+        pulled_distance, stalled = self.retract_with_force_check(
+            from_extension=reached_ext,
+            pull_distance=PULL_DISTANCE_M,
+            effort_threshold=PULL_EFFORT_THRESHOLD,
+        )
+
+        if stalled:
+            self.logger.warn(
+                f'Drawer appears stuck after pulling {pulled_distance:.3f}m — releasing')
+        else:
+            self.logger.info(f'Pulled {pulled_distance:.3f}m successfully')
 
         # 8. Release gripper
         self.logger.info('Releasing handle')
@@ -215,8 +306,8 @@ class OpenDrawersNode(hm.HelloNode):
         })
         time.sleep(0.5)
 
-        self.logger.info('Drawer pull complete')
-        return True
+        self.logger.info(f'Drawer pull complete (pulled {pulled_distance:.3f}m)')
+        return not stalled
 
     # --- Open Drawer Sequence ---
 
@@ -237,10 +328,12 @@ class OpenDrawersNode(hm.HelloNode):
             drawer['handle_center_world_coordinates']['y'],
             drawer['handle_center_world_coordinates']['z'],
         ])
+        handle_orientation = drawer.get('handle_orientation', 'horizontal')
 
         self.logger.info(
             f'Opening drawer #{drawer_id} at '
-            f'({handle_xyz[0]:.2f}, {handle_xyz[1]:.2f}, {handle_xyz[2]:.2f})')
+            f'({handle_xyz[0]:.2f}, {handle_xyz[1]:.2f}, {handle_xyz[2]:.2f}) '
+            f'handle={handle_orientation}')
 
         # Stow arm first
         self.move_to_pose({
@@ -263,7 +356,7 @@ class OpenDrawersNode(hm.HelloNode):
             return False
 
         # Grasp and pull
-        return self.grasp_and_pull(handle_xyz)
+        return self.grasp_and_pull(handle_xyz, handle_orientation)
 
     # --- Service Callbacks ---
 

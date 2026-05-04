@@ -31,7 +31,8 @@ setup(
             'drawer_grasp_server = stretch_demos.drawer_grasp_server:main',
             'drawer_explorer = stretch_demos.drawer_explorer:main',
             'search_for_drawers = stretch_demos.search_for_drawers:main',
-            'open_drawers = stretch_demos.open_drawers:main'
+            'open_drawers = stretch_demos.open_drawers:main',
+            'gnn_choose_drawers = stretch_demos.gnn_choose_drawers:main'
         ],
     },
 )

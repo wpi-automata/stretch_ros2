@@ -10,20 +10,123 @@ Launches:
 
 Usage:
   ros2 launch stretch_demos open_drawer_segmented.launch.py
+  ros2 launch stretch_demos open_drawer_segmented.launch.py robocasa_layout:=Random robocasa_style:=Random
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    OpaqueFunction,
     TimerAction,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+from stretch_mujoco.robocasa_gen import choose_layout, choose_style, get_styles, layouts
+
+
+def _resolve_robocasa_and_launch(context):
+    """Resolve layout/style once here so the inner launch never prompts."""
+    layout = context.launch_configurations.get('robocasa_layout', 'Random')
+    style = context.launch_configurations.get('robocasa_style', 'Random')
+
+    # Interactive prompt only if user didn't specify on command line
+    if layout == 'Random' and 'robocasa_layout' not in ' '.join(sys.argv):
+        print("\n\nChoose a robocasa kitchen layout:\n")
+        layout = layouts[choose_layout()]
+        print(f"  Selected layout: {layout}")
+
+    if style == 'Random' and 'robocasa_style' not in ' '.join(sys.argv):
+        print("\n\nChoose a robocasa kitchen style:\n")
+        style = get_styles()[choose_style()]
+        print(f"  Selected style: {style}")
+
+    use_rviz = context.launch_configurations.get('use_rviz', 'true')
+    exploration_mode = context.launch_configurations.get('exploration_mode', 'wall_following')
+
+    # Inject into sys.argv so the inner launch's sys.argv check sees them
+    # (stretch_mujoco_driver.launch.py checks sys.argv directly, not launch args)
+    if f'robocasa_layout:={layout}' not in ' '.join(sys.argv):
+        sys.argv.append(f'robocasa_layout:={layout}')
+    if f'robocasa_style:={style}' not in ' '.join(sys.argv):
+        sys.argv.append(f'robocasa_style:={style}')
+
+    # Pass resolved strings to inner launch
+    stretch_simulation_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            os.path.join(
+                get_package_share_directory('stretch_simulation'), 'launch'),
+            '/stretch_mujoco_driver.launch.py'
+        ]),
+        launch_arguments={
+            'mode': 'navigation',
+            'use_cameras': 'true',
+            'use_robocasa': 'true',
+            'use_rviz': use_rviz,
+            'robocasa_layout': layout,
+            'robocasa_style': style,
+            'use_slam': 'true',
+        }.items(),
+    )
+
+    # --- 2. Funmap (mapping with lidar scans) ---
+
+    funmap_node = Node(
+        package='stretch_funmap',
+        executable='funmap',
+        output='screen',
+        parameters=[{
+            'map_yaml': '',
+            'debug_directory': '',
+        }],
+    )
+
+    # --- 3. SLAM (online async for /map and lidar-based mapping) ---
+
+    slam_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            os.path.join(
+                get_package_share_directory('stretch_nav2'), 'launch'),
+            '/online_async_launch.py'
+        ]),
+        launch_arguments={
+            'use_sim_time': 'false',
+        }.items(),
+    )
+
+    # --- 4. Search for Drawers (Detic-based exploration) ---
+
+    search_for_drawers = Node(
+        package='stretch_demos',
+        executable='search_for_drawers',
+        output='screen',
+        parameters=[{
+            'exploration_mode': exploration_mode,
+        }],
+    )
+
+    # --- 5. Open Drawers (grasp and pull) ---
+
+    open_drawers = Node(
+        package='stretch_demos',
+        executable='open_drawers',
+        output='screen',
+        parameters=[{}],
+    )
+
+    return [
+        stretch_simulation_launch,
+        TimerAction(period=5.0, actions=[funmap_node]),
+        TimerAction(period=5.0, actions=[slam_launch]),
+        TimerAction(period=10.0, actions=[search_for_drawers]),
+        TimerAction(period=12.0, actions=[open_drawers]),
+    ]
 
 
 def generate_launch_description():
@@ -48,70 +151,7 @@ def generate_launch_description():
         choices=['wall_following', 'frontier'],
         description='Exploration strategy: wall_following (default) or frontier (funmap)'))
 
-    # --- 1. Simulation Driver (MuJoCo + robocasa kitchens) ---
-
-    stretch_simulation_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            os.path.join(
-                get_package_share_directory('stretch_simulation'), 'launch'),
-            '/stretch_mujoco_driver.launch.py'
-        ]),
-        launch_arguments={
-            'mode': 'navigation',
-            'use_cameras': 'true',
-            'use_robocasa': 'true',
-            'use_rviz': LaunchConfiguration('use_rviz'),
-            'robocasa_layout': LaunchConfiguration('robocasa_layout'),
-            'robocasa_style': LaunchConfiguration('robocasa_style'),
-        }.items(),
-    )
-    ld.add_action(stretch_simulation_launch)
-
-    # --- 2. Funmap (mapping with lidar scans) ---
-
-    funmap_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            os.path.join(
-                get_package_share_directory('stretch_funmap'), 'launch'),
-            '/funmap.launch.py'
-        ]),
-    )
-    # Delay funmap to let sim start publishing
-    ld.add_action(TimerAction(period=5.0, actions=[funmap_launch]))
-
-    # --- 3. SLAM (online async for /map and lidar-based mapping) ---
-
-    slam_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            os.path.join(
-                get_package_share_directory('stretch_nav2'), 'launch'),
-            '/online_async_launch.py'
-        ]),
-        launch_arguments={
-            'use_sim_time': 'true',
-        }.items(),
-    )
-    ld.add_action(TimerAction(period=5.0, actions=[slam_launch]))
-
-    # --- 4. Search for Drawers (Detic-based exploration) ---
-
-    search_for_drawers = Node(
-        package='stretch_demos',
-        executable='search_for_drawers',
-        output='screen',
-        parameters=[{'exploration_mode': LaunchConfiguration('exploration_mode')}],
-    )
-    # Delay to let sim + SLAM initialize
-    ld.add_action(TimerAction(period=10.0, actions=[search_for_drawers]))
-
-    # --- 5. Open Drawers (grasp and pull) ---
-
-    open_drawers = Node(
-        package='stretch_demos',
-        executable='open_drawers',
-        output='screen',
-    )
-    # Delay to let search node start
-    ld.add_action(TimerAction(period=12.0, actions=[open_drawers]))
+    # Resolve layout/style interactively once, then launch everything
+    ld.add_action(OpaqueFunction(function=_resolve_robocasa_and_launch))
 
     return ld

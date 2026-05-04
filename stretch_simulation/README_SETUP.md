@@ -126,3 +126,9 @@ sudo apt install rpl
 mkdir -p $HELLO_FLEET_PATH/$HELLO_FLEET_ID/exported_urdf
 cp -r ./exported_urdf/* $HELLO_FLEET_PATH/$HELLO_FLEET_ID/exported_urdf
 ```
+
+## Setting up Semantic Search
+
+```bash
+git submodule add -b realrobot git@github.com:wpi-automata/semantic-object-container-room.git
+```

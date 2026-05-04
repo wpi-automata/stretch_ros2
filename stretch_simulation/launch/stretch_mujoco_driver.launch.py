@@ -78,6 +78,12 @@ def generate_launch_description():
         )
     )
     ld.add_action(
+        DeclareLaunchArgument(
+            "use_slam", default_value="false", choices=["true", "false"],
+            description="When true, skip broadcasting map->odom identity (let SLAM provide it)",
+        )
+    )
+    ld.add_action(
         DeclareLaunchArgument("robocasa_task", default_value="PnPCounterToCab")
     )
     ld.add_action(
@@ -192,6 +198,7 @@ def generate_launch_description():
                 if robocasa_style is not None
                 else LaunchConfiguration("robocasa_style")
             ),
+            "use_slam": LaunchConfiguration("use_slam"),
         }
     ]
 
@@ -204,7 +211,7 @@ def generate_launch_description():
                 "-d",
                 str(stretch_simulation_path / "rviz" / "stretch_sim.rviz")
             ],
-            parameters=[{"use_sim_time": True}],
+            parameters=[{}],
             condition=IfCondition(LaunchConfiguration("use_rviz")),
         )
     )
