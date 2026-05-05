@@ -50,8 +50,10 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String, Header, ColorRGBA
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker
+from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
+from rclpy.action import ActionClient
 import tf2_ros
 
 
@@ -115,10 +117,10 @@ class NavigateOpenNode(Node):
             String, "/navigate_open/status", 10
         )
         self.cmd_vel_pub = self.create_publisher(Twist, "/stretch/cmd_vel", 10)
-        self.joint_cmd_pub = self.create_publisher(
-            JointTrajectory, "/stretch_controller/command", 10
+        self.trajectory_client = ActionClient(
+            self, FollowJointTrajectory,
+            "/stretch_controller/follow_joint_trajectory",
         )
-        self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
 
         # Subscribers
         self.create_subscription(
@@ -273,8 +275,10 @@ class NavigateOpenNode(Node):
             return None
 
         future = self.get_drawers_client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-        if future.result() is None:
+        timeout = time.time() + 10.0
+        while not future.done() and time.time() < timeout:
+            time.sleep(0.05)
+        if not future.done() or future.result() is None:
             return None
 
         response = future.result()
@@ -301,17 +305,14 @@ class NavigateOpenNode(Node):
     # ─── Navigation ───────────────────────────────────────────────────
 
     def _navigate_to_approach_pose(self, handle_pos: np.ndarray) -> bool:
-        """Navigate robot base to approach_distance from the drawer.
+        """Navigate robot base to approach_distance from the drawer using cmd_vel.
 
-        Positions the robot so the arm can reach the handle.
-        The robot stands 1m away, facing sideways (arm faces drawer).
+        Drives toward the approach point, then stops when close enough.
         """
         robot_pose = self._get_robot_pose()
         if robot_pose is None:
             return False
 
-        # Compute approach point: 1m away from handle along the line
-        # from handle to robot (so robot is behind its approach point)
         dx = robot_pose[0] - handle_pos[0]
         dy = robot_pose[1] - handle_pos[1]
         dist = math.sqrt(dx * dx + dy * dy)
@@ -319,55 +320,50 @@ class NavigateOpenNode(Node):
             dx, dy = 1.0, 0.0
             dist = 1.0
 
-        # Unit vector from handle toward robot
         ux = dx / dist
         uy = dy / dist
 
-        # Approach position: approach_distance from handle
         approach_x = handle_pos[0] + ux * self.approach_distance
         approach_y = handle_pos[1] + uy * self.approach_distance
 
-        # Heading: robot faces perpendicular to the handle direction
-        # (arm points toward handle, which is to the robot's left side)
-        heading_to_handle = math.atan2(-uy, -ux)
-        # Robot's arm is on its left side, so rotate 90 degrees
-        approach_theta = heading_to_handle + math.pi / 2
-
-        # Publish planned path for RViz
         self._publish_path(robot_pose, (approach_x, approach_y))
-
-        # Send goal
-        goal_msg = PoseStamped()
-        goal_msg.header.frame_id = "map"
-        goal_msg.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.pose.position.x = approach_x
-        goal_msg.pose.position.y = approach_y
-        goal_msg.pose.position.z = 0.0
-
-        from tf_transformations import quaternion_from_euler
-        q = quaternion_from_euler(0, 0, approach_theta)
-        goal_msg.pose.orientation.x = q[0]
-        goal_msg.pose.orientation.y = q[1]
-        goal_msg.pose.orientation.z = q[2]
-        goal_msg.pose.orientation.w = q[3]
-
-        self.goal_pub.publish(goal_msg)
         self.get_logger().info(
             f"Navigating to approach pose: ({approach_x:.2f}, {approach_y:.2f})"
         )
 
-        # Wait for arrival
+        # First rotate to face the approach point
+        angle_to_target = math.atan2(
+            approach_y - robot_pose[1], approach_x - robot_pose[0]
+        )
+        current_yaw = self._get_robot_yaw()
+        if current_yaw is not None:
+            angle_diff = (angle_to_target - current_yaw + math.pi) % (2 * math.pi) - math.pi
+            self._rotate_in_place(angle_diff)
+
+        # Drive forward until close
         timeout = 60.0
         start = time.time()
         while time.time() - start < timeout and not self.stop_requested:
             pose = self._get_robot_pose()
-            if pose is not None:
-                dx = approach_x - pose[0]
-                dy = approach_y - pose[1]
-                if math.sqrt(dx * dx + dy * dy) < 0.3:
-                    return True
-            time.sleep(0.5)
+            if pose is None:
+                time.sleep(0.1)
+                continue
 
+            dx = approach_x - pose[0]
+            dy = approach_y - pose[1]
+            remaining = math.sqrt(dx * dx + dy * dy)
+
+            if remaining < 0.15:
+                self.cmd_vel_pub.publish(Twist())
+                return True
+
+            speed = min(0.3, remaining)
+            twist = Twist()
+            twist.linear.x = speed
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(0.1)
+
+        self.cmd_vel_pub.publish(Twist())
         return False
 
     def _align_to_drawer(self, handle_pos: np.ndarray, orientation: str):
@@ -376,7 +372,6 @@ class NavigateOpenNode(Node):
         if robot_pose is None:
             return
 
-        # Compute angle from robot to handle
         dx = handle_pos[0] - robot_pose[0]
         dy = handle_pos[1] - robot_pose[1]
         angle_to_handle = math.atan2(dy, dx)
@@ -384,24 +379,11 @@ class NavigateOpenNode(Node):
         # Robot arm points left, so desired heading is handle_angle + pi/2
         desired_heading = angle_to_handle + math.pi / 2
 
-        # Get current heading
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "map", "base_link",
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=1.0),
-            )
-            from tf_transformations import euler_from_quaternion
-            q = transform.transform.rotation
-            _, _, current_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        except Exception:
+        current_yaw = self._get_robot_yaw()
+        if current_yaw is None:
             return
 
-        # Turn the difference
-        angle_diff = desired_heading - current_yaw
-        # Normalize to [-pi, pi]
-        angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi
-
+        angle_diff = (desired_heading - current_yaw + math.pi) % (2 * math.pi) - math.pi
         self._rotate_in_place(angle_diff)
 
     def _orient_wrist(self, handle_orientation: str):
@@ -506,17 +488,40 @@ class NavigateOpenNode(Node):
 
     # ─── Low-level control helpers ────────────────────────────────────
 
-    def _send_joint_command(self, joint_name: str, position: float):
-        """Send a single joint position command."""
-        msg = JointTrajectory()
-        msg.joint_names = [joint_name]
+    def _send_joint_command(self, joint_name: str, position: float, duration_sec: int = 1):
+        """Send a single joint position command via FollowJointTrajectory action."""
+        if not self.trajectory_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("FollowJointTrajectory action server not available")
+            return False
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = [joint_name]
 
         point = JointTrajectoryPoint()
         point.positions = [position]
-        point.time_from_start = Duration(sec=1, nanosec=0)
-        msg.points = [point]
+        point.time_from_start = Duration(sec=duration_sec, nanosec=0)
+        goal.trajectory.points = [point]
 
-        self.joint_cmd_pub.publish(msg)
+        future = self.trajectory_client.send_goal_async(goal)
+        # Wait for goal acceptance (non-blocking spin — main thread already spinning)
+        timeout = time.time() + 5.0
+        while not future.done() and time.time() < timeout:
+            time.sleep(0.05)
+        if not future.done() or future.result() is None:
+            self.get_logger().warn(f"Joint goal send timed out: {joint_name}")
+            return False
+
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn(f"Joint command rejected: {joint_name}={position:.3f}")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        timeout = time.time() + duration_sec + 10
+        while not result_future.done() and time.time() < timeout:
+            time.sleep(0.05)
+
+        return True
 
     def _rotate_in_place(self, angle_rad: float):
         """Rotate the base in place."""
@@ -542,7 +547,7 @@ class NavigateOpenNode(Node):
         """Get (x, y) of robot base in map frame."""
         try:
             transform = self.tf_buffer.lookup_transform(
-                "map", "base_link",
+                "odom", "base_link",
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
@@ -553,12 +558,27 @@ class NavigateOpenNode(Node):
         except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
             return None
 
+    def _get_robot_yaw(self):
+        """Get the robot's current heading (yaw) in the odom frame."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "base_link",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+            from tf_transformations import euler_from_quaternion
+            q = transform.transform.rotation
+            _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+            return yaw
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+            return None
+
     # ─── Visualization ────────────────────────────────────────────────
 
     def _publish_path(self, start_xy, end_xy):
         """Publish the planned path from start to end for RViz display."""
         path_msg = Path()
-        path_msg.header.frame_id = "map"
+        path_msg.header.frame_id = "odom"
         path_msg.header.stamp = self.get_clock().now().to_msg()
 
         for t in np.linspace(0, 1, 20):
@@ -575,7 +595,7 @@ class NavigateOpenNode(Node):
     def _publish_target_marker(self, handle_pos: np.ndarray):
         """Publish a pink marker at the target drawer for RViz."""
         marker = Marker()
-        marker.header.frame_id = "map"
+        marker.header.frame_id = "odom"
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "target_drawer"
         marker.id = 0

@@ -51,7 +51,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, TransformStamped
-from sensor_msgs.msg import Image as RosImage
+from sensor_msgs.msg import CameraInfo, Image as RosImage
 from std_msgs.msg import String, Header, ColorRGBA
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
@@ -72,6 +72,7 @@ class DetectedDrawer:
         self.handle_bbox = None
         self.handle_center_world = None
         self.handle_grasp_world = None
+        self.drawer_corners_world = None
         self.reachable = False
         self.handle_orientation = "horizontal"
         self.ranking = 0.0
@@ -115,6 +116,7 @@ class DrawerDetectionNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_rgb_stamp = None
+        self.camera_K = None
         self.detector = None
         self.exploring = False
 
@@ -143,6 +145,10 @@ class DrawerDetectionNode(Node):
         self.create_subscription(
             RosImage, "/camera/depth/image_rect_raw",
             self.depth_callback, sensor_qos
+        )
+        self.create_subscription(
+            CameraInfo, "/camera/color/camera_info",
+            self.camera_info_callback, sensor_qos
         )
         self.create_subscription(
             String, "/exploration_status",
@@ -184,6 +190,13 @@ class DrawerDetectionNode(Node):
     def depth_callback(self, msg: RosImage):
         self.latest_depth = self.bridge.imgmsg_to_cv2(msg, "passthrough")
 
+    def camera_info_callback(self, msg: CameraInfo):
+        if self.camera_K is None:
+            k = msg.k
+            self.camera_K = np.array([[k[0], k[1], k[2]],
+                                      [k[3], k[4], k[5]],
+                                      [k[6], k[7], k[8]]])
+
     def exploration_status_callback(self, msg: String):
         self.exploring = msg.data in ("rotating", "planning", "navigating")
 
@@ -203,9 +216,9 @@ class DrawerDetectionNode(Node):
                 drawer_data.append({
                     "drawer_id": d.drawer_id,
                     "handle_center_world": {
-                        "x": d.handle_center_world[0] if d.handle_center_world else 0,
-                        "y": d.handle_center_world[1] if d.handle_center_world else 0,
-                        "z": d.handle_center_world[2] if d.handle_center_world else 0,
+                        "x": float(d.handle_center_world[0]) if d.handle_center_world is not None else 0,
+                        "y": float(d.handle_center_world[1]) if d.handle_center_world is not None else 0,
+                        "z": float(d.handle_center_world[2]) if d.handle_center_world is not None else 0,
                     },
                     "reachable": d.reachable,
                     "handle_orientation": d.handle_orientation,
@@ -230,27 +243,28 @@ class DrawerDetectionNode(Node):
         """Run Detic detection on current frame, find drawers and handles."""
         if self.latest_rgb is None or self.latest_depth is None:
             return 0
+        if self.camera_K is None:
+            self.get_logger().debug("Waiting for camera_info...")
+            return 0
 
         rgb = self.latest_rgb.copy()
         depth = self.latest_depth.copy()
+        rgb_stamp = self.latest_rgb_stamp
 
-        # Get camera-to-map transform
+        # Get camera-to-map transform at the time the image was captured
         camera_frame = "camera_color_optical_frame"
         try:
+            tf_time = rclpy.time.Time.from_msg(rgb_stamp) if rgb_stamp else rclpy.time.Time()
             transform = self.tf_buffer.lookup_transform(
-                "map", camera_frame,
-                rclpy.time.Time(),
+                "odom", camera_frame,
+                tf_time,
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
         except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
             self.get_logger().debug(f"TF lookup failed: {e}")
             return len(self.drawers)
 
-        # Get camera intrinsics (approximate if not available)
-        h, w = rgb.shape[:2]
-        fx = fy = w * 0.9
-        cx, cy = w / 2.0, h / 2.0
-        camera_K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        camera_K = self.camera_K
 
         # Build camera pose matrix from TF
         camera_pose = self._transform_to_matrix(transform)
@@ -340,19 +354,19 @@ class DrawerDetectionNode(Node):
         detections = self.detector.detect(rgb, return_crops=False)
         detections = nms_by_type(detections)
 
-        # Filter for drawer-like classes
         drawer_classes = {
             "Drawer", "Cabinet", "Chest", "FilingCabinet",
             "Dresser", "NightStand", "SideTable",
             "drawer", "cabinet", "chest_of_drawers",
         }
 
-        for det in detections:
-            if det.object_type not in drawer_classes:
-                continue
-            if det.score < self.detection_confidence:
-                continue
+        # Filter to drawer classes first
+        drawer_dets = [d for d in detections
+                       if d.object_type in drawer_classes and d.score >= self.detection_confidence]
+        # Cross-class NMS: suppress overlapping bboxes regardless of class
+        drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.3)
 
+        for det in drawer_dets:
             drawer_bbox = det.bbox
 
             # Find handle within the drawer bbox region
@@ -367,6 +381,36 @@ class DrawerDetectionNode(Node):
             results.append((drawer_bbox, handle_bbox, det.score))
 
         return results
+
+    @staticmethod
+    def _cross_class_nms(detections, iou_threshold=0.3):
+        """Suppress overlapping bboxes across all classes, keeping higher confidence."""
+        if not detections:
+            return detections
+        sorted_dets = sorted(detections, key=lambda d: d.score, reverse=True)
+        keep = []
+        for det in sorted_dets:
+            suppressed = False
+            for kept in keep:
+                iou = DrawerDetectionNode._bbox_iou(det.bbox, kept.bbox)
+                if iou > iou_threshold:
+                    suppressed = True
+                    break
+            if not suppressed:
+                keep.append(det)
+        return keep
+
+    @staticmethod
+    def _bbox_iou(a, b):
+        x0 = max(a[0], b[0])
+        y0 = max(a[1], b[1])
+        x1 = min(a[2], b[2])
+        y1 = min(a[3], b[3])
+        inter = max(0, x1 - x0) * max(0, y1 - y0)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
 
     def _find_handle_in_bbox(self, rgb: np.ndarray, drawer_bbox: list):
         """Find the handle bounding box within a drawer bounding box.
@@ -384,11 +428,11 @@ class DrawerDetectionNode(Node):
         except ImportError:
             return None
 
-        # Detect handles in the cropped region
-        handle_detector = VisualDetector(
-            device="cpu", score_threshold=0.3
-        )
-        detections = handle_detector.detect(crop, return_crops=False)
+        if self.detector is None:
+            self.detector = VisualDetector(
+                device="cpu", score_threshold=0.3
+            )
+        detections = self.detector.detect(crop, return_crops=False)
 
         handle_classes = {"Handle", "Knob", "DoorHandle", "handle", "knob"}
         best_handle = None
@@ -458,6 +502,49 @@ class DrawerDetectionNode(Node):
         p_world = camera_pose @ p_cam
         return p_world[:3]
 
+    def _project_pixel_to_world(
+        self, u: int, v: int, depth: np.ndarray,
+        camera_pose: np.ndarray, camera_K: np.ndarray,
+    ):
+        """Project a single pixel (u, v) to world coordinates using depth."""
+        h, w = depth.shape[:2]
+        u = max(0, min(u, w - 1))
+        v = max(0, min(v, h - 1))
+
+        region = depth[max(0, v-3):v+3, max(0, u-3):u+3]
+        if depth.dtype == np.uint16:
+            region = region.astype(np.float32) / 1000.0
+        valid = region[region > 0.1]
+        if len(valid) == 0:
+            return None
+
+        d = float(np.median(valid))
+        fx, fy = camera_K[0, 0], camera_K[1, 1]
+        cx, cy = camera_K[0, 2], camera_K[1, 2]
+
+        x_cam = (u - cx) / fx * d
+        y_cam = (v - cy) / fy * d
+        z_cam = d
+
+        p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        p_world = camera_pose @ p_cam
+        return p_world[:3]
+
+    def _project_drawer_corners(
+        self, drawer_bbox: list, depth: np.ndarray,
+        camera_pose: np.ndarray, camera_K: np.ndarray,
+    ):
+        """Project the 4 corners of a drawer bbox to world coordinates."""
+        x0, y0, x1, y1 = [int(c) for c in drawer_bbox]
+        corners_px = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        corners_world = []
+        for u, v in corners_px:
+            pt = self._project_pixel_to_world(u, v, depth, camera_pose, camera_K)
+            if pt is None:
+                return None
+            corners_world.append(pt)
+        return corners_world
+
     def _transform_to_matrix(self, transform: TransformStamped) -> np.ndarray:
         """Convert a TF TransformStamped to a 4x4 SE(3) matrix."""
         from tf_transformations import quaternion_matrix
@@ -508,7 +595,7 @@ class DrawerDetectionNode(Node):
         """Update distance_to_robot for all drawers."""
         try:
             transform = self.tf_buffer.lookup_transform(
-                "map", "base_link",
+                "odom", "base_link",
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1),
             )
@@ -592,7 +679,7 @@ class DrawerDetectionNode(Node):
                     continue
 
                 marker = Marker()
-                marker.header.frame_id = "map"
+                marker.header.frame_id = "odom"
                 marker.header.stamp = self.get_clock().now().to_msg()
                 marker.ns = "drawers"
                 marker.id = i
@@ -604,9 +691,14 @@ class DrawerDetectionNode(Node):
                 marker.pose.position.z = float(drawer.handle_center_world[2])
                 marker.pose.orientation.w = 1.0
 
-                marker.scale.x = 0.3
-                marker.scale.y = 0.1
-                marker.scale.z = 0.15
+                if drawer.handle_orientation == "horizontal":
+                    marker.scale.x = 0.15
+                    marker.scale.y = 0.03
+                    marker.scale.z = 0.03
+                else:
+                    marker.scale.x = 0.03
+                    marker.scale.y = 0.03
+                    marker.scale.z = 0.12
 
                 if drawer.reachable:
                     marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.7)

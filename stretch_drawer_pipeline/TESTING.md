@@ -2,6 +2,25 @@
 
 Each node can be tested independently. This document describes the test procedures.
 
+## Prerequisites (Simulation)
+
+All test launch files require the MuJoCo sim driver to be running **first** in a separate terminal:
+
+```bash
+ros2 launch stretch_simulation stretch_mujoco_driver.launch.py use_cameras:=true use_rviz:=false mode:=navigation
+```
+
+Wait for the sim to finish loading before launching any test below.
+
+All pipeline launch files accept `use_sim:=true` which enables both `use_sim` (sim-specific behavior) and `use_sim_time` (ROS sim clock). Always pass `use_sim:=true` when running against the MuJoCo sim. Omit it or set `use_sim:=false` for real hardware.
+
+If you need to kill stale processes between runs:
+```bash
+~/ament_ws/scripts/kill_ros.sh
+```
+
+---
+
 ## Node 1: Mapping and Exploration
 
 **Goal**: Verify the robot can autonomously map a room until no frontiers remain.

@@ -113,6 +113,7 @@ class JointTrajectoryAction:
             )
 
             actuators_in_use = []
+            used_wheel_velocity = False
 
             for i, joint in enumerate(joint_names):
                 try:
@@ -128,17 +129,23 @@ class JointTrajectoryAction:
 
                 if (actuator == Actuators.left_wheel_vel or actuator == Actuators.right_wheel_vel) and velocity is not None:
                     self.node.sim.set_base_velocity(velocity, 0)
+                    used_wheel_velocity = True
                     continue
 
                 self.node.sim.move_to(actuator, target_position)
 
                 actuators_in_use.append(actuator)
 
+            base_moveto_actuators = {Actuators.base_translate, Actuators.base_rotate}
             for actuator in actuators_in_use:
-                self.node.sim.wait_until_at_setpoint(actuator)
+                if actuator in base_moveto_actuators:
+                    self.node.sim.wait_while_is_moving(actuator)
+                else:
+                    self.node.sim.wait_until_at_setpoint(actuator)
 
-            for actuator in [Actuators.left_wheel_vel, Actuators.right_wheel_vel]:
-                self.node.sim.wait_while_is_moving(actuator)
+            if used_wheel_velocity:
+                for actuator in [Actuators.left_wheel_vel, Actuators.right_wheel_vel]:
+                    self.node.sim.wait_while_is_moving(actuator)
 
             # Simulate wait until point.time_from_start
             # self._wait_until(

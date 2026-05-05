@@ -6,6 +6,10 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /Camera1
+        - /Camera1/Topic1
+        - /Depth Cloud1
+        - /Depth Cloud1/Topic1
       Splitter Ratio: 0.5
     Tree Height: 400
   - Class: rviz_common/Selection
@@ -90,59 +94,97 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         Reliability Policy: Best Effort
-        Value: /scan
+        Value: /scan_filtered
       Value: true
 
-    - Class: rviz_default_plugins/Map
+    - Class: rviz_default_plugins/Camera
       Enabled: true
-      Name: 2D Occupancy Grid
+      Far Plane Distance: 100
+      Image Rendering: background and overlay
+      Name: Camera
+      Overlay Alpha: 0.5
       Topic:
-        Depth: 1
-        Durability Policy: Transient Local
+        Depth: 5
+        Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map
-      Update Topic:
-        Value: ""
-      Alpha: 0.7
-      Color Scheme: map
-      Draw Behind: true
+        Reliability Policy: Best Effort
+        Value: /camera/color/image_raw
+      Value: true
+      Visibility:
+        Grid: true
+        LaserScan: true
+        RobotModel: true
+        TF: true
+        Value: false
+      Zoom Factor: 1
+
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: true
+      Name: Depth Cloud
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.01
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /camera/depth/color/points
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
 
     - Class: rviz_default_plugins/PointCloud2
       Enabled: true
-      Name: 3D Voxel Map
+      Name: Funmap Map Cloud
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         Reliability Policy: Reliable
-        Value: /voxel_map_cloud
-      Size (Pixels): 3
-      Size (m): 0.05
+        Value: /funmap/point_cloud2
+      Size (Pixels): 2
+      Size (m): 0.01
       Style: Flat Squares
       Use Fixed Frame: true
-      Use rainbow: true
+      Use rainbow: false
       Color Transformer: RGB8
       Value: true
 
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: Voxel Cubes (alt)
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Funmap VOI
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Reliability Policy: Reliable
-        Value: /voxel_markers
-      Value: false
+        Value: /funmap/voi_marker
+      Value: true
 
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Frontier Cells
+      Name: Funmap Markers
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Reliability Policy: Reliable
-        Value: /frontier_markers
+        Value: /funmap/marker_array
+      Value: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Funmap Nav Plan
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /funmap/navigation_plan_markers
       Value: true
 
     - Class: rviz_default_plugins/MarkerArray

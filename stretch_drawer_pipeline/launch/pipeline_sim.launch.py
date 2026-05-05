@@ -7,8 +7,6 @@ Then launch this file to start the pipeline.
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -19,7 +17,13 @@ def generate_launch_description():
     config_dir = os.path.join(pkg_dir, "config")
     rviz_config = os.path.join(pkg_dir, "rviz", "mapping.rviz")
 
-    frontier_method = LaunchConfiguration("frontier_method")
+    funmap_node = Node(
+        package="stretch_funmap",
+        executable="funmap",
+        name="funmap",
+        output="screen",
+        parameters=[{"map_yaml": "", "debug_directory": "", "use_sim": True}],
+    )
 
     mapping_node = Node(
         package="stretch_drawer_pipeline",
@@ -28,8 +32,7 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "mapping_params.yaml"),
-            {"use_sim": True},
-            {"frontier_method": frontier_method},
+            {"use_sim": True, "use_sim_time": True},
         ],
     )
 
@@ -40,7 +43,7 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "detection_params.yaml"),
-            {"use_sim": True},
+            {"use_sim": True, "use_sim_time": True},
             {"test_mode": False},
         ],
     )
@@ -52,7 +55,7 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "navigate_params.yaml"),
-            {"use_sim": True},
+            {"use_sim": True, "use_sim_time": True},
         ],
     )
 
@@ -66,10 +69,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument(
-            "frontier_method", default_value="occupancy_grid",
-            description="Frontier method: occupancy_grid or voxel"
-        ),
+        funmap_node,
         mapping_node,
         detection_node,
         navigate_node,

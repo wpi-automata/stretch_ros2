@@ -1155,8 +1155,9 @@ class FunmapNode(hm.HelloNode):
         with self.map_odom_tf_lock:
             self.map_to_odom_transform_mat = np.matmul(
                 t, self.map_to_odom_transform_mat)
-            self.tf2_broadcaster.sendTransform(
-                create_map_to_odom_transform(self.map_to_odom_transform_mat, self.clock.now().to_msg()))
+            if not self.use_sim:
+                self.tf2_broadcaster.sendTransform(
+                    create_map_to_odom_transform(self.map_to_odom_transform_mat, self.clock.now().to_msg()))
 
     def publish_corrected_robot_pose_markers(self, original_robot_map_pose_xya, corrected_robot_map_pose_xya):
         # Publish markers to visualize the corrected and
@@ -1282,6 +1283,9 @@ class FunmapNode(hm.HelloNode):
 
         self.map_filename = self.get_parameter('map_yaml').value
 
+        self.declare_parameter('use_sim', False)
+        self.use_sim = self.get_parameter('use_sim').value
+
         self.merged_map = None
         self.localized = False
 
@@ -1378,7 +1382,8 @@ class FunmapNode(hm.HelloNode):
         with self.map_odom_tf_lock:
             self.map_to_odom_transform_mat = np.identity(4)
 
-        self.map_odom_tf_timer = self.create_timer(timer_period, self.publish_map_to_odom_tf, callback_group=self.callback_group)
+        if not self.use_sim:
+            self.map_odom_tf_timer = self.create_timer(timer_period, self.publish_map_to_odom_tf, callback_group=self.callback_group)
 
         self.publish_map_point_cloud_timer = self.create_timer(timer_period, self.publish_map_point_cloud, callback_group=self.callback_group)
 

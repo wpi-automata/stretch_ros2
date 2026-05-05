@@ -30,13 +30,22 @@
 ### Critical QoS Fix
 The sim driver publishes sensor data with `BEST_EFFORT` reliability. Subscribers MUST use `BEST_EFFORT` QoS or they'll never receive messages. This was the root cause of the occupancy grid not publishing.
 
+### Mapping via stretch_funmap
+- Mapping node is now an **orchestrator** that calls funmap's services in a loop
+- `stretch_funmap` (FunmapNode) handles: head scanning, max-height-image map building, localization, path planning, obstacle detection, and cmd_vel navigation
+- The mapping node calls `/funmap/trigger_head_scan` then `/funmap/trigger_drive_to_scan` repeatedly until funmap reports no more scan locations
+- Funmap publishes its map to `/funmap/point_cloud2` (PointCloud2) and visualization markers
+
 ### Node Communication Flow
 ```
-Node 1 (Mapping) → publishes /exploration_status, /map
+funmap node        → /funmap/point_cloud2, /funmap/marker_array, /funmap/navigation_plan_markers
+                   → services: /funmap/trigger_head_scan, /funmap/trigger_drive_to_scan
+Node 1 (Mapping)   → calls funmap services, publishes /exploration_status
+                   → services: /mapping/start, /mapping/stop, /mapping/is_complete
 Node 2 (Detection) → subscribes /exploration_status, /camera topics
-                    → publishes /drawer_markers, serves /detection/get_drawers
+                   → publishes /drawer_markers, serves /detection/get_drawers
 Node 3 (Navigate)  → calls /detection/get_drawers service
-                    → publishes /navigate_open/path, /navigate_open/target_marker
+                   → publishes /navigate_open/path, /navigate_open/target_marker
 ```
 
 ## Files Created
