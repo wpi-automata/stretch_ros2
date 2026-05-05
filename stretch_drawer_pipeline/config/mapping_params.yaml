@@ -1,0 +1,23 @@
+mapping_node:
+  ros__parameters:
+    # Frontier exploration method: "occupancy_grid" (default) or "voxel"
+    frontier_method: "occupancy_grid"
+
+    # 2D occupancy grid parameters
+    map_resolution: 0.05        # meters per cell
+    map_width: 200              # cells
+    map_height: 200             # cells
+
+    # 3D voxel map parameters
+    voxel_resolution: 0.05      # meters per voxel
+
+    # Exploration behavior
+    exploration_timeout_s: 300.0  # max seconds to explore
+    min_frontier_size: 5          # minimum cells for a valid frontier
+    max_exploration_attempts: 50  # max navigate attempts before giving up
+
+    # Robot geometry
+    robot_radius: 0.18          # meters (for collision buffer)
+
+    # Environment
+    use_sim: false

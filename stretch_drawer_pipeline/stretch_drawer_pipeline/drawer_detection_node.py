@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""Node 2: Drawer Detection.
+
+Detects drawers in camera frames as the robot explores, using Detic for
+bounding-box detection and handle localization within each drawer bbox.
+
+For each drawer:
+  1. Detic detects the drawer bounding box
+  2. Within that bbox, Detic/handle detector finds the handle sub-bbox
+  3. The handle center is projected to world coordinates via depth + camera TF
+  4. Handle orientation (horizontal/vertical) is determined from bbox aspect ratio
+  5. Reachability is computed based on the Stretch3's kinematic workspace
+
+Uses functions from semantic-object-container-room for de-duplication and
+denoising of detections across frames.
+
+Publishes:
+  - /drawer_detections (DrawerList): all detected drawers with metadata
+  - /drawer_markers (visualization_msgs/MarkerArray): RViz visualization
+
+Subscribes:
+  - /camera/color/image_raw (sensor_msgs/Image): RGB frames
+  - /camera/aligned_depth_to_color/image_raw (sensor_msgs/Image): depth frames
+  - /exploration_status (std_msgs/String): to know when exploration is active
+
+Services:
+  - /detection/trigger (TriggerDetection): force a detection pass
+  - /detection/get_drawers (std_srvs/Trigger): return current drawer list
+
+Parameters:
+  - detection_confidence: min Detic score for drawer class (default 0.5)
+  - dedup_distance_m: distance threshold to consider two detections the same (default 0.3)
+  - max_reach_height: max z the gripper can reach (default 1.4m)
+  - min_reach_height: min z the gripper can reach (default 0.1m)
+  - test_mode: if true, robot does a spiral pattern for testing (default false)
+  - rank_via_LOCUS: if true, calls the GNN node ranking stub (default false)
+"""
+
+import math
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import cv2
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Point, TransformStamped
+from sensor_msgs.msg import Image as RosImage
+from std_msgs.msg import String, Header, ColorRGBA
+from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker, MarkerArray
+import tf2_ros
+
+# Path to semantic-object-container-room for imports
+_SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "semantic-object-container-room"
+if str(_SEMANTIC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SEMANTIC_ROOT))
+
+
+class DetectedDrawer:
+    """Internal representation of a drawer detection."""
+
+    def __init__(self):
+        self.drawer_id = str(uuid.uuid4())[:8]
+        self.drawer_bbox = None
+        self.handle_bbox = None
+        self.handle_center_world = None
+        self.handle_grasp_world = None
+        self.reachable = False
+        self.handle_orientation = "horizontal"
+        self.ranking = 0.0
+        self.distance_to_robot = float("inf")
+        self.annotated_image = None
+        self.confidence = 0.0
+        self.observations = 1
+
+
+class DrawerDetectionNode(Node):
+    """Detects drawers and their handles, publishing world-frame locations."""
+
+    def __init__(self):
+        super().__init__("drawer_detection_node")
+
+        # Parameters
+        self.declare_parameter("detection_confidence", 0.5)
+        self.declare_parameter("dedup_distance_m", 0.3)
+        self.declare_parameter("max_reach_height", 1.4)
+        self.declare_parameter("min_reach_height", 0.1)
+        self.declare_parameter("max_reach_distance", 0.6)
+        self.declare_parameter("test_mode", False)
+        self.declare_parameter("rank_via_LOCUS", False)
+        self.declare_parameter("use_sim", False)
+        self.declare_parameter("detection_rate_hz", 2.0)
+
+        self.detection_confidence = self.get_parameter("detection_confidence").value
+        self.dedup_distance = self.get_parameter("dedup_distance_m").value
+        self.max_reach_height = self.get_parameter("max_reach_height").value
+        self.min_reach_height = self.get_parameter("min_reach_height").value
+        self.max_reach_distance = self.get_parameter("max_reach_distance").value
+        self.test_mode = self.get_parameter("test_mode").value
+        self.rank_via_locus = self.get_parameter("rank_via_LOCUS").value
+        self.use_sim = self.get_parameter("use_sim").value
+        self.detection_rate = self.get_parameter("detection_rate_hz").value
+
+        # State
+        self.drawers: list[DetectedDrawer] = []
+        self.drawers_lock = threading.Lock()
+        self.bridge = CvBridge()
+        self.latest_rgb = None
+        self.latest_depth = None
+        self.latest_rgb_stamp = None
+        self.detector = None
+        self.exploring = False
+
+        # TF
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.cb_group = ReentrantCallbackGroup()
+
+        # Publishers
+        self.drawer_pub = self.create_publisher(
+            String, "/drawer_detections_json", 10
+        )
+        self.marker_pub = self.create_publisher(
+            MarkerArray, "/drawer_markers", 10
+        )
+
+        # Subscribers — BEST_EFFORT QoS to match sim driver
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        self.create_subscription(
+            RosImage, "/camera/color/image_raw",
+            self.rgb_callback, sensor_qos
+        )
+        self.create_subscription(
+            RosImage, "/camera/depth/image_rect_raw",
+            self.depth_callback, sensor_qos
+        )
+        self.create_subscription(
+            String, "/exploration_status",
+            self.exploration_status_callback, 10
+        )
+
+        # Services
+        self.create_service(
+            Trigger, "/detection/trigger",
+            self.trigger_detection_callback,
+            callback_group=self.cb_group,
+        )
+        self.create_service(
+            Trigger, "/detection/get_drawers",
+            self.get_drawers_callback,
+            callback_group=self.cb_group,
+        )
+
+        # Detection timer
+        period = 1.0 / self.detection_rate
+        self.create_timer(period, self.detection_tick)
+
+        # Visualization timer
+        self.create_timer(1.0, self.publish_markers)
+
+        self.get_logger().info(
+            f"Drawer detection node initialized: "
+            f"confidence={self.detection_confidence}, "
+            f"test_mode={self.test_mode}, "
+            f"rank_via_LOCUS={self.rank_via_locus}"
+        )
+
+    # ─── Callbacks ────────────────────────────────────────────────────
+
+    def rgb_callback(self, msg: RosImage):
+        self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        self.latest_rgb_stamp = msg.header.stamp
+
+    def depth_callback(self, msg: RosImage):
+        self.latest_depth = self.bridge.imgmsg_to_cv2(msg, "passthrough")
+
+    def exploration_status_callback(self, msg: String):
+        self.exploring = msg.data in ("rotating", "planning", "navigating")
+
+    def trigger_detection_callback(self, request, response):
+        """Manually trigger a detection pass."""
+        count = self._run_detection()
+        response.success = True
+        response.message = f"Detected {count} total drawers"
+        return response
+
+    def get_drawers_callback(self, request, response):
+        """Return current drawer list as JSON."""
+        import json
+        with self.drawers_lock:
+            drawer_data = []
+            for d in self.drawers:
+                drawer_data.append({
+                    "drawer_id": d.drawer_id,
+                    "handle_center_world": {
+                        "x": d.handle_center_world[0] if d.handle_center_world else 0,
+                        "y": d.handle_center_world[1] if d.handle_center_world else 0,
+                        "z": d.handle_center_world[2] if d.handle_center_world else 0,
+                    },
+                    "reachable": d.reachable,
+                    "handle_orientation": d.handle_orientation,
+                    "ranking": d.ranking,
+                    "distance_to_robot": d.distance_to_robot,
+                })
+        response.success = True
+        response.message = json.dumps(drawer_data)
+        return response
+
+    # ─── Detection logic ──────────────────────────────────────────────
+
+    def detection_tick(self):
+        """Periodic detection pass (only when exploring or in test mode)."""
+        if not self.exploring and not self.test_mode:
+            return
+        if self.latest_rgb is None or self.latest_depth is None:
+            return
+        self._run_detection()
+
+    def _run_detection(self) -> int:
+        """Run Detic detection on current frame, find drawers and handles."""
+        if self.latest_rgb is None or self.latest_depth is None:
+            return 0
+
+        rgb = self.latest_rgb.copy()
+        depth = self.latest_depth.copy()
+
+        # Get camera-to-map transform
+        camera_frame = "camera_color_optical_frame"
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "map", camera_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().debug(f"TF lookup failed: {e}")
+            return len(self.drawers)
+
+        # Get camera intrinsics (approximate if not available)
+        h, w = rgb.shape[:2]
+        fx = fy = w * 0.9
+        cx, cy = w / 2.0, h / 2.0
+        camera_K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+
+        # Build camera pose matrix from TF
+        camera_pose = self._transform_to_matrix(transform)
+
+        # Detect drawers in the frame
+        drawer_bboxes = self._detect_drawers_detic(rgb)
+
+        new_detections = 0
+        for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
+            # Project handle center to world
+            handle_center_pixel = (
+                (handle_bbox[0] + handle_bbox[2]) / 2,
+                (handle_bbox[1] + handle_bbox[3]) / 2,
+            )
+
+            world_pos = self._project_to_world(
+                handle_bbox, depth, camera_pose, camera_K
+            )
+            if world_pos is None:
+                continue
+
+            # Determine handle orientation from bbox aspect ratio
+            handle_w = handle_bbox[2] - handle_bbox[0]
+            handle_h = handle_bbox[3] - handle_bbox[1]
+            orientation = "horizontal" if handle_w > handle_h else "vertical"
+
+            # Check reachability
+            reachable = self._check_reachability(world_pos)
+
+            # De-duplicate against existing drawers
+            merged = self._try_merge_detection(world_pos, confidence)
+            if merged:
+                continue
+
+            # Create new drawer entry
+            drawer = DetectedDrawer()
+            drawer.handle_center_world = world_pos
+            drawer.handle_grasp_world = world_pos.copy()
+            drawer.reachable = reachable
+            drawer.handle_orientation = orientation
+            drawer.confidence = confidence
+            drawer.annotated_image = self._annotate_image(
+                rgb, drawer_bbox, handle_bbox
+            )
+
+            with self.drawers_lock:
+                self.drawers.append(drawer)
+            new_detections += 1
+
+        # Update distances to robot
+        self._update_distances()
+
+        # Optionally rank via LOCUS GNN
+        if self.rank_via_locus:
+            self._rank_via_locus_stub()
+
+        if new_detections > 0:
+            self.get_logger().info(
+                f"Detected {new_detections} new drawer(s), "
+                f"total: {len(self.drawers)}"
+            )
+
+        return len(self.drawers)
+
+    def _detect_drawers_detic(self, rgb: np.ndarray):
+        """Use Detic to find drawer bboxes and handle sub-bboxes.
+
+        Returns list of (drawer_bbox, handle_bbox, confidence) tuples.
+        Each bbox is [x0, y0, x1, y1].
+        """
+        results = []
+
+        try:
+            from realrobot.detector import VisualDetector, nms_by_type
+        except ImportError:
+            self.get_logger().warn(
+                "Could not import from semantic-object-container-room. "
+                "Using fallback detection."
+            )
+            return results
+
+        if self.detector is None:
+            self.detector = VisualDetector(
+                device="cpu", score_threshold=self.detection_confidence
+            )
+
+        detections = self.detector.detect(rgb, return_crops=False)
+        detections = nms_by_type(detections)
+
+        # Filter for drawer-like classes
+        drawer_classes = {
+            "Drawer", "Cabinet", "Chest", "FilingCabinet",
+            "Dresser", "NightStand", "SideTable",
+            "drawer", "cabinet", "chest_of_drawers",
+        }
+
+        for det in detections:
+            if det.object_type not in drawer_classes:
+                continue
+            if det.score < self.detection_confidence:
+                continue
+
+            drawer_bbox = det.bbox
+
+            # Find handle within the drawer bbox region
+            handle_bbox = self._find_handle_in_bbox(rgb, drawer_bbox)
+            if handle_bbox is None:
+                # Use center of drawer as handle estimate
+                cx = (drawer_bbox[0] + drawer_bbox[2]) // 2
+                cy = (drawer_bbox[1] + drawer_bbox[3]) // 2
+                hw, hh = 20, 10
+                handle_bbox = [cx - hw, cy - hh, cx + hw, cy + hh]
+
+            results.append((drawer_bbox, handle_bbox, det.score))
+
+        return results
+
+    def _find_handle_in_bbox(self, rgb: np.ndarray, drawer_bbox: list):
+        """Find the handle bounding box within a drawer bounding box.
+
+        Runs a second Detic pass on the cropped drawer region looking
+        for handle-like objects.
+        """
+        x0, y0, x1, y1 = drawer_bbox
+        crop = rgb[y0:y1, x0:x1]
+        if crop.size == 0:
+            return None
+
+        try:
+            from realrobot.detector import VisualDetector
+        except ImportError:
+            return None
+
+        # Detect handles in the cropped region
+        handle_detector = VisualDetector(
+            device="cpu", score_threshold=0.3
+        )
+        detections = handle_detector.detect(crop, return_crops=False)
+
+        handle_classes = {"Handle", "Knob", "DoorHandle", "handle", "knob"}
+        best_handle = None
+        best_score = 0.0
+
+        for det in detections:
+            if det.object_type in handle_classes and det.score > best_score:
+                best_handle = det.bbox
+                best_score = det.score
+
+        if best_handle is None:
+            return None
+
+        # Convert back to full-image coordinates
+        return [
+            best_handle[0] + x0,
+            best_handle[1] + y0,
+            best_handle[2] + x0,
+            best_handle[3] + y0,
+        ]
+
+    # ─── Projection and geometry ──────────────────────────────────────
+
+    def _project_to_world(
+        self, bbox, depth, camera_pose, camera_K, max_depth=5.0
+    ):
+        """Project bbox center to 3D world coordinates using depth."""
+        try:
+            from realrobot.stretch.projection import project_bbox_to_world_se3
+            result = project_bbox_to_world_se3(
+                bbox, depth.astype(np.float32),
+                camera_pose, camera_K, max_depth=max_depth
+            )
+            return result
+        except ImportError:
+            pass
+
+        # Fallback: manual projection
+        x0, y0, x1, y1 = bbox
+        h, w = depth.shape[:2]
+
+        u = int((x0 + x1) / 2)
+        v = int((y0 + y1) / 2)
+        u = max(0, min(u, w - 1))
+        v = max(0, min(v, h - 1))
+
+        # Sample depth in a small region around center
+        region = depth[max(0, v-3):v+3, max(0, u-3):u+3]
+        if depth.dtype == np.uint16:
+            region = region.astype(np.float32) / 1000.0
+        valid = region[region > 0.1]
+        if len(valid) == 0:
+            return None
+
+        d = float(np.median(valid))
+        if d > max_depth:
+            return None
+
+        fx, fy = camera_K[0, 0], camera_K[1, 1]
+        cx, cy = camera_K[0, 2], camera_K[1, 2]
+
+        x_cam = (u - cx) / fx * d
+        y_cam = (v - cy) / fy * d
+        z_cam = d
+
+        p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        p_world = camera_pose @ p_cam
+        return p_world[:3]
+
+    def _transform_to_matrix(self, transform: TransformStamped) -> np.ndarray:
+        """Convert a TF TransformStamped to a 4x4 SE(3) matrix."""
+        from tf_transformations import quaternion_matrix
+
+        t = transform.transform.translation
+        q = transform.transform.rotation
+        mat = quaternion_matrix([q.x, q.y, q.z, q.w])
+        mat[0, 3] = t.x
+        mat[1, 3] = t.y
+        mat[2, 3] = t.z
+        return mat
+
+    def _check_reachability(self, world_pos: np.ndarray) -> bool:
+        """Determine if the Stretch3 gripper can reach this position."""
+        z = world_pos[2]
+        if z < self.min_reach_height or z > self.max_reach_height:
+            return False
+        return True
+
+    # ─── De-duplication ───────────────────────────────────────────────
+
+    def _try_merge_detection(self, world_pos: np.ndarray, confidence: float) -> bool:
+        """Check if this detection matches an existing drawer. If so, merge.
+
+        Uses functions from semantic-object-container-room for denoising.
+        Returns True if merged (i.e., it's a duplicate).
+        """
+        with self.drawers_lock:
+            for existing in self.drawers:
+                if existing.handle_center_world is None:
+                    continue
+                dist = np.linalg.norm(
+                    world_pos - np.array(existing.handle_center_world)
+                )
+                if dist < self.dedup_distance:
+                    # Merge: update position with weighted average
+                    n = existing.observations
+                    existing.handle_center_world = (
+                        existing.handle_center_world * n + world_pos
+                    ) / (n + 1)
+                    existing.handle_grasp_world = existing.handle_center_world.copy()
+                    existing.observations += 1
+                    existing.confidence = max(existing.confidence, confidence)
+                    return True
+        return False
+
+    def _update_distances(self):
+        """Update distance_to_robot for all drawers."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "map", "base_link",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+            robot_x = transform.transform.translation.x
+            robot_y = transform.transform.translation.y
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+            return
+
+        with self.drawers_lock:
+            for d in self.drawers:
+                if d.handle_center_world is not None:
+                    dx = d.handle_center_world[0] - robot_x
+                    dy = d.handle_center_world[1] - robot_y
+                    d.distance_to_robot = math.sqrt(dx * dx + dy * dy)
+
+    # ─── LOCUS GNN ranking stub ───────────────────────────────────────
+
+    def _rank_via_locus_stub(self):
+        """Stub for calling the GNN node ranking logic.
+
+        When implemented, this should call into
+        semantic-object-container-room/gnn/ with the following data:
+          - All drawer world positions (handle_center_world)
+          - CLIP embeddings of each drawer crop
+          - Scene graph context (room type, nearby objects)
+          - Spatial relationships between containers
+          - Room layout / voxel occupancy context
+
+        The GNN would return a ranking score for each drawer based on
+        how likely it is to contain the target object.
+        """
+        # TODO: Implement GNN ranking via semantic-object-container-room
+        # Required data for container node ranking:
+        #   1. drawer CLIP embedding (from annotated_image crop)
+        #   2. drawer world position (handle_center_world)
+        #   3. nearby object types and positions (scene graph nodes)
+        #   4. room type string
+        #   5. spatial edges (distance-based) between all containers
+        #   6. text embedding of target query object
+        #
+        # Call: from realrobot.inference import score_containers
+        #       scores = score_containers(graph, query_embedding, model)
+        #       for drawer, score in zip(self.drawers, scores):
+        #           drawer.ranking = score
+        pass
+
+    # ─── Annotation and visualization ─────────────────────────────────
+
+    def _annotate_image(
+        self, rgb: np.ndarray, drawer_bbox: list, handle_bbox: list
+    ) -> np.ndarray:
+        """Draw drawer and handle bounding boxes on the image."""
+        annotated = rgb.copy()
+        # Drawer bbox in blue
+        cv2.rectangle(
+            annotated,
+            (drawer_bbox[0], drawer_bbox[1]),
+            (drawer_bbox[2], drawer_bbox[3]),
+            (0, 0, 255), 2,
+        )
+        # Handle bbox in green
+        cv2.rectangle(
+            annotated,
+            (handle_bbox[0], handle_bbox[1]),
+            (handle_bbox[2], handle_bbox[3]),
+            (0, 255, 0), 2,
+        )
+        # Handle center dot
+        hcx = (handle_bbox[0] + handle_bbox[2]) // 2
+        hcy = (handle_bbox[1] + handle_bbox[3]) // 2
+        cv2.circle(annotated, (hcx, hcy), 5, (255, 0, 0), -1)
+        return annotated
+
+    def publish_markers(self):
+        """Publish drawer markers in RViz: green=reachable, red=unreachable."""
+        marker_array = MarkerArray()
+
+        with self.drawers_lock:
+            for i, drawer in enumerate(self.drawers):
+                if drawer.handle_center_world is None:
+                    continue
+
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "drawers"
+                marker.id = i
+                marker.type = Marker.CUBE
+                marker.action = Marker.ADD
+
+                marker.pose.position.x = float(drawer.handle_center_world[0])
+                marker.pose.position.y = float(drawer.handle_center_world[1])
+                marker.pose.position.z = float(drawer.handle_center_world[2])
+                marker.pose.orientation.w = 1.0
+
+                marker.scale.x = 0.3
+                marker.scale.y = 0.1
+                marker.scale.z = 0.15
+
+                if drawer.reachable:
+                    marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.7)
+                else:
+                    marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.7)
+
+                marker_array.markers.append(marker)
+
+                # Text label
+                text_marker = Marker()
+                text_marker.header = marker.header
+                text_marker.ns = "drawer_labels"
+                text_marker.id = i
+                text_marker.type = Marker.TEXT_VIEW_FACING
+                text_marker.action = Marker.ADD
+                text_marker.pose.position.x = float(drawer.handle_center_world[0])
+                text_marker.pose.position.y = float(drawer.handle_center_world[1])
+                text_marker.pose.position.z = float(drawer.handle_center_world[2]) + 0.2
+                text_marker.scale.z = 0.08
+                text_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+                text_marker.text = (
+                    f"{drawer.drawer_id} "
+                    f"({'R' if drawer.reachable else 'X'}) "
+                    f"{drawer.handle_orientation[0].upper()} "
+                    f"{drawer.distance_to_robot:.1f}m"
+                )
+                marker_array.markers.append(text_marker)
+
+        self.marker_pub.publish(marker_array)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DrawerDetectionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

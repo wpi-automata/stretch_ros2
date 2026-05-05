@@ -1,0 +1,24 @@
+drawer_detection_node:
+  ros__parameters:
+    # Detic detection threshold for drawer class
+    detection_confidence: 0.5
+
+    # De-duplication: min distance (m) to consider two detections as the same drawer
+    dedup_distance_m: 0.3
+
+    # Stretch3 reachability limits (gripper Z in map frame)
+    max_reach_height: 1.4       # meters (above floor)
+    min_reach_height: 0.1       # meters (above floor)
+    max_reach_distance: 0.6     # max arm extension
+
+    # Detection rate (Hz) — how often to run detection on incoming frames
+    detection_rate_hz: 2.0
+
+    # Test mode: robot does a spiral pattern instead of relying on mapping node
+    test_mode: false
+
+    # LOCUS GNN ranking (stub — not yet implemented)
+    rank_via_LOCUS: false
+
+    # Environment
+    use_sim: false

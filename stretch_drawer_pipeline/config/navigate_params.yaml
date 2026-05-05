@@ -1,0 +1,19 @@
+navigate_open_node:
+  ros__parameters:
+    # How far from the drawer handle to position the robot base (meters)
+    approach_distance: 1.0
+
+    # Force thresholds (Newtons)
+    grasp_force_threshold: 5.0    # force to detect handle contact
+    pull_force_threshold: 15.0    # force to stop pulling (drawer open or stuck)
+
+    # Gripper
+    gripper_close_effort: -50.0   # effort value to close gripper
+
+    # Arm motion
+    arm_extension_speed: 0.01     # m per step when approaching
+    pull_speed: 0.02              # m per step when pulling
+    max_pull_distance: 0.4        # max meters to pull back
+
+    # Environment
+    use_sim: false

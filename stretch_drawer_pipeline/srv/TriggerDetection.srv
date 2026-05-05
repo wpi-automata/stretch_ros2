@@ -1,0 +1,6 @@
+# Trigger a detection pass (used in testing mode)
+---
+# Number of drawers found
+uint32 drawer_count
+bool success
+string message
