@@ -270,6 +270,9 @@ class NavigateOpenNode(Node):
             # Retract arm
             self._retract_arm()
 
+            # Step 12: Look at the opened drawer
+            self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
+
             if pull_success:
                 self._set_state(OpenState.COMPLETE)
                 self.get_logger().info("Drawer opened successfully!")
@@ -479,6 +482,60 @@ class NavigateOpenNode(Node):
         # else:
         #     self._send_joint_command("joint_wrist_roll", 0.0)
         time.sleep(1.0)
+
+    # ─── Head control ─────────────────────────────────────────────────
+
+    def _look_at_drawer(self, handle_pos: np.ndarray, corners_world=None):
+        """Pan and tilt the head camera to look at the drawer center.
+
+        Computes the target position in base_link frame, then derives
+        head pan and tilt angles using the known head mount position
+        on the mast (1.33m above base_link).
+        Pan = 0 is the robot's forward direction.
+        Tilt = 0 is horizontal, negative looks down.
+        """
+        if corners_world and len(corners_world) >= 4:
+            pts = np.array([[c["x"], c["y"], c["z"]] for c in corners_world])
+            target = pts.mean(axis=0)
+        else:
+            target = handle_pos.copy()
+
+        try:
+            robot_pose = self._get_robot_pose()
+            robot_yaw = self._get_robot_yaw()
+            if robot_pose is None or robot_yaw is None:
+                self.get_logger().warn("Cannot look at drawer: no robot pose")
+                return
+
+            # Target direction in world frame
+            dx_world = target[0] - robot_pose[0]
+            dy_world = target[1] - robot_pose[1]
+
+            # Rotate into base_link frame (base_link X = forward)
+            cos_yaw = math.cos(robot_yaw)
+            sin_yaw = math.sin(robot_yaw)
+            dx_base = cos_yaw * dx_world + sin_yaw * dy_world
+            dy_base = -sin_yaw * dx_world + cos_yaw * dy_world
+
+            # Head is ~1.33m above base_link
+            head_height = 1.33
+            dz = target[2] - head_height
+
+            pan = math.atan2(dy_base, dx_base)
+            horiz_dist = math.sqrt(dx_base * dx_base + dy_base * dy_base)
+            tilt = math.atan2(dz, horiz_dist)
+
+            self.get_logger().info(
+                f"Looking at drawer: base=({dx_base:.2f}, {dy_base:.2f}), "
+                f"dz={dz:.2f}, pan={math.degrees(pan):.1f} deg, "
+                f"tilt={math.degrees(tilt):.1f} deg"
+            )
+            self._send_joint_command("joint_head_pan", pan, duration_sec=2)
+            self._send_joint_command("joint_head_tilt", tilt, duration_sec=2)
+            time.sleep(2.0)
+
+        except Exception as e:
+            self.get_logger().warn(f"Cannot look at drawer: {e}")
 
     # ─── Arm control ──────────────────────────────────────────────────
 

@@ -17,26 +17,46 @@ Given a list of detected drawers from Node 2, navigates the robot to the best ta
 | `max_pull_distance` | `0.4` | Max pull-back distance |
 | `use_sim` | `false` | Simulation mode |
 
+## Launch Arguments
+
+`approach_distance` and `max_pull_distance` are exposed as launch arguments for easy override:
+
+```bash
+ros2 launch stretch_drawer_pipeline test_navigate.launch.py use_sim:=true approach_distance:=0.6 max_pull_distance:=0.3
+```
+
+| Launch Argument | Default | Description |
+|-----------------|---------|-------------|
+| `use_sim` | `false` | Simulation mode (enables use_sim_time) |
+| `approach_distance` | `0.45` | Distance (m) from handle to position robot base |
+| `max_pull_distance` | `0.4` | Max distance (m) to retract arm when pulling drawer |
+
+All other parameters can be tuned in `config/navigate_params.yaml`.
+
 ## Execution Sequence
 
 1. **Select Drawer**: Get list from Node 2, sort by ranking (or distance if no ranking)
 2. **Switch to position mode**: Call `/switch_to_position_mode` so `translate_mobile_base` and `rotate_mobile_base` commands move the base
-3. **Navigate**: Rotate toward, then drive to `approach_distance` from handle using `rotate_mobile_base` and `translate_mobile_base` via FollowJointTrajectory
-4. **Align**: Compute drawer face normal from corner geometry, rotate perpendicular so the arm faces the drawer
-5. **Orient Wrist**: Rotate wrist yaw to match handle orientation (horizontal/vertical)
-6. **Approach**: Incrementally extend arm until `grasp_force_threshold` exceeded
-7. **Grasp**: Close gripper to hold handle
-8. **Pull**: Retract arm until `pull_force_threshold` or `max_pull_distance`
-9. **Release**: Open gripper and retract arm fully
-10. **Switch to navigation mode**: Call `/switch_to_navigation_mode` in a `finally` block (always runs, even on failure/exception) so `cmd_vel` works again for frontier exploration
+3. **Navigate & Align**: Compute approach pose directly in front of the handle, offset along the drawer face normal by `approach_distance`. Execute rotate → drive → rotate to position the robot with its arm facing the handle
+4. **Orient Wrist**: Set wrist yaw for bump approach (pi/2), roll based on handle orientation
+5. **Approach (bump)**: Extend arm toward handle to find bump/contact point. Sim: computed distance. Real: force threshold
+6. **Retract**: Pull arm back fully
+7. **Open & Orient**: Open gripper, set wrist yaw to 0 (inline with arm) and roll for handle orientation
+8. **Re-extend**: Extend arm back to the recorded bump point
+9. **Grasp**: Close gripper to hold handle
+10. **Pull**: Retract arm up to `max_pull_distance`. Sim: single retract command. Real: incremental with force threshold
+11. **Release**: Open gripper and retract arm fully
+12. **Look at drawer**: Pan/tilt head camera to view the opened drawer using TF geometry
+13. **Switch to navigation mode**: Call `/switch_to_navigation_mode` in a `finally` block (always runs, even on failure/exception) so `cmd_vel` works again for frontier exploration
 
-## Force Feedback
+## Sim vs Real Differences
 
-The node monitors `/joint_states` effort values:
-- **Contact detection**: `wrist_extension` effort exceeds `grasp_force_threshold`
-- **Pull limit**: `wrist_extension` effort exceeds `pull_force_threshold`
-
-This works in both MuJoCo simulation (which provides simulated force readings) and on the real Stretch3 hardware.
+| Step | Simulation | Real Robot |
+|------|-----------|------------|
+| **Approach (bump)** | Computes distance to handle, extends directly | Extends incrementally, stops on force contact |
+| **Pull** | Retracts full `max_pull_distance` in one command | Retracts incrementally, stops when effort > `pull_force_threshold` |
+| **Force feedback** | MuJoCo publishes zero effort — unavailable | Monitors `/joint_states` effort for `grasp_force_threshold` and `pull_force_threshold` |
+| **Arm extension joints** | Reads `joint_arm_l0..l3` (sum = total extension) | Reads `wrist_extension` directly |
 
 ## RViz Visualization
 

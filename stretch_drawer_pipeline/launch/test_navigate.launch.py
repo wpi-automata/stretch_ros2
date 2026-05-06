@@ -24,6 +24,8 @@ def generate_launch_description():
     rviz_config = os.path.join(pkg_dir, "rviz", "mapping.rviz")
 
     use_sim = LaunchConfiguration("use_sim")
+    approach_distance = LaunchConfiguration("approach_distance")
+    max_pull_distance = LaunchConfiguration("max_pull_distance")
 
     detection_node = Node(
         package="stretch_drawer_pipeline",
@@ -44,7 +46,12 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "navigate_params.yaml"),
-            {"use_sim": use_sim, "use_sim_time": use_sim},
+            {
+                "use_sim": use_sim,
+                "use_sim_time": use_sim,
+                "approach_distance": approach_distance,
+                "max_pull_distance": max_pull_distance,
+            },
         ],
     )
 
@@ -60,6 +67,10 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("use_sim", default_value="false",
                               description="Set true for simulation (enables use_sim_time)"),
+        DeclareLaunchArgument("approach_distance", default_value="0.45",
+                              description="Distance (m) from handle to position robot base"),
+        DeclareLaunchArgument("max_pull_distance", default_value="0.4",
+                              description="Max distance (m) to retract arm when pulling drawer"),
         detection_node,
         navigate_node,
         rviz_node,
