@@ -219,17 +219,12 @@ class NavigateOpenNode(Node):
             # Switch to position mode so base translate/rotate commands work
             self._switch_to_position_mode()
 
-            # Step 2: Navigate base to approach_distance from drawer
+            # Step 2: Navigate to approach pose (in front of handle,
+            # perpendicular to drawer face) and align arm toward handle
             self._set_state(OpenState.NAVIGATING)
-            nav_success = self._navigate_to_approach_pose(handle_pos)
+            corners = drawer.get("drawer_corners_world")
+            nav_success = self._navigate_to_approach_pose(handle_pos, corners)
             if not nav_success or self.stop_requested:
-                self._set_state(OpenState.FAILED)
-                return
-
-            # Step 3: Align robot perpendicular to drawer face
-            self._set_state(OpenState.ALIGNING)
-            self._align_to_drawer(handle_pos, orientation, drawer.get("drawer_corners_world"))
-            if self.stop_requested:
                 self._set_state(OpenState.FAILED)
                 return
 
@@ -331,119 +326,107 @@ class NavigateOpenNode(Node):
 
     # ─── Navigation ───────────────────────────────────────────────────
 
-    def _navigate_to_approach_pose(self, handle_pos: np.ndarray) -> bool:
-        """Navigate robot base to approach_distance from the drawer.
+    def _navigate_to_approach_pose(self, handle_pos: np.ndarray,
+                                   corners_world=None) -> bool:
+        """Navigate robot to stand directly in front of the handle,
+        perpendicular to the drawer face, with the arm facing the handle.
 
-        Uses rotate_mobile_base and translate_mobile_base via
-        FollowJointTrajectory to rotate toward, then drive to, the
-        approach point.
+        Computes an approach point along the drawer face normal at
+        approach_distance from the handle. Then executes:
+          1. Rotate to face the approach point
+          2. Drive straight to the approach point (with stall detection)
+          3. Rotate so the arm (left side) faces the drawer
+
+        Works regardless of the robot's starting position/orientation.
         """
         robot_pose = self._get_robot_pose()
         if robot_pose is None:
             return False
 
-        dx = robot_pose[0] - handle_pos[0]
-        dy = robot_pose[1] - handle_pos[1]
-        dist = math.sqrt(dx * dx + dy * dy)
-        if dist < 0.01:
-            dx, dy = 1.0, 0.0
-            dist = 1.0
+        # Drawer face normal points outward from the drawer surface
+        face_normal = self._compute_drawer_face_normal(corners_world, handle_pos)
+        normal_angle = math.atan2(face_normal[1], face_normal[0])
 
-        ux = dx / dist
-        uy = dy / dist
-
-        approach_x = handle_pos[0] + ux * self.approach_distance
-        approach_y = handle_pos[1] + uy * self.approach_distance
+        # Approach point: handle position offset along face normal
+        approach_x = handle_pos[0] + face_normal[0] * self.approach_distance
+        approach_y = handle_pos[1] + face_normal[1] * self.approach_distance
 
         self._publish_path(robot_pose, (approach_x, approach_y))
         self.get_logger().info(
-            f"Navigating to approach pose: ({approach_x:.2f}, {approach_y:.2f})"
+            f"Approach pose: ({approach_x:.2f}, {approach_y:.2f}), "
+            f"face normal {math.degrees(normal_angle):.1f} deg"
         )
 
-        # Rotate to face the approach point
-        angle_to_target = math.atan2(
-            approach_y - robot_pose[1], approach_x - robot_pose[0]
-        )
-        current_yaw = self._get_robot_yaw()
-        if current_yaw is not None:
-            angle_diff = (angle_to_target - current_yaw + math.pi) % (2 * math.pi) - math.pi
-            if abs(angle_diff) > 0.05:
-                self.get_logger().info(f"Rotating {math.degrees(angle_diff):.1f} deg to face approach point")
-                self._rotate_in_place(angle_diff)
+        # Phase 1: Rotate to face the approach point
+        dx = approach_x - robot_pose[0]
+        dy = approach_y - robot_pose[1]
+        travel_dist = math.sqrt(dx * dx + dy * dy)
 
-        # Drive forward to approach point in increments.
-        # Instead of a fixed timeout, track progress — only fail if the
-        # robot stops making progress (stall detection).
-        stall_timeout = 10.0
-        last_remaining = float("inf")
-        last_progress_time = time.time()
+        if travel_dist > 0.1:
+            angle_to_approach = math.atan2(dy, dx)
+            current_yaw = self._get_robot_yaw()
+            if current_yaw is not None:
+                angle_diff = (angle_to_approach - current_yaw + math.pi) % (2 * math.pi) - math.pi
+                if abs(angle_diff) > 0.05:
+                    self.get_logger().info(
+                        f"Phase 1: Rotating {math.degrees(angle_diff):.1f} deg to face approach point"
+                    )
+                    self._rotate_in_place(angle_diff)
+                    if self.stop_requested:
+                        return False
 
-        while not self.stop_requested:
-            robot_pose = self._get_robot_pose()
-            if robot_pose is None:
-                time.sleep(0.2)
-                continue
+            # Phase 2: Drive to approach point with stall detection
+            stall_timeout = 10.0
+            last_remaining = float("inf")
+            last_progress_time = time.time()
 
-            dx = approach_x - robot_pose[0]
-            dy = approach_y - robot_pose[1]
-            remaining = math.sqrt(dx * dx + dy * dy)
+            while not self.stop_requested:
+                robot_pose = self._get_robot_pose()
+                if robot_pose is None:
+                    time.sleep(0.2)
+                    continue
 
-            if remaining < 0.1:
-                self.get_logger().info("Reached approach point")
-                return True
+                dx = approach_x - robot_pose[0]
+                dy = approach_y - robot_pose[1]
+                remaining = math.sqrt(dx * dx + dy * dy)
 
-            # Check if we're still making progress
-            if last_remaining - remaining > 0.02:
-                last_progress_time = time.time()
-                last_remaining = remaining
-            elif time.time() - last_progress_time > stall_timeout:
-                self.get_logger().warn(
-                    f"Navigation stalled at {remaining:.2f}m from target"
-                )
+                if remaining < 0.1:
+                    self.get_logger().info("Reached approach point")
+                    break
+
+                if last_remaining - remaining > 0.02:
+                    last_progress_time = time.time()
+                    last_remaining = remaining
+                elif time.time() - last_progress_time > stall_timeout:
+                    self.get_logger().warn(
+                        f"Navigation stalled at {remaining:.2f}m from target"
+                    )
+                    return False
+
+                step = min(remaining, 0.2)
+                self.get_logger().info(f"Phase 2: Driving {step:.2f}m (remaining {remaining:.2f}m)")
+                self._send_joint_command("translate_mobile_base", step, duration_sec=3)
+                time.sleep(1.0)
+
+            if self.stop_requested:
                 return False
 
-            step = min(remaining, 0.2)
-            self.get_logger().info(f"Driving forward {step:.2f}m (remaining {remaining:.2f}m)")
-            self._send_joint_command("translate_mobile_base", step, duration_sec=3)
-            time.sleep(1.0)
-
-        self.get_logger().warn("Navigation stopped by user")
-        return False
-
-    def _align_to_drawer(self, handle_pos: np.ndarray, orientation: str,
-                         corners_world=None):
-        """Rotate robot so the arm faces the drawer, perpendicular to its face.
-
-        If drawer_corners_world is available (4 corner points from the
-        detection node), the drawer face normal is computed from the
-        corners. Otherwise falls back to using the robot-to-handle vector.
-
-        The Stretch arm extends to the robot's left (+Y in base_link),
-        so the robot's forward direction should be perpendicular to the
-        drawer face, pointing along the face (with the arm toward it).
-        """
-        face_normal = self._compute_drawer_face_normal(corners_world, handle_pos)
-        # face_normal points outward from the drawer face. The robot
-        # should approach from the direction the normal points, so the
-        # arm (extending left) faces into the drawer. The robot's
-        # forward axis should be perpendicular to the normal, rotated
-        # so the left side points opposite to the normal.
-        # desired_heading = atan2(normal_y, normal_x) - pi/2
-        normal_angle = math.atan2(face_normal[1], face_normal[0])
+        # Phase 3: Rotate so the arm faces the drawer.
+        # The arm extends to the robot's left (+Y in base_link), so the
+        # robot's forward axis should be perpendicular to the face normal,
+        # with the left side pointing toward the drawer.
         desired_heading = normal_angle - math.pi / 2
-
         current_yaw = self._get_robot_yaw()
-        if current_yaw is None:
-            return
+        if current_yaw is not None:
+            angle_diff = (desired_heading - current_yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(angle_diff) > 0.05:
+                self.get_logger().info(
+                    f"Phase 3: Rotating {math.degrees(angle_diff):.1f} deg to align arm toward drawer"
+                )
+                self._rotate_in_place(angle_diff)
 
-        angle_diff = (desired_heading - current_yaw + math.pi) % (2 * math.pi) - math.pi
-        self.get_logger().info(
-            f"Aligning: rotate {math.degrees(angle_diff):.1f} deg "
-            f"(face normal {math.degrees(normal_angle):.1f} deg, "
-            f"desired heading {math.degrees(desired_heading):.1f} deg)"
-        )
-        if abs(angle_diff) > 0.05:
-            self._rotate_in_place(angle_diff)
+        self.get_logger().info("Approach pose reached and aligned")
+        return True
 
     def _compute_drawer_face_normal(self, corners_world, handle_pos):
         """Compute the outward-facing normal of the drawer face.
@@ -734,9 +717,8 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - robot_pose[0]
         dy = target_world[1] - robot_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        # Add 5cm to compensate for open gripper losing reach vs closed gripper
-        target_extension = min(dist + 0.05, 0.52)
-        self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m (includes 5cm gripper offset)")
+        target_extension = min(dist, 0.52)
+        self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m")
         self._send_joint_command("wrist_extension", target_extension, duration_sec=4)
         time.sleep(1.0)
 
