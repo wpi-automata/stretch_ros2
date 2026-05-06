@@ -132,7 +132,10 @@ class JointTrajectoryAction:
                     used_wheel_velocity = True
                     continue
 
-                self.node.sim.move_to(actuator, target_position)
+                if actuator in (Actuators.base_translate, Actuators.base_rotate):
+                    self.node.sim.move_by(actuator, target_position)
+                else:
+                    self.node.sim.move_to(actuator, target_position)
 
                 actuators_in_use.append(actuator)
 

@@ -44,7 +44,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
-from geometry_msgs.msg import PoseStamped, Point, Twist
+from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import Path
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String, Header, ColorRGBA
@@ -77,7 +77,7 @@ class NavigateOpenNode(Node):
         super().__init__("navigate_open_node")
 
         # Parameters
-        self.declare_parameter("approach_distance", 1.0)
+        self.declare_parameter("approach_distance", 0.45)
         self.declare_parameter("grasp_force_threshold", 5.0)
         self.declare_parameter("pull_force_threshold", 15.0)
         self.declare_parameter("gripper_close_effort", -50.0)
@@ -116,7 +116,6 @@ class NavigateOpenNode(Node):
         self.status_pub = self.create_publisher(
             String, "/navigate_open/status", 10
         )
-        self.cmd_vel_pub = self.create_publisher(Twist, "/stretch/cmd_vel", 10)
         self.trajectory_client = ActionClient(
             self, FollowJointTrajectory,
             "/stretch_controller/follow_joint_trajectory",
@@ -142,6 +141,14 @@ class NavigateOpenNode(Node):
         # Client to get drawers from Node 2
         self.get_drawers_client = self.create_client(
             Trigger, "/detection/get_drawers"
+        )
+
+        # Mode switching (sim needs position mode for base translate/rotate)
+        self.position_mode_client = self.create_client(
+            Trigger, "/switch_to_position_mode"
+        )
+        self.navigation_mode_client = self.create_client(
+            Trigger, "/switch_to_navigation_mode"
         )
 
         # Status timer
@@ -206,8 +213,11 @@ class NavigateOpenNode(Node):
                 f"orientation={orientation}"
             )
 
-            # Publish target marker (pink)
-            self._publish_target_marker(handle_pos)
+            # Publish target marker (pink) sized to drawer bounding box
+            self._publish_target_marker(drawer)
+
+            # Switch to position mode so base translate/rotate commands work
+            self._switch_to_position_mode()
 
             # Step 2: Navigate base to approach_distance from drawer
             self._set_state(OpenState.NAVIGATING)
@@ -218,7 +228,7 @@ class NavigateOpenNode(Node):
 
             # Step 3: Align robot perpendicular to drawer face
             self._set_state(OpenState.ALIGNING)
-            self._align_to_drawer(handle_pos, orientation)
+            self._align_to_drawer(handle_pos, orientation, drawer.get("drawer_corners_world"))
             if self.stop_requested:
                 self._set_state(OpenState.FAILED)
                 return
@@ -261,6 +271,8 @@ class NavigateOpenNode(Node):
             self.get_logger().error(f"Pipeline failed: {e}")
             self._set_state(OpenState.FAILED)
             self._stop_robot()
+        finally:
+            self._switch_to_navigation_mode()
 
     # ─── Drawer selection ─────────────────────────────────────────────
 
@@ -305,9 +317,11 @@ class NavigateOpenNode(Node):
     # ─── Navigation ───────────────────────────────────────────────────
 
     def _navigate_to_approach_pose(self, handle_pos: np.ndarray) -> bool:
-        """Navigate robot base to approach_distance from the drawer using cmd_vel.
+        """Navigate robot base to approach_distance from the drawer.
 
-        Drives toward the approach point, then stops when close enough.
+        Uses rotate_mobile_base and translate_mobile_base via
+        FollowJointTrajectory to rotate toward, then drive to, the
+        approach point.
         """
         robot_pose = self._get_robot_pose()
         if robot_pose is None:
@@ -331,60 +345,126 @@ class NavigateOpenNode(Node):
             f"Navigating to approach pose: ({approach_x:.2f}, {approach_y:.2f})"
         )
 
-        # First rotate to face the approach point
+        # Rotate to face the approach point
         angle_to_target = math.atan2(
             approach_y - robot_pose[1], approach_x - robot_pose[0]
         )
         current_yaw = self._get_robot_yaw()
         if current_yaw is not None:
             angle_diff = (angle_to_target - current_yaw + math.pi) % (2 * math.pi) - math.pi
-            self._rotate_in_place(angle_diff)
+            if abs(angle_diff) > 0.05:
+                self.get_logger().info(f"Rotating {math.degrees(angle_diff):.1f} deg to face approach point")
+                self._rotate_in_place(angle_diff)
 
-        # Drive forward until close
-        timeout = 60.0
-        start = time.time()
-        while time.time() - start < timeout and not self.stop_requested:
-            pose = self._get_robot_pose()
-            if pose is None:
-                time.sleep(0.1)
+        # Drive forward to approach point in increments.
+        # Instead of a fixed timeout, track progress — only fail if the
+        # robot stops making progress (stall detection).
+        stall_timeout = 10.0
+        last_remaining = float("inf")
+        last_progress_time = time.time()
+
+        while not self.stop_requested:
+            robot_pose = self._get_robot_pose()
+            if robot_pose is None:
+                time.sleep(0.2)
                 continue
 
-            dx = approach_x - pose[0]
-            dy = approach_y - pose[1]
+            dx = approach_x - robot_pose[0]
+            dy = approach_y - robot_pose[1]
             remaining = math.sqrt(dx * dx + dy * dy)
 
-            if remaining < 0.15:
-                self.cmd_vel_pub.publish(Twist())
+            if remaining < 0.1:
+                self.get_logger().info("Reached approach point")
                 return True
 
-            speed = min(0.3, remaining)
-            twist = Twist()
-            twist.linear.x = speed
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.1)
+            # Check if we're still making progress
+            if last_remaining - remaining > 0.02:
+                last_progress_time = time.time()
+                last_remaining = remaining
+            elif time.time() - last_progress_time > stall_timeout:
+                self.get_logger().warn(
+                    f"Navigation stalled at {remaining:.2f}m from target"
+                )
+                return False
 
-        self.cmd_vel_pub.publish(Twist())
+            step = min(remaining, 0.2)
+            self.get_logger().info(f"Driving forward {step:.2f}m (remaining {remaining:.2f}m)")
+            self._send_joint_command("translate_mobile_base", step, duration_sec=3)
+            time.sleep(1.0)
+
+        self.get_logger().warn("Navigation stopped by user")
         return False
 
-    def _align_to_drawer(self, handle_pos: np.ndarray, orientation: str):
-        """Fine-tune robot rotation to face the drawer with the arm."""
-        robot_pose = self._get_robot_pose()
-        if robot_pose is None:
-            return
+    def _align_to_drawer(self, handle_pos: np.ndarray, orientation: str,
+                         corners_world=None):
+        """Rotate robot so the arm faces the drawer, perpendicular to its face.
 
-        dx = handle_pos[0] - robot_pose[0]
-        dy = handle_pos[1] - robot_pose[1]
-        angle_to_handle = math.atan2(dy, dx)
+        If drawer_corners_world is available (4 corner points from the
+        detection node), the drawer face normal is computed from the
+        corners. Otherwise falls back to using the robot-to-handle vector.
 
-        # Robot arm points left, so desired heading is handle_angle + pi/2
-        desired_heading = angle_to_handle + math.pi / 2
+        The Stretch arm extends to the robot's left (+Y in base_link),
+        so the robot's forward direction should be perpendicular to the
+        drawer face, pointing along the face (with the arm toward it).
+        """
+        face_normal = self._compute_drawer_face_normal(corners_world, handle_pos)
+        # face_normal points outward from the drawer face. The robot
+        # should approach from the direction the normal points, so the
+        # arm (extending left) faces into the drawer. The robot's
+        # forward axis should be perpendicular to the normal, rotated
+        # so the left side points opposite to the normal.
+        # desired_heading = atan2(normal_y, normal_x) - pi/2
+        normal_angle = math.atan2(face_normal[1], face_normal[0])
+        desired_heading = normal_angle - math.pi / 2
 
         current_yaw = self._get_robot_yaw()
         if current_yaw is None:
             return
 
         angle_diff = (desired_heading - current_yaw + math.pi) % (2 * math.pi) - math.pi
-        self._rotate_in_place(angle_diff)
+        self.get_logger().info(
+            f"Aligning: rotate {math.degrees(angle_diff):.1f} deg "
+            f"(face normal {math.degrees(normal_angle):.1f} deg, "
+            f"desired heading {math.degrees(desired_heading):.1f} deg)"
+        )
+        if abs(angle_diff) > 0.05:
+            self._rotate_in_place(angle_diff)
+
+    def _compute_drawer_face_normal(self, corners_world, handle_pos):
+        """Compute the outward-facing normal of the drawer face.
+
+        corners_world: list of 4 dicts with x,y,z (top-left, top-right,
+                       bottom-right, bottom-left of the drawer bbox).
+        Falls back to robot-to-handle direction if corners are unavailable.
+        """
+        if corners_world is not None and len(corners_world) >= 3:
+            pts = np.array([[c["x"], c["y"], c["z"]] for c in corners_world])
+            # Two edge vectors of the drawer face
+            v1 = pts[1] - pts[0]  # top edge
+            v2 = pts[3] - pts[0]  # left edge
+            normal = np.cross(v1, v2)
+            normal_2d = normal[:2]
+            norm = np.linalg.norm(normal_2d)
+            if norm > 1e-6:
+                normal_2d = normal_2d / norm
+                # Ensure normal points toward the robot (outward from drawer)
+                robot_pose = self._get_robot_pose()
+                if robot_pose is not None:
+                    center = pts.mean(axis=0)[:2]
+                    to_robot = np.array(robot_pose) - center
+                    if np.dot(normal_2d, to_robot) < 0:
+                        normal_2d = -normal_2d
+                return normal_2d
+
+        # Fallback: use robot-to-handle direction
+        robot_pose = self._get_robot_pose()
+        if robot_pose is not None:
+            dx = robot_pose[0] - handle_pos[0]
+            dy = robot_pose[1] - handle_pos[1]
+            norm = math.sqrt(dx * dx + dy * dy)
+            if norm > 1e-6:
+                return np.array([dx / norm, dy / norm])
+        return np.array([1.0, 0.0])
 
     def _orient_wrist(self, handle_orientation: str):
         """Set wrist yaw for the handle orientation."""
@@ -399,15 +479,49 @@ class NavigateOpenNode(Node):
     # ─── Arm control ──────────────────────────────────────────────────
 
     def _approach_handle(self, handle_pos: np.ndarray) -> bool:
-        """Extend arm toward the handle until pressure is detected.
+        """Extend arm toward the handle.
 
-        Returns True if contact was made.
+        In simulation: computes the required extension from the robot's
+        position to the handle and extends directly to that distance
+        (MuJoCo publishes zero effort so force sensing is unavailable).
+
+        On real robot: incrementally extends until wrist effort exceeds
+        grasp_force_threshold.
+
+        Returns True if contact/arrival was achieved.
         """
-        # First set lift height to match handle z
+        # Set lift height to match handle z
         self._send_joint_command("joint_lift", float(handle_pos[2]))
         time.sleep(2.0)
 
-        # Incrementally extend wrist until contact
+        if self.use_sim:
+            return self._approach_handle_sim(handle_pos)
+        else:
+            return self._approach_handle_real()
+
+    def _approach_handle_sim(self, handle_pos: np.ndarray) -> bool:
+        """Sim: extend arm to computed distance (no force feedback available)."""
+        robot_pose = self._get_robot_pose()
+        if robot_pose is None:
+            self.get_logger().error("Cannot get robot pose for extension calc")
+            return False
+
+        dx = handle_pos[0] - robot_pose[0]
+        dy = handle_pos[1] - robot_pose[1]
+        dist_to_handle = math.sqrt(dx * dx + dy * dy)
+
+        # Small overshoot to ensure contact
+        target_extension = min(dist_to_handle + 0.02, 0.52)
+        self.get_logger().info(
+            f"Sim approach: dist_to_handle={dist_to_handle:.3f}m, "
+            f"extending to {target_extension:.3f}m"
+        )
+        self._send_joint_command("wrist_extension", target_extension, duration_sec=4)
+        time.sleep(1.0)
+        return True
+
+    def _approach_handle_real(self) -> bool:
+        """Real robot: incrementally extend until force contact is detected."""
         max_extension = 0.52
         current_extension = 0.0
         step = self.arm_extension_speed
@@ -417,7 +531,6 @@ class NavigateOpenNode(Node):
             self._send_joint_command("wrist_extension", current_extension)
             time.sleep(0.2)
 
-            # Check force on wrist
             if self._detect_contact():
                 self.get_logger().info(
                     f"Contact detected at extension={current_extension:.3f}m"
@@ -447,19 +560,33 @@ class NavigateOpenNode(Node):
     def _pull_drawer(self) -> bool:
         """Retract the arm to pull the drawer open.
 
-        Monitors force and stops when pull_force_threshold is exceeded.
-        Returns True if the force threshold was reached (drawer opened).
+        In simulation: pulls back max_pull_distance in one command
+        (MuJoCo publishes zero effort so force sensing is unavailable).
+
+        On real robot: retracts incrementally, stopping when wrist effort
+        exceeds pull_force_threshold.
         """
-        if self.current_joint_state is None:
-            return False
+        if self.use_sim:
+            return self._pull_drawer_sim()
+        else:
+            return self._pull_drawer_real()
 
-        # Get current extension
-        try:
-            ext_idx = list(self.current_joint_state.name).index("wrist_extension")
-            start_extension = self.current_joint_state.position[ext_idx]
-        except (ValueError, IndexError):
-            start_extension = 0.3
+    def _pull_drawer_sim(self) -> bool:
+        """Sim: retract arm by max_pull_distance (no force feedback)."""
+        start_extension = self._get_current_extension()
+        target = max(0.0, start_extension - self.max_pull_distance)
+        self.get_logger().info(
+            f"Sim pull: retracting from {start_extension:.3f}m to {target:.3f}m"
+        )
+        self._send_joint_command("wrist_extension", target, duration_sec=4)
+        time.sleep(1.0)
+        pulled = start_extension - target
+        self.get_logger().info(f"Pulled {pulled:.3f}m")
+        return pulled > 0.05
 
+    def _pull_drawer_real(self) -> bool:
+        """Real robot: retract incrementally with force threshold check."""
+        start_extension = self._get_current_extension()
         target_extension = max(0.0, start_extension - self.max_pull_distance)
         current = start_extension
 
@@ -469,7 +596,6 @@ class NavigateOpenNode(Node):
             self._send_joint_command("wrist_extension", current)
             time.sleep(0.1)
 
-            # Check if force threshold exceeded (drawer is stuck or fully open)
             effort = abs(self.current_effort.get("wrist_extension", 0.0))
             if effort > self.pull_force_threshold:
                 self.get_logger().info(
@@ -480,6 +606,32 @@ class NavigateOpenNode(Node):
         pulled_distance = start_extension - current
         self.get_logger().info(f"Pulled {pulled_distance:.3f}m")
         return pulled_distance > 0.05
+
+    def _get_current_extension(self) -> float:
+        """Read current arm extension from joint_states.
+
+        The sim publishes joint_arm_l0..l3 (each is 1/4 of total extension),
+        real robot publishes wrist_extension directly.
+        """
+        if self.current_joint_state is None:
+            return 0.3
+
+        names = list(self.current_joint_state.name)
+        positions = list(self.current_joint_state.position)
+
+        # Try wrist_extension first (real robot)
+        if "wrist_extension" in names:
+            return positions[names.index("wrist_extension")]
+
+        # Sum joint_arm_l0..l3 (sim)
+        total = 0.0
+        for seg in ("joint_arm_l0", "joint_arm_l1", "joint_arm_l2", "joint_arm_l3"):
+            if seg in names:
+                total += positions[names.index(seg)]
+        if total > 0:
+            return total
+
+        return 0.3
 
     def _retract_arm(self):
         """Fully retract the arm after releasing."""
@@ -502,46 +654,76 @@ class NavigateOpenNode(Node):
         point.time_from_start = Duration(sec=duration_sec, nanosec=0)
         goal.trajectory.points = [point]
 
+        self.get_logger().info(f"Sending joint command: {joint_name}={position:.3f}")
         future = self.trajectory_client.send_goal_async(goal)
-        # Wait for goal acceptance (non-blocking spin — main thread already spinning)
+
         timeout = time.time() + 5.0
         while not future.done() and time.time() < timeout:
             time.sleep(0.05)
-        if not future.done() or future.result() is None:
-            self.get_logger().warn(f"Joint goal send timed out: {joint_name}")
+        if not future.done():
+            self.get_logger().error(f"Joint goal send timed out: {joint_name}")
+            return False
+        if future.result() is None:
+            self.get_logger().error(f"Joint goal result is None: {joint_name}")
             return False
 
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().warn(f"Joint command rejected: {joint_name}={position:.3f}")
+            self.get_logger().error(f"Joint command REJECTED: {joint_name}={position:.3f}")
             return False
 
+        self.get_logger().info(f"Joint command accepted: {joint_name}={position:.3f}")
         result_future = goal_handle.get_result_async()
         timeout = time.time() + duration_sec + 10
         while not result_future.done() and time.time() < timeout:
             time.sleep(0.05)
 
+        if not result_future.done():
+            self.get_logger().warn(f"Joint command execution timed out: {joint_name}")
+            return False
+
+        self.get_logger().info(f"Joint command complete: {joint_name}={position:.3f}")
         return True
 
+    def _switch_to_position_mode(self) -> bool:
+        """Switch the driver to position mode (needed for base translate/rotate)."""
+        if not self.position_mode_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("Position mode service not available — may already be in position mode")
+            return True
+        future = self.position_mode_client.call_async(Trigger.Request())
+        timeout = time.time() + 5.0
+        while not future.done() and time.time() < timeout:
+            time.sleep(0.05)
+        if future.done() and future.result() is not None:
+            self.get_logger().info(f"Switched to position mode: {future.result().message}")
+            return future.result().success
+        self.get_logger().warn("Position mode switch timed out")
+        return False
+
+    def _switch_to_navigation_mode(self) -> bool:
+        """Switch the driver back to navigation mode (needed for cmd_vel / frontier exploration)."""
+        if not self.navigation_mode_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("Navigation mode service not available")
+            return True
+        future = self.navigation_mode_client.call_async(Trigger.Request())
+        timeout = time.time() + 5.0
+        while not future.done() and time.time() < timeout:
+            time.sleep(0.05)
+        if future.done() and future.result() is not None:
+            self.get_logger().info(f"Switched to navigation mode: {future.result().message}")
+            return future.result().success
+        self.get_logger().warn("Navigation mode switch timed out")
+        return False
+
     def _rotate_in_place(self, angle_rad: float):
-        """Rotate the base in place."""
-        angular_speed = 0.4
-        duration = abs(angle_rad) / angular_speed
-
-        twist = Twist()
-        twist.angular.z = angular_speed if angle_rad > 0 else -angular_speed
-
-        start = time.time()
-        while time.time() - start < duration and not self.stop_requested:
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.1)
-
-        self.cmd_vel_pub.publish(Twist())
-        time.sleep(0.3)
+        """Rotate the base in place via FollowJointTrajectory."""
+        duration_sec = max(2, int(abs(angle_rad) / 0.3))
+        self._send_joint_command("rotate_mobile_base", angle_rad, duration_sec=duration_sec)
+        time.sleep(1.0)
 
     def _stop_robot(self):
-        """Emergency stop all motion."""
-        self.cmd_vel_pub.publish(Twist())
+        """Stop all motion."""
+        pass
 
     def _get_robot_pose(self):
         """Get (x, y) of robot base in map frame."""
@@ -592,8 +774,8 @@ class NavigateOpenNode(Node):
 
         self.path_pub.publish(path_msg)
 
-    def _publish_target_marker(self, handle_pos: np.ndarray):
-        """Publish a pink marker at the target drawer for RViz."""
+    def _publish_target_marker(self, drawer: dict):
+        """Publish a pink cube matching the drawer's bounding box in RViz."""
         marker = Marker()
         marker.header.frame_id = "odom"
         marker.header.stamp = self.get_clock().now().to_msg()
@@ -601,17 +783,28 @@ class NavigateOpenNode(Node):
         marker.id = 0
         marker.type = Marker.CUBE
         marker.action = Marker.ADD
-
-        marker.pose.position.x = float(handle_pos[0])
-        marker.pose.position.y = float(handle_pos[1])
-        marker.pose.position.z = float(handle_pos[2])
         marker.pose.orientation.w = 1.0
 
-        marker.scale.x = 0.35
-        marker.scale.y = 0.15
-        marker.scale.z = 0.2
+        corners = drawer.get("drawer_corners_world")
+        if corners is not None and len(corners) == 4:
+            xs = [c["x"] for c in corners]
+            ys = [c["y"] for c in corners]
+            zs = [c["z"] for c in corners]
+            marker.pose.position.x = (min(xs) + max(xs)) / 2
+            marker.pose.position.y = (min(ys) + max(ys)) / 2
+            marker.pose.position.z = (min(zs) + max(zs)) / 2
+            marker.scale.x = max(max(xs) - min(xs), 0.02)
+            marker.scale.y = max(max(ys) - min(ys), 0.02)
+            marker.scale.z = max(max(zs) - min(zs), 0.02)
+        else:
+            h = drawer["handle_center_world"]
+            marker.pose.position.x = h["x"]
+            marker.pose.position.y = h["y"]
+            marker.pose.position.z = h["z"]
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.15
 
-        # Pink color for target
         marker.color = ColorRGBA(r=1.0, g=0.4, b=0.7, a=0.9)
         marker.lifetime.sec = 60
 

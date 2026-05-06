@@ -8,7 +8,7 @@ Given a list of detected drawers from Node 2, navigates the robot to the best ta
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `approach_distance` | `1.0` | Meters from handle to position base |
+| `approach_distance` | `0.45` | Meters from handle to position base |
 | `grasp_force_threshold` | `5.0` | Force (N) to detect handle contact |
 | `pull_force_threshold` | `15.0` | Force (N) to stop pulling |
 | `gripper_close_effort` | `-50.0` | Effort for gripper close |
@@ -20,13 +20,15 @@ Given a list of detected drawers from Node 2, navigates the robot to the best ta
 ## Execution Sequence
 
 1. **Select Drawer**: Get list from Node 2, sort by ranking (or distance if no ranking)
-2. **Navigate**: Move base to `approach_distance` from handle, perpendicular to drawer face
-3. **Align**: Fine-tune rotation so the arm faces the drawer
-4. **Orient Wrist**: Rotate wrist yaw to match handle orientation (horizontal/vertical)
-5. **Approach**: Incrementally extend arm until `grasp_force_threshold` exceeded
-6. **Grasp**: Close gripper to hold handle
-7. **Pull**: Retract arm until `pull_force_threshold` or `max_pull_distance`
-8. **Release**: Open gripper and retract arm fully
+2. **Switch to position mode**: Call `/switch_to_position_mode` so `translate_mobile_base` and `rotate_mobile_base` commands move the base
+3. **Navigate**: Rotate toward, then drive to `approach_distance` from handle using `rotate_mobile_base` and `translate_mobile_base` via FollowJointTrajectory
+4. **Align**: Compute drawer face normal from corner geometry, rotate perpendicular so the arm faces the drawer
+5. **Orient Wrist**: Rotate wrist yaw to match handle orientation (horizontal/vertical)
+6. **Approach**: Incrementally extend arm until `grasp_force_threshold` exceeded
+7. **Grasp**: Close gripper to hold handle
+8. **Pull**: Retract arm until `pull_force_threshold` or `max_pull_distance`
+9. **Release**: Open gripper and retract arm fully
+10. **Switch to navigation mode**: Call `/switch_to_navigation_mode` in a `finally` block (always runs, even on failure/exception) so `cmd_vel` works again for frontier exploration
 
 ## Force Feedback
 
@@ -38,7 +40,7 @@ This works in both MuJoCo simulation (which provides simulated force readings) a
 
 ## RViz Visualization
 
-- Pink cube: Target drawer being opened
+- Pink cube: Target drawer being opened, sized to match the drawer's world-frame bounding box
 - Green path: Planned robot path to approach pose
 - Status text on `/navigate_open/status`
 

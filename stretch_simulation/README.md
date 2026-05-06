@@ -176,6 +176,10 @@ You could display all the launch options available to the Stretch Mujoco Driver 
         One of: ['Random', 'Industrial', 'Scandanavian', 'Coastal', 'Modern_1', 'Modern_2', 'Traditional_1', 'Traditional_2', 'Farmhouse', 'Rustic', 'Mediterranean', 'Transitional_1', 'Transitional_2']
         (default: 'Random')
 
+    'robocasa_seed':
+        Random seed for robocasa fixture selection. Controls which fixture the robot spawns near. Use -1 for random (default behavior).
+        (default: '-1')
+
 ```
 
 You can also set the node's argument`arguments=["--ros-args", "--log-level", "debug"]` in the launch file to display Sim-to-Real time and other useful debug information.

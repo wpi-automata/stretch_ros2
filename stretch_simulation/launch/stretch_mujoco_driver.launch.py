@@ -92,6 +92,13 @@ def generate_launch_description():
             choices=["Random"] + list(get_styles().values()),
         )
     )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "robocasa_seed",
+            default_value="-1",
+            description="Random seed for robocasa fixture selection (-1 = random)",
+        )
+    )
 
     use_robocasa = "use_robocasa:=false" not in sys.argv
     robocasa_layout = None
@@ -192,6 +199,7 @@ def generate_launch_description():
                 if robocasa_style is not None
                 else LaunchConfiguration("robocasa_style")
             ),
+            "robocasa_seed": LaunchConfiguration("robocasa_seed"),
         }
     ]
 

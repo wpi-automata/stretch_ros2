@@ -1,38 +1,45 @@
 #!/usr/bin/env python3
 """Node 2: Drawer Detection.
 
-Detects drawers in camera frames as the robot explores, using Detic for
-bounding-box detection and handle localization within each drawer bbox.
+Detects drawers and handles in camera frames using a single Detic pass on
+the full image. Handles are associated with drawers by containment: a handle
+bbox whose center falls within a drawer bbox belongs to that drawer. The
+grasp point is the center of the matched handle's bounding box.
 
 For each drawer:
-  1. Detic detects the drawer bounding box
-  2. Within that bbox, Detic/handle detector finds the handle sub-bbox
-  3. The handle center is projected to world coordinates via depth + camera TF
-  4. Handle orientation (horizontal/vertical) is determined from bbox aspect ratio
-  5. Reachability is computed based on the Stretch3's kinematic workspace
+  1. Detic detects drawer and handle bounding boxes in one pass
+  2. Handles are matched to drawers by bbox containment
+  3. The handle bbox center is the grasp point, projected to world coordinates
+  4. Drawer corners are also projected to world for RViz visualization
+  5. Handle orientation (horizontal/vertical) is determined from bbox aspect ratio
+  6. Reachability is computed based on the Stretch3's kinematic workspace
 
-Uses functions from semantic-object-container-room for de-duplication and
-denoising of detections across frames.
+Uses VisualDetector from semantic-object-container-room for Detic inference,
+and its nms_by_type for per-class non-maximum suppression.
 
 Publishes:
-  - /drawer_detections (DrawerList): all detected drawers with metadata
+  - /drawer_detections_json (std_msgs/String): all detected drawers as JSON
   - /drawer_markers (visualization_msgs/MarkerArray): RViz visualization
+      - Green/red cubes sized to drawer bounding box (reachable/unreachable)
+      - Blue spheres at handle grasp points
+      - White text labels with ID, reachability, orientation, distance
 
 Subscribes:
   - /camera/color/image_raw (sensor_msgs/Image): RGB frames
-  - /camera/aligned_depth_to_color/image_raw (sensor_msgs/Image): depth frames
+  - /camera/depth/image_rect_raw (sensor_msgs/Image): depth frames
+  - /camera/color/camera_info (sensor_msgs/CameraInfo): camera intrinsics
   - /exploration_status (std_msgs/String): to know when exploration is active
 
 Services:
-  - /detection/trigger (TriggerDetection): force a detection pass
-  - /detection/get_drawers (std_srvs/Trigger): return current drawer list
+  - /detection/trigger (std_srvs/Trigger): force a detection pass
+  - /detection/get_drawers (std_srvs/Trigger): return current drawer list as JSON
 
 Parameters:
   - detection_confidence: min Detic score for drawer class (default 0.5)
   - dedup_distance_m: distance threshold to consider two detections the same (default 0.3)
   - max_reach_height: max z the gripper can reach (default 1.4m)
   - min_reach_height: min z the gripper can reach (default 0.1m)
-  - test_mode: if true, robot does a spiral pattern for testing (default false)
+  - test_mode: if true, process all frames without waiting for exploration (default false)
   - rank_via_LOCUS: if true, calls the GNN node ranking stub (default false)
 """
 
@@ -213,6 +220,12 @@ class DrawerDetectionNode(Node):
         with self.drawers_lock:
             drawer_data = []
             for d in self.drawers:
+                corners_list = None
+                if d.drawer_corners_world is not None:
+                    corners_list = [
+                        {"x": float(c[0]), "y": float(c[1]), "z": float(c[2])}
+                        for c in d.drawer_corners_world
+                    ]
                 drawer_data.append({
                     "drawer_id": d.drawer_id,
                     "handle_center_world": {
@@ -220,6 +233,7 @@ class DrawerDetectionNode(Node):
                         "y": float(d.handle_center_world[1]) if d.handle_center_world is not None else 0,
                         "z": float(d.handle_center_world[2]) if d.handle_center_world is not None else 0,
                     },
+                    "drawer_corners_world": corners_list,
                     "reachable": d.reachable,
                     "handle_orientation": d.handle_orientation,
                     "ranking": d.ranking,
@@ -270,7 +284,7 @@ class DrawerDetectionNode(Node):
         camera_pose = self._transform_to_matrix(transform)
 
         # Detect drawers in the frame
-        drawer_bboxes = self._detect_drawers_detic(rgb)
+        drawer_bboxes, all_detections = self._detect_drawers_detic(rgb)
 
         new_detections = 0
         for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
@@ -299,10 +313,16 @@ class DrawerDetectionNode(Node):
             if merged:
                 continue
 
+            # Project drawer corners to world for RViz bounding box
+            drawer_corners = self._project_drawer_corners(
+                drawer_bbox, depth, camera_pose, camera_K
+            )
+
             # Create new drawer entry
             drawer = DetectedDrawer()
             drawer.handle_center_world = world_pos
             drawer.handle_grasp_world = world_pos.copy()
+            drawer.drawer_corners_world = drawer_corners
             drawer.reachable = reachable
             drawer.handle_orientation = orientation
             drawer.confidence = confidence
@@ -326,11 +346,17 @@ class DrawerDetectionNode(Node):
                 f"Detected {new_detections} new drawer(s), "
                 f"total: {len(self.drawers)}"
             )
+            self._save_debug_image(rgb, all_detections, drawer_bboxes)
 
         return len(self.drawers)
 
     def _detect_drawers_detic(self, rgb: np.ndarray):
-        """Use Detic to find drawer bboxes and handle sub-bboxes.
+        """Use Detic to find drawer and handle bboxes in a single pass.
+
+        Runs Detic once on the full image. Drawers and handles are detected
+        together, then handles are associated with drawers by checking which
+        handle bbox falls within a drawer bbox. The grasp point is the center
+        of the handle's bounding box.
 
         Returns list of (drawer_bbox, handle_bbox, confidence) tuples.
         Each bbox is [x0, y0, x1, y1].
@@ -354,33 +380,59 @@ class DrawerDetectionNode(Node):
         detections = self.detector.detect(rgb, return_crops=False)
         detections = nms_by_type(detections)
 
+        # Log all Detic detections for debugging
+        for d in detections:
+            self.get_logger().debug(
+                f"Detic: {d.object_type} ({d.detic_class}) "
+                f"score={d.score:.2f} bbox={d.bbox}"
+            )
+
         drawer_classes = {
             "Drawer", "Cabinet", "Chest", "FilingCabinet",
             "Dresser", "NightStand", "SideTable",
-            "drawer", "cabinet", "chest_of_drawers",
+            "Armoire", "Buffet", "CedarChest", "ChestOfDrawers",
+            "ChinaCabinet", "Credenza", "Cupboard", "AiringCupboard",
+            "HopeChest", "Hutch", "Locker", "Footlocker",
+            "MedicineChest", "Pantry", "Sideboard", "Wardrobe",
+            "Cabinetwork",
+        }
+        handle_classes = {
+            "Handle", "Knob", "Doorknob",
+            "Pull", "Bellpull", "PullChain",
         }
 
-        # Filter to drawer classes first
         drawer_dets = [d for d in detections
                        if d.object_type in drawer_classes and d.score >= self.detection_confidence]
-        # Cross-class NMS: suppress overlapping bboxes regardless of class
         drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.3)
+
+        handle_dets = [d for d in detections if d.object_type in handle_classes]
+
+        self.get_logger().info(
+            f"Detic pass: {len(detections)} total, "
+            f"{len(drawer_dets)} drawers, {len(handle_dets)} handles"
+        )
 
         for det in drawer_dets:
             drawer_bbox = det.bbox
 
-            # Find handle within the drawer bbox region
-            handle_bbox = self._find_handle_in_bbox(rgb, drawer_bbox)
+            # Associate: find the best handle whose bbox center falls inside this drawer bbox
+            handle_bbox, _ = self._match_handle_to_drawer(drawer_bbox, handle_dets)
             if handle_bbox is None:
-                # Use center of drawer as handle estimate
+                self.get_logger().warn(
+                    f"No handle found in drawer bbox {drawer_bbox}, using center fallback"
+                )
                 cx = (drawer_bbox[0] + drawer_bbox[2]) // 2
                 cy = (drawer_bbox[1] + drawer_bbox[3]) // 2
                 hw, hh = 20, 10
                 handle_bbox = [cx - hw, cy - hh, cx + hw, cy + hh]
+            else:
+                self.get_logger().info(
+                    f"Handle matched to drawer {drawer_bbox}: handle bbox={handle_bbox}"
+                )
 
             results.append((drawer_bbox, handle_bbox, det.score))
 
-        return results
+        return results, detections
 
     @staticmethod
     def _cross_class_nms(detections, iou_threshold=0.3):
@@ -412,47 +464,27 @@ class DrawerDetectionNode(Node):
         union = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
 
-    def _find_handle_in_bbox(self, rgb: np.ndarray, drawer_bbox: list):
-        """Find the handle bounding box within a drawer bounding box.
+    @staticmethod
+    def _match_handle_to_drawer(drawer_bbox, handle_dets):
+        """Find the highest-confidence handle whose bbox center falls inside the drawer bbox.
 
-        Runs a second Detic pass on the cropped drawer region looking
-        for handle-like objects.
+        Returns (handle_bbox, index) or (None, None).
         """
-        x0, y0, x1, y1 = drawer_bbox
-        crop = rgb[y0:y1, x0:x1]
-        if crop.size == 0:
-            return None
-
-        try:
-            from realrobot.detector import VisualDetector
-        except ImportError:
-            return None
-
-        if self.detector is None:
-            self.detector = VisualDetector(
-                device="cpu", score_threshold=0.3
-            )
-        detections = self.detector.detect(crop, return_crops=False)
-
-        handle_classes = {"Handle", "Knob", "DoorHandle", "handle", "knob"}
+        dx0, dy0, dx1, dy1 = drawer_bbox
         best_handle = None
         best_score = 0.0
+        best_idx = None
 
-        for det in detections:
-            if det.object_type in handle_classes and det.score > best_score:
+        for i, det in enumerate(handle_dets):
+            hx0, hy0, hx1, hy1 = det.bbox
+            hcx = (hx0 + hx1) / 2
+            hcy = (hy0 + hy1) / 2
+            if dx0 <= hcx <= dx1 and dy0 <= hcy <= dy1 and det.score > best_score:
                 best_handle = det.bbox
                 best_score = det.score
+                best_idx = i
 
-        if best_handle is None:
-            return None
-
-        # Convert back to full-image coordinates
-        return [
-            best_handle[0] + x0,
-            best_handle[1] + y0,
-            best_handle[2] + x0,
-            best_handle[3] + y0,
-        ]
+        return best_handle, best_idx
 
     # ─── Projection and geometry ──────────────────────────────────────
 
@@ -534,15 +566,50 @@ class DrawerDetectionNode(Node):
         self, drawer_bbox: list, depth: np.ndarray,
         camera_pose: np.ndarray, camera_K: np.ndarray,
     ):
-        """Project the 4 corners of a drawer bbox to world coordinates."""
+        """Project the 4 corners of a drawer bbox to world coordinates.
+
+        Uses a single median depth from the bbox interior so all corners
+        land on the same plane, preventing distortion from corner pixels
+        that fall on walls/floor/other surfaces.
+        """
         x0, y0, x1, y1 = [int(c) for c in drawer_bbox]
+        h, w = depth.shape[:2]
+        x0c = max(0, min(x0, w - 1))
+        y0c = max(0, min(y0, h - 1))
+        x1c = max(0, min(x1, w - 1))
+        y1c = max(0, min(y1, h - 1))
+
+        # Sample depth from the central 60% of the bbox to avoid edges
+        margin_x = int((x1c - x0c) * 0.2)
+        margin_y = int((y0c - y1c) * 0.2) if y0c > y1c else int((y1c - y0c) * 0.2)
+        rx0 = x0c + margin_x
+        ry0 = y0c + margin_y
+        rx1 = x1c - margin_x
+        ry1 = y1c - margin_y
+        if rx0 >= rx1 or ry0 >= ry1:
+            rx0, ry0, rx1, ry1 = x0c, y0c, x1c, y1c
+
+        region = depth[ry0:ry1, rx0:rx1]
+        if depth.dtype == np.uint16:
+            region = region.astype(np.float32) / 1000.0
+        valid = region[region > 0.1]
+        if len(valid) == 0:
+            return None
+
+        d = float(np.median(valid))
+
+        fx, fy = camera_K[0, 0], camera_K[1, 1]
+        cx, cy = camera_K[0, 2], camera_K[1, 2]
+
         corners_px = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         corners_world = []
         for u, v in corners_px:
-            pt = self._project_pixel_to_world(u, v, depth, camera_pose, camera_K)
-            if pt is None:
-                return None
-            corners_world.append(pt)
+            x_cam = (u - cx) / fx * d
+            y_cam = (v - cy) / fy * d
+            z_cam = d
+            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+            p_world = camera_pose @ p_cam
+            corners_world.append(p_world[:3])
         return corners_world
 
     def _transform_to_matrix(self, transform: TransformStamped) -> np.ndarray:
@@ -669,47 +736,111 @@ class DrawerDetectionNode(Node):
         cv2.circle(annotated, (hcx, hcy), 5, (255, 0, 0), -1)
         return annotated
 
+    def _save_debug_image(self, rgb, all_detections, matched_results):
+        """Save a debug image showing all Detic detections to /tmp/detic_debug/."""
+        debug_dir = Path("/tmp/detic_debug")
+        debug_dir.mkdir(exist_ok=True)
+
+        debug_img = rgb.copy()
+
+        # Draw all Detic detections in gray with class labels
+        for det in all_detections:
+            x0, y0, x1, y1 = det.bbox
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), (180, 180, 180), 1)
+            label = f"{det.object_type} {det.score:.2f}"
+            cv2.putText(debug_img, label, (x0, max(y0 - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+
+        # Draw matched drawer (blue) and handle (green) bboxes on top
+        for drawer_bbox, handle_bbox, conf in matched_results:
+            cv2.rectangle(debug_img, (drawer_bbox[0], drawer_bbox[1]),
+                          (drawer_bbox[2], drawer_bbox[3]), (255, 0, 0), 2)
+            cv2.rectangle(debug_img, (handle_bbox[0], handle_bbox[1]),
+                          (handle_bbox[2], handle_bbox[3]), (0, 255, 0), 2)
+            hcx = (handle_bbox[0] + handle_bbox[2]) // 2
+            hcy = (handle_bbox[1] + handle_bbox[3]) // 2
+            cv2.circle(debug_img, (hcx, hcy), 5, (0, 0, 255), -1)
+
+        stamp = int(time.time() * 1000) % 1000000
+        path = debug_dir / f"detic_{stamp}.jpg"
+        cv2.imwrite(str(path), cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
+        self.get_logger().info(f"Debug image saved: {path}")
+
     def publish_markers(self):
-        """Publish drawer markers in RViz: green=reachable, red=unreachable."""
+        """Publish drawer markers in RViz.
+
+        - Green/red rectangle outline around drawer bbox (green=reachable, red=not)
+        - Blue sphere at handle grasp point
+        - White text label with ID, reachability, orientation, distance
+        """
         marker_array = MarkerArray()
+        now = self.get_clock().now().to_msg()
 
         with self.drawers_lock:
             for i, drawer in enumerate(self.drawers):
                 if drawer.handle_center_world is None:
                     continue
 
-                marker = Marker()
-                marker.header.frame_id = "odom"
-                marker.header.stamp = self.get_clock().now().to_msg()
-                marker.ns = "drawers"
-                marker.id = i
-                marker.type = Marker.CUBE
-                marker.action = Marker.ADD
+                header = Header(frame_id="odom", stamp=now)
 
-                marker.pose.position.x = float(drawer.handle_center_world[0])
-                marker.pose.position.y = float(drawer.handle_center_world[1])
-                marker.pose.position.z = float(drawer.handle_center_world[2])
-                marker.pose.orientation.w = 1.0
-
-                if drawer.handle_orientation == "horizontal":
-                    marker.scale.x = 0.15
-                    marker.scale.y = 0.03
-                    marker.scale.z = 0.03
-                else:
-                    marker.scale.x = 0.03
-                    marker.scale.y = 0.03
-                    marker.scale.z = 0.12
+                # Drawer bounding box as 2D rectangle outline
+                box_marker = Marker()
+                box_marker.header = header
+                box_marker.ns = "drawers"
+                box_marker.id = i
+                box_marker.type = Marker.LINE_STRIP
+                box_marker.action = Marker.ADD
+                box_marker.scale.x = 0.01
 
                 if drawer.reachable:
-                    marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.7)
+                    box_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.9)
                 else:
-                    marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.7)
+                    box_marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.9)
 
-                marker_array.markers.append(marker)
+                if drawer.drawer_corners_world is not None and len(drawer.drawer_corners_world) == 4:
+                    for c in drawer.drawer_corners_world:
+                        box_marker.points.append(
+                            Point(x=float(c[0]), y=float(c[1]), z=float(c[2]))
+                        )
+                    box_marker.points.append(
+                        Point(
+                            x=float(drawer.drawer_corners_world[0][0]),
+                            y=float(drawer.drawer_corners_world[0][1]),
+                            z=float(drawer.drawer_corners_world[0][2]),
+                        )
+                    )
+                else:
+                    p = drawer.handle_center_world
+                    hw, hh = 0.15, 0.075
+                    box_marker.points.append(Point(x=float(p[0]) - hw, y=float(p[1]), z=float(p[2]) - hh))
+                    box_marker.points.append(Point(x=float(p[0]) + hw, y=float(p[1]), z=float(p[2]) - hh))
+                    box_marker.points.append(Point(x=float(p[0]) + hw, y=float(p[1]), z=float(p[2]) + hh))
+                    box_marker.points.append(Point(x=float(p[0]) - hw, y=float(p[1]), z=float(p[2]) + hh))
+                    box_marker.points.append(Point(x=float(p[0]) - hw, y=float(p[1]), z=float(p[2]) - hh))
+
+                box_marker.pose.orientation.w = 1.0
+                marker_array.markers.append(box_marker)
+
+                # Handle grasp point sphere
+                handle_marker = Marker()
+                handle_marker.header = header
+                handle_marker.ns = "handle_grasp"
+                handle_marker.id = i
+                handle_marker.type = Marker.SPHERE
+                handle_marker.action = Marker.ADD
+                handle_marker.pose.position.x = float(drawer.handle_center_world[0])
+                handle_marker.pose.position.y = float(drawer.handle_center_world[1])
+                handle_marker.pose.position.z = float(drawer.handle_center_world[2])
+                handle_marker.pose.orientation.w = 1.0
+                handle_marker.scale.x = 0.04
+                handle_marker.scale.y = 0.04
+                handle_marker.scale.z = 0.04
+                handle_marker.color = ColorRGBA(r=0.0, g=0.3, b=1.0, a=1.0)
+                marker_array.markers.append(handle_marker)
 
                 # Text label
                 text_marker = Marker()
-                text_marker.header = marker.header
+                text_marker.header = header
                 text_marker.ns = "drawer_labels"
                 text_marker.id = i
                 text_marker.type = Marker.TEXT_VIEW_FACING

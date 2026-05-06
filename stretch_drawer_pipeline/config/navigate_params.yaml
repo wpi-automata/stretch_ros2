@@ -1,7 +1,9 @@
 navigate_open_node:
   ros__parameters:
-    # How far from the drawer handle to position the robot base (meters)
-    approach_distance: 1.0
+    # How far from the drawer handle to position the robot base (meters).
+    # Must be within arm reach (~0.52m) since the robot turns sideways
+    # and extends the arm laterally toward the handle.
+    approach_distance: 0.45
 
     # Force thresholds (Newtons)
     grasp_force_threshold: 5.0    # force to detect handle contact

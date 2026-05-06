@@ -24,7 +24,7 @@ Explores the room using frontier-based exploration. Builds both a 3D voxel map a
 
 ### 2. Drawer Detection (`drawer_detection_node.py`)
 
-Uses Detic (from `semantic-object-container-room`) to detect drawer bounding boxes, then localizes the handle within each bbox. Projects handle centers to world coordinates. De-duplicates across frames. Determines reachability based on Stretch3 workspace.
+Uses Detic (from `semantic-object-container-room`) to detect drawer and handle bounding boxes in a single pass. Handles are associated with drawers by containment (handle bbox center within drawer bbox). The grasp point is the center of the handle's bounding box. Projects handle centers and drawer corners to world coordinates. De-duplicates across frames. Determines reachability based on Stretch3 workspace.
 
 ### 3. Navigate and Open (`navigate_open_node.py`)
 
@@ -35,7 +35,10 @@ Receives the drawer list, selects the best target (by ranking or distance), navi
 ### Simulation
 ```bash
 # Terminal 1: Launch MuJoCo simulation
-ros2 launch stretch_simulation stretch_mujoco_driver.launch.py
+ros2 launch stretch_simulation stretch_mujoco_driver.launch.py use_cameras:=true use_rviz:=true mode:=navigation
+
+# Optional: use robocasa_seed to control which fixture the robot spawns near (default is random)
+ros2 launch stretch_simulation stretch_mujoco_driver.launch.py use_cameras:=true use_rviz:=true mode:=navigation robocasa_seed:=0
 
 # Terminal 2: Launch the full pipeline
 ros2 launch stretch_drawer_pipeline pipeline_sim.launch.py
@@ -79,6 +82,50 @@ ros2 service call /mapping/start std_srvs/srv/Trigger
 | `/detection/get_drawers` | `std_srvs/Trigger` | Get drawer list (JSON) |
 | `/navigate_open/execute` | `std_srvs/Trigger` | Navigate to and open drawer |
 | `/navigate_open/stop` | `std_srvs/Trigger` | Abort operation |
+
+## Mode Switch Requirements
+
+The Stretch driver (both MuJoCo sim and real robot) has two control modes:
+
+| Mode | Service | What works | What is ignored |
+|------|---------|------------|-----------------|
+| **Navigation** (default) | `/switch_to_navigation_mode` | `cmd_vel` velocity commands | `translate_mobile_base`, `rotate_mobile_base` via FollowJointTrajectory |
+| **Position** | `/switch_to_position_mode` | `translate_mobile_base`, `rotate_mobile_base` via FollowJointTrajectory | `cmd_vel` velocity commands |
+
+### Where mode switches occur
+
+1. **Node 1 (Mapping/Exploration)** runs in **navigation mode** (the default). Frontier exploration uses `cmd_vel` to drive the base.
+
+2. **Node 3 (Navigate & Open)** switches to **position mode** before moving the base toward the drawer. It uses `translate_mobile_base` and `rotate_mobile_base` joints via the FollowJointTrajectory action server, which require position mode.
+
+3. **Node 3** switches back to **navigation mode** in a `finally` block when the pipeline completes (success, failure, or exception). This ensures frontier exploration can resume with `cmd_vel`.
+
+### Timeline
+
+```
+Exploration (nav mode)
+  │
+  ▼
+Node 3 triggered
+  │── switch_to_position_mode
+  │── rotate toward drawer
+  │── translate to approach point
+  │── align perpendicular to drawer face
+  │── extend arm, grasp, pull, release
+  │── switch_to_navigation_mode (finally)
+  ▼
+Exploration can resume (nav mode)
+```
+
+### Debugging
+
+If the robot accepts `translate_mobile_base` goals but doesn't move, it is likely still in navigation mode. Verify and fix manually:
+
+```bash
+# Check by sending a small translate and watching if the robot moves
+ros2 service call /switch_to_position_mode std_srvs/srv/Trigger
+ros2 action send_goal /stretch_controller/follow_joint_trajectory control_msgs/action/FollowJointTrajectory "{trajectory: {joint_names: [translate_mobile_base], points: [{positions: [0.1], time_from_start: {sec: 2}}]}}"
+```
 
 ## See Also
 
