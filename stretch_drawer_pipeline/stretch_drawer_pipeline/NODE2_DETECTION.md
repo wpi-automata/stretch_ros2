@@ -9,7 +9,8 @@ Continuously detects drawers in camera frames using Detic, localizes handles, pr
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `detection_confidence` | `0.5` | Min Detic score for drawer class |
-| `dedup_distance_m` | `0.3` | Distance (m) to merge detections |
+| `enable_dedup` | `true` | Enable de-duplication of nearby detections |
+| `dedup_distance_m` | `0.1` | Distance (m) to merge detections (when dedup enabled) |
 | `max_reach_height` | `1.4` | Max gripper Z (m above floor) |
 | `min_reach_height` | `0.1` | Min gripper Z (m above floor) |
 | `max_reach_distance` | `0.6` | Max arm extension (m) |
@@ -26,7 +27,7 @@ Continuously detects drawers in camera frames using Detic, localizes handles, pr
 4. **World Projection**: Handle center pixel → depth → camera-to-map TF → world XYZ; drawer corners also projected to world for visualization
 5. **Orientation**: Handle bbox aspect ratio determines horizontal vs vertical
 6. **Reachability**: Z-height check against Stretch3 workspace limits
-7. **De-duplication**: New detection within `dedup_distance_m` of existing → merge (weighted average position)
+7. **De-duplication** (optional, off by default): New detection within `dedup_distance_m` of existing → merge (weighted average position). Enable with `enable_dedup: true`
 
 ## Output Format
 

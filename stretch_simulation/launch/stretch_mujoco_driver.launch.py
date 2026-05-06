@@ -99,6 +99,13 @@ def generate_launch_description():
             description="Random seed for robocasa fixture selection (-1 = random)",
         )
     )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "robot_spawn_offset_back",
+            default_value="0.0",
+            description="Move robot spawn position backward by this many meters (0.0 = no offset)",
+        )
+    )
 
     use_robocasa = "use_robocasa:=false" not in sys.argv
     robocasa_layout = None
@@ -200,6 +207,7 @@ def generate_launch_description():
                 else LaunchConfiguration("robocasa_style")
             ),
             "robocasa_seed": LaunchConfiguration("robocasa_seed"),
+            "robot_spawn_offset_back": LaunchConfiguration("robot_spawn_offset_back"),
         }
     ]
 

@@ -3,8 +3,9 @@ drawer_detection_node:
     # Detic detection threshold for drawer class
     detection_confidence: 0.5
 
-    # De-duplication: min distance (m) to consider two detections as the same drawer
-    dedup_distance_m: 0.3
+    # De-duplication: merge detections whose handle positions are within this distance
+    enable_dedup: true
+    dedup_distance_m: 0.1
 
     # Stretch3 reachability limits (gripper Z in map frame)
     max_reach_height: 1.4       # meters (above floor)

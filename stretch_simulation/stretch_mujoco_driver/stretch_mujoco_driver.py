@@ -94,6 +94,7 @@ class StretchMujocoDriver(Node):
         self.declare_parameter("robocasa_layout", None)
         self.declare_parameter("robocasa_style", None)
         self.declare_parameter("robocasa_seed", -1)
+        self.declare_parameter("robot_spawn_offset_back", 0.0)
 
         use_cameras = self.get_parameter("use_cameras").value
         use_mujoco_viewer = self.get_parameter("use_mujoco_viewer").value
@@ -131,11 +132,14 @@ class StretchMujocoDriver(Node):
             robocasa_seed = self.get_parameter("robocasa_seed").value
             seed_val = robocasa_seed if robocasa_seed >= 0 else None
 
+            offset_back = self.get_parameter("robot_spawn_offset_back").value
+
             model, xml, objects_info = model_generation_wizard(
                 task=robocasa_task or DEFAULT_ROBOCASA_TASK,
                 layout=robocasa_layout,
                 style=robocasa_style,
                 seed=seed_val,
+                spawn_offset_back=offset_back,
             )
 
         sim = StretchMujocoSimulator(

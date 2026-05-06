@@ -97,7 +97,8 @@ class DrawerDetectionNode(Node):
 
         # Parameters
         self.declare_parameter("detection_confidence", 0.5)
-        self.declare_parameter("dedup_distance_m", 0.3)
+        self.declare_parameter("enable_dedup", True)
+        self.declare_parameter("dedup_distance_m", 0.1)
         self.declare_parameter("max_reach_height", 1.4)
         self.declare_parameter("min_reach_height", 0.1)
         self.declare_parameter("max_reach_distance", 0.6)
@@ -107,6 +108,7 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("detection_rate_hz", 2.0)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
+        self.enable_dedup = self.get_parameter("enable_dedup").value
         self.dedup_distance = self.get_parameter("dedup_distance_m").value
         self.max_reach_height = self.get_parameter("max_reach_height").value
         self.min_reach_height = self.get_parameter("min_reach_height").value
@@ -308,15 +310,16 @@ class DrawerDetectionNode(Node):
             # Check reachability
             reachable = self._check_reachability(world_pos)
 
-            # De-duplicate against existing drawers
-            merged = self._try_merge_detection(world_pos, confidence)
-            if merged:
-                continue
-
             # Project drawer corners to world for RViz bounding box
             drawer_corners = self._project_drawer_corners(
                 drawer_bbox, depth, camera_pose, camera_K
             )
+
+            # De-duplicate against existing drawers
+            if self.enable_dedup:
+                merged = self._try_merge_detection(world_pos, confidence, drawer_corners)
+                if merged:
+                    continue
 
             # Create new drawer entry
             drawer = DetectedDrawer()
@@ -568,49 +571,48 @@ class DrawerDetectionNode(Node):
     ):
         """Project the 4 corners of a drawer bbox to world coordinates.
 
-        Uses a single median depth from the bbox interior so all corners
-        land on the same plane, preventing distortion from corner pixels
-        that fall on walls/floor/other surfaces.
+        Each corner is projected at its own depth sampled from a small
+        region around that corner pixel. This produces an accurate
+        rectangle even when the camera views the drawer at an angle.
         """
         x0, y0, x1, y1 = [int(c) for c in drawer_bbox]
         h, w = depth.shape[:2]
-        x0c = max(0, min(x0, w - 1))
-        y0c = max(0, min(y0, h - 1))
-        x1c = max(0, min(x1, w - 1))
-        y1c = max(0, min(y1, h - 1))
-
-        # Sample depth from the central 60% of the bbox to avoid edges
-        margin_x = int((x1c - x0c) * 0.2)
-        margin_y = int((y0c - y1c) * 0.2) if y0c > y1c else int((y1c - y0c) * 0.2)
-        rx0 = x0c + margin_x
-        ry0 = y0c + margin_y
-        rx1 = x1c - margin_x
-        ry1 = y1c - margin_y
-        if rx0 >= rx1 or ry0 >= ry1:
-            rx0, ry0, rx1, ry1 = x0c, y0c, x1c, y1c
-
-        region = depth[ry0:ry1, rx0:rx1]
-        if depth.dtype == np.uint16:
-            region = region.astype(np.float32) / 1000.0
-        valid = region[region > 0.1]
-        if len(valid) == 0:
-            return None
-
-        d = float(np.median(valid))
 
         fx, fy = camera_K[0, 0], camera_K[1, 1]
         cx, cy = camera_K[0, 2], camera_K[1, 2]
 
         corners_px = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         corners_world = []
+
         for u, v in corners_px:
-            x_cam = (u - cx) / fx * d
-            y_cam = (v - cy) / fy * d
+            uc = max(0, min(u, w - 1))
+            vc = max(0, min(v, h - 1))
+
+            d = self._sample_depth_at(depth, uc, vc)
+            if d is None:
+                return None
+
+            x_cam = (uc - cx) / fx * d
+            y_cam = (vc - cy) / fy * d
             z_cam = d
             p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
             p_world = camera_pose @ p_cam
             corners_world.append(p_world[:3])
+
         return corners_world
+
+    @staticmethod
+    def _sample_depth_at(depth: np.ndarray, u: int, v: int, radius: int = 5):
+        """Sample median depth in a small region around (u, v)."""
+        h, w = depth.shape[:2]
+        r = radius
+        region = depth[max(0, v - r):min(h, v + r), max(0, u - r):min(w, u + r)]
+        if depth.dtype == np.uint16:
+            region = region.astype(np.float32) / 1000.0
+        valid = region[region > 0.1]
+        if len(valid) == 0:
+            return None
+        return float(np.median(valid))
 
     def _transform_to_matrix(self, transform: TransformStamped) -> np.ndarray:
         """Convert a TF TransformStamped to a 4x4 SE(3) matrix."""
@@ -633,10 +635,12 @@ class DrawerDetectionNode(Node):
 
     # ─── De-duplication ───────────────────────────────────────────────
 
-    def _try_merge_detection(self, world_pos: np.ndarray, confidence: float) -> bool:
+    def _try_merge_detection(self, world_pos: np.ndarray, confidence: float,
+                             drawer_corners=None) -> bool:
         """Check if this detection matches an existing drawer. If so, merge.
 
-        Uses functions from semantic-object-container-room for denoising.
+        Handle position is updated with a weighted average. Drawer corners
+        are replaced if the new detection has higher confidence.
         Returns True if merged (i.e., it's a duplicate).
         """
         with self.drawers_lock:
@@ -647,14 +651,21 @@ class DrawerDetectionNode(Node):
                     world_pos - np.array(existing.handle_center_world)
                 )
                 if dist < self.dedup_distance:
-                    # Merge: update position with weighted average
-                    n = existing.observations
-                    existing.handle_center_world = (
-                        existing.handle_center_world * n + world_pos
-                    ) / (n + 1)
-                    existing.handle_grasp_world = existing.handle_center_world.copy()
                     existing.observations += 1
-                    existing.confidence = max(existing.confidence, confidence)
+                    if confidence > existing.confidence:
+                        # Higher confidence: replace everything so
+                        # handle position and corners stay consistent
+                        existing.confidence = confidence
+                        existing.handle_center_world = world_pos
+                        existing.handle_grasp_world = world_pos.copy()
+                        if drawer_corners is not None:
+                            existing.drawer_corners_world = drawer_corners
+                    else:
+                        n = existing.observations
+                        existing.handle_center_world = (
+                            existing.handle_center_world * (n - 1) + world_pos
+                        ) / n
+                        existing.handle_grasp_world = existing.handle_center_world.copy()
                     return True
         return False
 

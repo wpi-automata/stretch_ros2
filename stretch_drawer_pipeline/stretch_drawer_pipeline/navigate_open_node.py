@@ -490,9 +490,26 @@ class NavigateOpenNode(Node):
 
         Returns True if contact/arrival was achieved.
         """
-        # Set lift height to match handle z
-        self._send_joint_command("joint_lift", float(handle_pos[2]))
-        time.sleep(2.0)
+        # Set lift height to match handle z, compensating for the
+        # offset between the lift joint and the gripper tip
+        gripper_z = self._get_gripper_z()
+        if gripper_z is not None:
+            current_lift = self._get_joint_position("joint_lift")
+            if current_lift is not None:
+                offset = gripper_z - current_lift
+                target_lift = float(handle_pos[2]) - offset
+                self.get_logger().info(
+                    f"Lift: handle_z={handle_pos[2]:.3f}, gripper_offset={offset:.3f}, "
+                    f"target_lift={target_lift:.3f}"
+                )
+                self._send_joint_command("joint_lift", target_lift)
+                time.sleep(2.0)
+            else:
+                self._send_joint_command("joint_lift", float(handle_pos[2]))
+                time.sleep(2.0)
+        else:
+            self._send_joint_command("joint_lift", float(handle_pos[2]))
+            time.sleep(2.0)
 
         if self.use_sim:
             return self._approach_handle_sim(handle_pos)
@@ -715,11 +732,67 @@ class NavigateOpenNode(Node):
         self.get_logger().warn("Navigation mode switch timed out")
         return False
 
-    def _rotate_in_place(self, angle_rad: float):
-        """Rotate the base in place via FollowJointTrajectory."""
-        duration_sec = max(2, int(abs(angle_rad) / 0.3))
-        self._send_joint_command("rotate_mobile_base", angle_rad, duration_sec=duration_sec)
-        time.sleep(1.0)
+    def _rotate_in_place(self, target_angle_rad: float):
+        """Rotate the base in place via FollowJointTrajectory.
+
+        Uses stall detection: keeps sending rotation commands until the
+        target heading is reached, only fails if yaw stops changing.
+        """
+        start_yaw = self._get_robot_yaw()
+        if start_yaw is None:
+            return
+        desired_yaw = start_yaw + target_angle_rad
+
+        stall_timeout = 5.0
+        last_yaw = start_yaw
+        last_progress_time = time.time()
+
+        while not self.stop_requested:
+            current_yaw = self._get_robot_yaw()
+            if current_yaw is None:
+                time.sleep(0.2)
+                continue
+
+            remaining = (desired_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(remaining) < 0.05:
+                self.get_logger().info("Rotation complete")
+                return
+
+            yaw_change = abs((current_yaw - last_yaw + math.pi) % (2 * math.pi) - math.pi)
+            if yaw_change > 0.01:
+                last_progress_time = time.time()
+                last_yaw = current_yaw
+            elif time.time() - last_progress_time > stall_timeout:
+                self.get_logger().warn(
+                    f"Rotation stalled with {math.degrees(remaining):.1f} deg remaining"
+                )
+                return
+
+            duration_sec = max(2, int(abs(remaining) / 0.3))
+            self.get_logger().info(f"Rotating {math.degrees(remaining):.1f} deg remaining")
+            self._send_joint_command("rotate_mobile_base", remaining, duration_sec=duration_sec)
+            time.sleep(1.0)
+
+    def _get_gripper_z(self):
+        """Get the gripper tip Z position in odom frame via TF."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "link_gripper_finger_left",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+            return transform.transform.translation.z
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+            return None
+
+    def _get_joint_position(self, joint_name: str):
+        """Get current position of a joint from joint_states."""
+        if self.current_joint_state is None:
+            return None
+        names = list(self.current_joint_state.name)
+        if joint_name in names:
+            return self.current_joint_state.position[names.index(joint_name)]
+        return None
 
     def _stop_robot(self):
         """Stop all motion."""

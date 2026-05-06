@@ -63,7 +63,7 @@ Visualization Manager:
       Visual Enabled: true
 
     - Class: rviz_default_plugins/TF
-      Enabled: true
+      Enabled: false
       Name: TF
       Show Arrows: false
       Show Axes: true
