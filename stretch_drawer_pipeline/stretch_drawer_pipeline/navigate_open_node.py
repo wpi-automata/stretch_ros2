@@ -331,13 +331,15 @@ class NavigateOpenNode(Node):
 
     def _navigate_to_approach_pose(self, handle_pos: np.ndarray,
                                    corners_world=None) -> bool:
-        """Navigate robot to stand directly in front of the handle,
+        """Navigate robot so the mast is directly in front of the handle,
         perpendicular to the drawer face, with the arm facing the handle.
 
-        Computes an approach point along the drawer face normal at
-        approach_distance from the handle. Then executes:
-          1. Rotate to face the approach point
-          2. Drive straight to the approach point (with stall detection)
+        Computes where the mast should end up (approach_distance from
+        handle along face normal), then back-computes the base_link
+        target position accounting for the mast offset at the final
+        heading. Executes:
+          1. Rotate to face the base_link target
+          2. Drive straight to the base_link target (with stall detection)
           3. Rotate so the arm (left side) faces the drawer
 
         Works regardless of the robot's starting position/orientation.
@@ -346,39 +348,48 @@ class NavigateOpenNode(Node):
         if robot_pose is None:
             return False
 
-        # Drawer face normal points outward from the drawer surface
         face_normal = self._compute_drawer_face_normal(corners_world, handle_pos)
         normal_angle = math.atan2(face_normal[1], face_normal[0])
 
-        # Approach point: handle position offset along face normal
-        approach_x = handle_pos[0] + face_normal[0] * self.approach_distance
-        approach_y = handle_pos[1] + face_normal[1] * self.approach_distance
+        # Where the mast should end up
+        mast_target_x = handle_pos[0] + face_normal[0] * self.approach_distance
+        mast_target_y = handle_pos[1] + face_normal[1] * self.approach_distance
 
-        self._publish_path(robot_pose, (approach_x, approach_y))
+        # Final heading: arm faces drawer (left side toward drawer)
+        desired_heading = normal_angle - math.pi / 2
+
+        # Back-compute base_link position from mast target at final heading
+        cos_h = math.cos(desired_heading)
+        sin_h = math.sin(desired_heading)
+        base_target_x = mast_target_x - (cos_h * self.MAST_OFFSET_X - sin_h * self.MAST_OFFSET_Y)
+        base_target_y = mast_target_y - (sin_h * self.MAST_OFFSET_X + cos_h * self.MAST_OFFSET_Y)
+
+        self._publish_path(robot_pose, (base_target_x, base_target_y))
         self.get_logger().info(
-            f"Approach pose: ({approach_x:.2f}, {approach_y:.2f}), "
+            f"Mast target: ({mast_target_x:.2f}, {mast_target_y:.2f}), "
+            f"base target: ({base_target_x:.2f}, {base_target_y:.2f}), "
             f"face normal {math.degrees(normal_angle):.1f} deg"
         )
 
-        # Phase 1: Rotate to face the approach point
-        dx = approach_x - robot_pose[0]
-        dy = approach_y - robot_pose[1]
+        # Phase 1: Rotate to face the base_link target
+        dx = base_target_x - robot_pose[0]
+        dy = base_target_y - robot_pose[1]
         travel_dist = math.sqrt(dx * dx + dy * dy)
 
         if travel_dist > 0.1:
-            angle_to_approach = math.atan2(dy, dx)
+            angle_to_target = math.atan2(dy, dx)
             current_yaw = self._get_robot_yaw()
             if current_yaw is not None:
-                angle_diff = (angle_to_approach - current_yaw + math.pi) % (2 * math.pi) - math.pi
+                angle_diff = (angle_to_target - current_yaw + math.pi) % (2 * math.pi) - math.pi
                 if abs(angle_diff) > 0.05:
                     self.get_logger().info(
-                        f"Phase 1: Rotating {math.degrees(angle_diff):.1f} deg to face approach point"
+                        f"Phase 1: Rotating {math.degrees(angle_diff):.1f} deg to face target"
                     )
                     self._rotate_in_place(angle_diff)
                     if self.stop_requested:
                         return False
 
-            # Phase 2: Drive to approach point with stall detection
+            # Phase 2: Drive to base_link target with stall detection
             stall_timeout = 10.0
             last_remaining = float("inf")
             last_progress_time = time.time()
@@ -389,12 +400,12 @@ class NavigateOpenNode(Node):
                     time.sleep(0.2)
                     continue
 
-                dx = approach_x - robot_pose[0]
-                dy = approach_y - robot_pose[1]
+                dx = base_target_x - robot_pose[0]
+                dy = base_target_y - robot_pose[1]
                 remaining = math.sqrt(dx * dx + dy * dy)
 
                 if remaining < 0.1:
-                    self.get_logger().info("Reached approach point")
+                    self.get_logger().info("Reached base target")
                     break
 
                 if last_remaining - remaining > 0.02:
@@ -414,11 +425,7 @@ class NavigateOpenNode(Node):
             if self.stop_requested:
                 return False
 
-        # Phase 3: Rotate so the arm faces the drawer.
-        # The arm extends to the robot's left (+Y in base_link), so the
-        # robot's forward axis should be perpendicular to the face normal,
-        # with the left side pointing toward the drawer.
-        desired_heading = normal_angle - math.pi / 2
+        # Phase 3: Rotate so the arm faces the drawer
         current_yaw = self._get_robot_yaw()
         if current_yaw is not None:
             angle_diff = (desired_heading - current_yaw + math.pi) % (2 * math.pi) - math.pi
@@ -428,7 +435,7 @@ class NavigateOpenNode(Node):
                 )
                 self._rotate_in_place(angle_diff)
 
-        self.get_logger().info("Approach pose reached and aligned")
+        self.get_logger().info("Mast aligned in front of handle")
         return True
 
     def _compute_drawer_face_normal(self, corners_world, handle_pos):
@@ -449,19 +456,19 @@ class NavigateOpenNode(Node):
             if norm > 1e-6:
                 normal_2d = normal_2d / norm
                 # Ensure normal points toward the robot (outward from drawer)
-                robot_pose = self._get_robot_pose()
-                if robot_pose is not None:
+                mast_pose = self._get_mast_pose()
+                if mast_pose is not None:
                     center = pts.mean(axis=0)[:2]
-                    to_robot = np.array(robot_pose) - center
+                    to_robot = np.array(mast_pose) - center
                     if np.dot(normal_2d, to_robot) < 0:
                         normal_2d = -normal_2d
                 return normal_2d
 
-        # Fallback: use robot-to-handle direction
-        robot_pose = self._get_robot_pose()
-        if robot_pose is not None:
-            dx = robot_pose[0] - handle_pos[0]
-            dy = robot_pose[1] - handle_pos[1]
+        # Fallback: use mast-to-handle direction
+        mast_pose = self._get_mast_pose()
+        if mast_pose is not None:
+            dx = mast_pose[0] - handle_pos[0]
+            dy = mast_pose[1] - handle_pos[1]
             norm = math.sqrt(dx * dx + dy * dy)
             if norm > 1e-6:
                 return np.array([dx / norm, dy / norm])
@@ -488,9 +495,8 @@ class NavigateOpenNode(Node):
     def _look_at_drawer(self, handle_pos: np.ndarray, corners_world=None):
         """Pan and tilt the head camera to look at the drawer center.
 
-        Computes the target position in base_link frame, then derives
-        head pan and tilt angles using the known head mount position
-        on the mast (1.33m above base_link).
+        Computes direction from the mast/head to the target in the
+        robot's local frame, then derives pan and tilt joint angles.
         Pan = 0 is the robot's forward direction.
         Tilt = 0 is horizontal, negative looks down.
         """
@@ -501,15 +507,15 @@ class NavigateOpenNode(Node):
             target = handle_pos.copy()
 
         try:
-            robot_pose = self._get_robot_pose()
+            mast_pose = self._get_mast_pose()
             robot_yaw = self._get_robot_yaw()
-            if robot_pose is None or robot_yaw is None:
-                self.get_logger().warn("Cannot look at drawer: no robot pose")
+            if mast_pose is None or robot_yaw is None:
+                self.get_logger().warn("Cannot look at drawer: no mast pose")
                 return
 
-            # Target direction in world frame
-            dx_world = target[0] - robot_pose[0]
-            dy_world = target[1] - robot_pose[1]
+            # Target direction in world frame, from mast
+            dx_world = target[0] - mast_pose[0]
+            dy_world = target[1] - mast_pose[1]
 
             # Rotate into base_link frame (base_link X = forward)
             cos_yaw = math.cos(robot_yaw)
@@ -517,9 +523,7 @@ class NavigateOpenNode(Node):
             dx_base = cos_yaw * dx_world + sin_yaw * dy_world
             dy_base = -sin_yaw * dx_world + cos_yaw * dy_world
 
-            # Head is ~1.33m above base_link
-            head_height = 1.33
-            dz = target[2] - head_height
+            dz = target[2] - self.MAST_HEIGHT
 
             pan = math.atan2(dy_base, dx_base)
             horiz_dist = math.sqrt(dx_base * dx_base + dy_base * dy_base)
@@ -583,13 +587,13 @@ class NavigateOpenNode(Node):
 
     def _approach_handle_sim(self, handle_pos: np.ndarray) -> bool:
         """Sim: extend arm to computed distance (no force feedback available)."""
-        robot_pose = self._get_robot_pose()
-        if robot_pose is None:
-            self.get_logger().error("Cannot get robot pose for extension calc")
+        mast_pose = self._get_mast_pose()
+        if mast_pose is None:
+            self.get_logger().error("Cannot get mast pose for extension calc")
             return False
 
-        dx = handle_pos[0] - robot_pose[0]
-        dy = handle_pos[1] - robot_pose[1]
+        dx = handle_pos[0] - mast_pose[0]
+        dy = handle_pos[1] - mast_pose[1]
         dist_to_handle = math.sqrt(dx * dx + dy * dy)
 
         # Small overshoot to ensure contact
@@ -765,14 +769,14 @@ class NavigateOpenNode(Node):
                 self._send_joint_command("joint_lift", target_lift)
                 time.sleep(2.0)
 
-        # Compute extension distance
-        robot_pose = self._get_robot_pose()
-        if robot_pose is None:
-            self.get_logger().error("Cannot get robot pose for extension")
+        # Compute extension distance from mast (where arm originates)
+        mast_pose = self._get_mast_pose()
+        if mast_pose is None:
+            self.get_logger().error("Cannot get mast pose for extension")
             return
 
-        dx = target_world[0] - robot_pose[0]
-        dy = target_world[1] - robot_pose[1]
+        dx = target_world[0] - mast_pose[0]
+        dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
         target_extension = min(dist, 0.52)
         self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m")
@@ -936,6 +940,27 @@ class NavigateOpenNode(Node):
             )
         except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
             return None
+
+    # Mast offset from base_link in base_link frame (from URDF joint_mast)
+    MAST_OFFSET_X = -0.067  # slightly behind base center
+    MAST_OFFSET_Y = 0.135   # slightly to the left
+    MAST_HEIGHT = 1.36       # head height above ground (0.0284 + 1.33)
+
+    def _get_mast_pose(self):
+        """Get (x, y) of the mast in the odom frame.
+
+        The arm and head both extend from the mast, so distance
+        calculations for reaching/viewing should use this, not base_link.
+        """
+        robot_pose = self._get_robot_pose()
+        yaw = self._get_robot_yaw()
+        if robot_pose is None or yaw is None:
+            return None
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        mast_x = robot_pose[0] + cos_yaw * self.MAST_OFFSET_X - sin_yaw * self.MAST_OFFSET_Y
+        mast_y = robot_pose[1] + sin_yaw * self.MAST_OFFSET_X + cos_yaw * self.MAST_OFFSET_Y
+        return (mast_x, mast_y)
 
     def _get_robot_yaw(self):
         """Get the robot's current heading (yaw) in the odom frame."""
