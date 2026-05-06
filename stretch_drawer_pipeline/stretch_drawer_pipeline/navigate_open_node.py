@@ -253,7 +253,7 @@ class NavigateOpenNode(Node):
             # Step 7: Open gripper and orient toward bump point
             self._open_gripper()
             time.sleep(0.5)
-            self._orient_gripper_toward(bump_point)
+            self._orient_gripper_toward(bump_point, orientation)
 
             # Step 8: Extend arm back to bump point
             self._set_state(OpenState.GRASPING)
@@ -482,13 +482,19 @@ class NavigateOpenNode(Node):
         return np.array([1.0, 0.0])
 
     def _orient_wrist(self, handle_orientation: str):
-        """Set wrist yaw for the handle orientation."""
-        if handle_orientation == "vertical":
-            wrist_yaw = 0.0
-        else:
-            wrist_yaw = math.pi / 2
+        """Set wrist orientation for the bump/contact approach.
 
-        self._send_joint_command("joint_wrist_yaw", wrist_yaw)
+        Yaw = pi/2 so the flat of the gripper faces away from the handle for bumping.
+        Roll = pi/2 for vertical handles, 0 for horizontal.
+        Note: the camera image is rotated 90 degrees from the real-world
+        orientation, so what appears horizontal in the image is vertical
+        in reality and vice versa.
+        """
+        self._send_joint_command("joint_wrist_yaw", math.pi / 2)
+        # if handle_orientation == "vertical":
+        #     self._send_joint_command("joint_wrist_roll", math.pi / 2)
+        # else:
+        #     self._send_joint_command("joint_wrist_roll", 0.0)
         time.sleep(1.0)
 
     # ─── Arm control ──────────────────────────────────────────────────
@@ -688,14 +694,19 @@ class NavigateOpenNode(Node):
             self.get_logger().error(f"Cannot get gripper world pos: {e}")
             return None
 
-    def _orient_gripper_toward(self, target_world: np.ndarray):
-        """Align the gripper in line with the arm so it points toward the drawer.
+    def _orient_gripper_toward(self, target_world: np.ndarray, handle_orientation: str):
+        """Align the gripper for grasping the handle.
 
-        wrist_yaw = 0 means the gripper is aligned with the arm extension
-        axis, which points toward the drawer since the robot is sideways.
+        Yaw = 0: gripper in line with arm axis, pointing toward drawer.
+        Roll = pi/2 for vertical handles, 0 for horizontal.
+        Note: camera image is rotated 90 deg from real life.
         """
-        self.get_logger().info("Orienting gripper in line with arm (wrist_yaw=0)")
+        roll = math.pi / 2 if handle_orientation == "vertical" else 0.0
+        self.get_logger().info(
+            f"Orienting gripper: yaw=0, roll={'pi/2' if handle_orientation == 'vertical' else '0'}"
+        )
         self._send_joint_command("joint_wrist_yaw", 0.0)
+        self._send_joint_command("joint_wrist_roll", roll)
         time.sleep(1.0)
 
     def _extend_to_point(self, target_world: np.ndarray):
@@ -723,8 +734,9 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - robot_pose[0]
         dy = target_world[1] - robot_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        target_extension = min(dist, 0.52)
-        self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m")
+        # Add 5cm to compensate for open gripper losing reach vs closed gripper
+        target_extension = min(dist + 0.05, 0.52)
+        self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m (includes 5cm gripper offset)")
         self._send_joint_command("wrist_extension", target_extension, duration_sec=4)
         time.sleep(1.0)
 
