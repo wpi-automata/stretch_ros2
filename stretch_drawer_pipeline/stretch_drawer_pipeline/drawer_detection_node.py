@@ -652,22 +652,33 @@ class DrawerDetectionNode(Node):
                 )
                 if dist < self.dedup_distance:
                     existing.observations += 1
-                    if confidence > existing.confidence:
-                        # Higher confidence: replace everything so
-                        # handle position and corners stay consistent
-                        existing.confidence = confidence
-                        existing.handle_center_world = world_pos
-                        existing.handle_grasp_world = world_pos.copy()
-                        if drawer_corners is not None:
+                    # Only replace corners if the new bbox is larger
+                    if drawer_corners is not None and existing.drawer_corners_world is not None:
+                        new_area = self._corners_area(drawer_corners)
+                        old_area = self._corners_area(existing.drawer_corners_world)
+                        if new_area > old_area:
                             existing.drawer_corners_world = drawer_corners
-                    else:
-                        n = existing.observations
-                        existing.handle_center_world = (
-                            existing.handle_center_world * (n - 1) + world_pos
-                        ) / n
-                        existing.handle_grasp_world = existing.handle_center_world.copy()
+                    elif drawer_corners is not None and existing.drawer_corners_world is None:
+                        existing.drawer_corners_world = drawer_corners
+
+                    # Average handle position
+                    n = existing.observations
+                    existing.handle_center_world = (
+                        existing.handle_center_world * (n - 1) + world_pos
+                    ) / n
+                    existing.handle_grasp_world = existing.handle_center_world.copy()
+                    existing.confidence = max(existing.confidence, confidence)
                     return True
         return False
+
+    @staticmethod
+    def _corners_area(corners):
+        """Approximate area of a quadrilateral from its 4 world-frame corners."""
+        pts = np.array([[c[0], c[1], c[2]] if isinstance(c, (list, np.ndarray))
+                        else [c["x"], c["y"], c["z"]] for c in corners])
+        v1 = pts[2] - pts[0]
+        v2 = pts[3] - pts[1]
+        return np.linalg.norm(np.cross(v1, v2)) * 0.5
 
     def _update_distances(self):
         """Update distance_to_robot for all drawers."""

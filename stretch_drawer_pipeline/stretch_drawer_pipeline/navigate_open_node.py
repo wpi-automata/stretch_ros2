@@ -236,23 +236,38 @@ class NavigateOpenNode(Node):
             # Step 4: Set wrist orientation for handle type
             self._orient_wrist(orientation)
 
-            # Step 5: Extend arm toward handle
+            # Step 5: Extend arm toward handle to find bump point
             self._set_state(OpenState.APPROACHING)
-            contact = self._approach_handle(handle_pos)
-            if not contact or self.stop_requested:
+            bump_point = self._approach_handle(handle_pos)
+            if bump_point is None or self.stop_requested:
                 self._set_state(OpenState.FAILED)
                 return
+            self.get_logger().info(
+                f"Bump point recorded: ({bump_point[0]:.3f}, "
+                f"{bump_point[1]:.3f}, {bump_point[2]:.3f})"
+            )
 
-            # Step 6: Close gripper
+            # Step 6: Retract arm fully
+            self._retract_arm()
+
+            # Step 7: Open gripper and orient toward bump point
+            self._open_gripper()
+            time.sleep(0.5)
+            self._orient_gripper_toward(bump_point)
+
+            # Step 8: Extend arm back to bump point
             self._set_state(OpenState.GRASPING)
+            self._extend_to_point(bump_point)
+
+            # Step 9: Close gripper
             self._close_gripper()
             time.sleep(1.0)
 
-            # Step 7: Pull drawer open
+            # Step 10: Pull drawer open
             self._set_state(OpenState.PULLING)
             pull_success = self._pull_drawer()
 
-            # Step 8: Release
+            # Step 11: Release
             self._set_state(OpenState.RELEASING)
             self._open_gripper()
             time.sleep(0.5)
@@ -478,17 +493,14 @@ class NavigateOpenNode(Node):
 
     # ─── Arm control ──────────────────────────────────────────────────
 
-    def _approach_handle(self, handle_pos: np.ndarray) -> bool:
-        """Extend arm toward the handle.
+    def _approach_handle(self, handle_pos: np.ndarray):
+        """Extend arm toward the handle to find the bump/contact point.
 
-        In simulation: computes the required extension from the robot's
-        position to the handle and extends directly to that distance
-        (MuJoCo publishes zero effort so force sensing is unavailable).
+        1. Sets lift height so gripper tip matches handle Z
+        2. Extends arm until contact (real) or computed distance (sim)
+        3. Records the gripper tip position in world frame as the bump point
 
-        On real robot: incrementally extends until wrist effort exceeds
-        grasp_force_threshold.
-
-        Returns True if contact/arrival was achieved.
+        Returns bump_point_world_frame (np.ndarray) or None on failure.
         """
         # Set lift height to match handle z, compensating for the
         # offset between the lift joint and the gripper tip
@@ -511,10 +523,17 @@ class NavigateOpenNode(Node):
             self._send_joint_command("joint_lift", float(handle_pos[2]))
             time.sleep(2.0)
 
+        # Extend arm toward the handle
         if self.use_sim:
-            return self._approach_handle_sim(handle_pos)
+            reached = self._approach_handle_sim(handle_pos)
         else:
-            return self._approach_handle_real()
+            reached = self._approach_handle_real()
+
+        if not reached:
+            return None
+
+        # Record where the gripper tip ended up = bump point
+        return self._get_gripper_world_pos()
 
     def _approach_handle_sim(self, handle_pos: np.ndarray) -> bool:
         """Sim: extend arm to computed distance (no force feedback available)."""
@@ -654,6 +673,60 @@ class NavigateOpenNode(Node):
         """Fully retract the arm after releasing."""
         self._send_joint_command("wrist_extension", 0.0)
         time.sleep(2.0)
+
+    def _get_gripper_world_pos(self):
+        """Get the gripper tip position in odom frame via TF."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "link_gripper_finger_left",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+            t = transform.transform.translation
+            return np.array([t.x, t.y, t.z])
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().error(f"Cannot get gripper world pos: {e}")
+            return None
+
+    def _orient_gripper_toward(self, target_world: np.ndarray):
+        """Align the gripper in line with the arm so it points toward the drawer.
+
+        wrist_yaw = 0 means the gripper is aligned with the arm extension
+        axis, which points toward the drawer since the robot is sideways.
+        """
+        self.get_logger().info("Orienting gripper in line with arm (wrist_yaw=0)")
+        self._send_joint_command("joint_wrist_yaw", 0.0)
+        time.sleep(1.0)
+
+    def _extend_to_point(self, target_world: np.ndarray):
+        """Extend arm so the gripper tip reaches target_world.
+
+        Computes the required extension from the robot base to the
+        target point and also sets the lift to match the target Z.
+        """
+        # Set lift to target Z with gripper offset compensation
+        gripper_z = self._get_gripper_z()
+        if gripper_z is not None:
+            current_lift = self._get_joint_position("joint_lift")
+            if current_lift is not None:
+                offset = gripper_z - current_lift
+                target_lift = float(target_world[2]) - offset
+                self._send_joint_command("joint_lift", target_lift)
+                time.sleep(2.0)
+
+        # Compute extension distance
+        robot_pose = self._get_robot_pose()
+        if robot_pose is None:
+            self.get_logger().error("Cannot get robot pose for extension")
+            return
+
+        dx = target_world[0] - robot_pose[0]
+        dy = target_world[1] - robot_pose[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+        target_extension = min(dist, 0.52)
+        self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m")
+        self._send_joint_command("wrist_extension", target_extension, duration_sec=4)
+        time.sleep(1.0)
 
     # ─── Low-level control helpers ────────────────────────────────────
 
