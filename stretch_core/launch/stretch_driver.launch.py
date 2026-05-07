@@ -26,14 +26,14 @@ def generate_launch_description():
 
     declare_broadcast_odom_tf_arg = DeclareLaunchArgument(
         'broadcast_odom_tf',
-        default_value='False', choices=['True', 'False'],
+        default_value='False',
         description='Whether to broadcast the odom TF'
     )
     ld.add_action(declare_broadcast_odom_tf_arg)
 
     declare_fail_out_of_range_goal_arg = DeclareLaunchArgument(
         'fail_out_of_range_goal',
-        default_value='False', choices=['True', 'False'],
+        default_value='False',
         description='Whether the motion action servers fail on out-of-range commands'
     )
     ld.add_action(declare_fail_out_of_range_goal_arg)
