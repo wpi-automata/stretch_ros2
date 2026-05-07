@@ -617,19 +617,35 @@ class NavigateOpenNode(Node):
             self._send_joint_command("wrist_extension", current_extension)
             time.sleep(0.2)
 
-            if self._detect_contact():
+            contact, effort = self._detect_contact()
+            if contact:
                 self.get_logger().info(
-                    f"Contact detected at extension={current_extension:.3f}m"
+                    f"Contact detected at extension={current_extension:.3f}m, effort={effort:.2f}"
                 )
                 return True
 
         self.get_logger().warn("Max extension reached without contact")
         return False
 
-    def _detect_contact(self) -> bool:
-        """Check if the gripper is in contact based on effort readings."""
-        effort = self.current_effort.get("wrist_extension", 0.0)
-        return abs(effort) > self.grasp_force_threshold
+    def _detect_contact(self) -> tuple:
+        """Check if the gripper is in contact based on effort readings.
+
+        Checks both wrist_extension (real robot virtual joint) and the
+        individual arm telescoping joints (joint_arm_l0..l3).
+        """
+        ext_effort = self.current_effort.get("wrist_extension", 0.0)
+        arm_efforts = [self.current_effort.get(f"joint_arm_l{i}", 0.0) for i in range(4)]
+        max_arm = max(abs(e) for e in arm_efforts) if arm_efforts else 0.0
+        effort = max(abs(ext_effort), max_arm)
+
+        self.get_logger().info(
+            f"  effort: wrist_extension={ext_effort:.3f}, "
+            f"arm_l0..l3={[f'{e:.3f}' for e in arm_efforts]}, "
+            f"threshold={self.grasp_force_threshold}",
+            throttle_duration_sec=1.0,
+        )
+
+        return effort > self.grasp_force_threshold, effort
 
     def _close_gripper(self):
         """Close the gripper to grasp the handle."""
@@ -734,7 +750,7 @@ class NavigateOpenNode(Node):
             )
             t = transform.transform.translation
             return np.array([t.x, t.y, t.z])
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
+        except Exception as e:
             self.get_logger().error(f"Cannot get gripper world pos: {e}")
             return None
 
@@ -910,7 +926,8 @@ class NavigateOpenNode(Node):
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
             return transform.transform.translation.z
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+        except Exception as e:
+            self.get_logger().warn(f"_get_gripper_z TF failed: {e}")
             return None
 
     def _get_joint_position(self, joint_name: str):
@@ -938,7 +955,8 @@ class NavigateOpenNode(Node):
                 transform.transform.translation.x,
                 transform.transform.translation.y,
             )
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+        except Exception as e:
+            self.get_logger().warn(f"_get_robot_pose TF failed: {e}")
             return None
 
     # Mast offset from base_link in base_link frame (from URDF joint_mast)
@@ -974,7 +992,8 @@ class NavigateOpenNode(Node):
             q = transform.transform.rotation
             _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
             return yaw
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+        except Exception as e:
+            self.get_logger().warn(f"_get_robot_yaw TF failed: {e}")
             return None
 
     # ─── Visualization ────────────────────────────────────────────────

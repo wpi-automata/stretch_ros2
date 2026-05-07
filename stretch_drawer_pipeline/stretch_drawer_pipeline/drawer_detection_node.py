@@ -43,6 +43,8 @@ Parameters:
   - rank_via_LOCUS: if true, calls the GNN node ranking stub (default false)
 """
 
+import base64
+import json
 import math
 import sys
 import threading
@@ -57,12 +59,14 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Point, TransformStamped
+from geometry_msgs.msg import Point, TransformStamped, Vector3, Quaternion
 from sensor_msgs.msg import CameraInfo, Image as RosImage
 from std_msgs.msg import String, Header, ColorRGBA
 from std_srvs.srv import Trigger
+from tf2_msgs.msg import TFMessage
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
+import roslibpy
 
 # Path to semantic-object-container-room for imports
 _SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "semantic-object-container-room"
@@ -106,6 +110,11 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("rank_via_LOCUS", False)
         self.declare_parameter("use_sim", False)
         self.declare_parameter("detection_rate_hz", 2.0)
+        self.declare_parameter("robot_ip", "")
+        self.declare_parameter("robot_port", 9090)
+        self.declare_parameter("remote_rgb_topic", "/camera/color/image_raw/compressed")
+        self.declare_parameter("remote_depth_topic", "/camera/depth/image_rect_raw")
+        self.declare_parameter("throttle_rate_ms", 500)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -125,7 +134,12 @@ class DrawerDetectionNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_rgb_stamp = None
-        self.camera_K = None
+        # D435i intrinsics at 1280x720 — fallback if camera_info topic is unavailable
+        self.camera_K = np.array([
+            [911.968, 0.0,     639.360],
+            [0.0,     911.456, 375.114],
+            [0.0,     0.0,     1.0],
+        ])
         self.detector = None
         self.exploring = False
 
@@ -143,26 +157,17 @@ class DrawerDetectionNode(Node):
             MarkerArray, "/drawer_markers", 10
         )
 
-        # Subscribers — BEST_EFFORT QoS to match sim driver
-        from rclpy.qos import QoSProfile, ReliabilityPolicy
-        sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
-
-        self.create_subscription(
-            RosImage, "/camera/color/image_raw",
-            self.rgb_callback, sensor_qos
-        )
-        self.create_subscription(
-            RosImage, "/camera/depth/image_rect_raw",
-            self.depth_callback, sensor_qos
-        )
-        self.create_subscription(
-            CameraInfo, "/camera/color/camera_info",
-            self.camera_info_callback, sensor_qos
-        )
         self.create_subscription(
             String, "/exploration_status",
             self.exploration_status_callback, 10
         )
+
+        # Image transport: rosbridge WebSocket (real) or DDS (sim)
+        self._robot_ip = self.get_parameter("robot_ip").value
+        if self._robot_ip:
+            self._setup_rosbridge_images()
+        else:
+            self._setup_dds_images()
 
         # Services
         self.create_service(
@@ -190,16 +195,181 @@ class DrawerDetectionNode(Node):
             f"rank_via_LOCUS={self.rank_via_locus}"
         )
 
+    # ─── Image transport setup ───────────────────────────────────────
+
+    def _setup_dds_images(self):
+        """Subscribe to camera topics via DDS (sim or same-machine)."""
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        self.create_subscription(
+            RosImage, "/camera/color/image_raw",
+            self._rgb_dds_callback, sensor_qos
+        )
+        self.create_subscription(
+            RosImage, "/camera/depth/image_rect_raw",
+            self._depth_dds_callback, sensor_qos
+        )
+        self.create_subscription(
+            CameraInfo, "/camera/color/camera_info",
+            self._camera_info_dds_callback, sensor_qos
+        )
+        self.get_logger().info("Image transport: DDS subscriptions")
+
+    def _setup_rosbridge_images(self):
+        """Receive camera images via rosbridge WebSocket (real hardware)."""
+        robot_port = self.get_parameter("robot_port").value
+        throttle_ms = self.get_parameter("throttle_rate_ms").value
+        remote_rgb = self.get_parameter("remote_rgb_topic").value
+        remote_depth = self.get_parameter("remote_depth_topic").value
+
+        self.get_logger().info(
+            f"Image transport: rosbridge at {self._robot_ip}:{robot_port}"
+        )
+        self.get_logger().info(
+            f"Remote topics: rgb={remote_rgb}, depth={remote_depth}"
+        )
+
+        self._ws_rgb_count = 0
+        self._ws_depth_count = 0
+
+        self._ros_client = roslibpy.Ros(
+            host=self._robot_ip, port=robot_port
+        )
+
+        self._rgb_topic = roslibpy.Topic(
+            self._ros_client, remote_rgb, "sensor_msgs/msg/CompressedImage",
+            throttle_rate=throttle_ms,
+        )
+        self._depth_topic = roslibpy.Topic(
+            self._ros_client, remote_depth, "sensor_msgs/msg/Image",
+            throttle_rate=throttle_ms,
+        )
+
+        self._tf_topic = roslibpy.Topic(
+            self._ros_client, "/tf", "tf2_msgs/msg/TFMessage",
+        )
+        self._tf_static_topic = roslibpy.Topic(
+            self._ros_client, "/tf_static", "tf2_msgs/msg/TFMessage",
+        )
+
+        self._tf_pub = self.create_publisher(TFMessage, "/tf", 100)
+        self._tf_static_pub = self.create_publisher(
+            TFMessage, "/tf_static",
+            rclpy.qos.QoSProfile(
+                depth=100,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+
+        self._rgb_topic.subscribe(self._rosbridge_rgb_callback)
+        self._depth_topic.subscribe(self._rosbridge_depth_callback)
+        self._tf_topic.subscribe(self._rosbridge_tf_callback)
+        self._tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
+
+        self._ros_client_thread = threading.Thread(
+            target=self._ros_client.run, daemon=True
+        )
+        self._ros_client_thread.start()
+
+        self.create_timer(10.0, self._ws_log_stats)
+
+    def _rosbridge_rgb_callback(self, msg_dict):
+        try:
+            data = msg_dict["data"]
+            if isinstance(data, str):
+                data = base64.b64decode(data)
+            arr = cv2.imdecode(
+                np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR
+            )
+            if arr is None:
+                return
+            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            self.latest_rgb = arr
+            stamp = msg_dict.get("header", {}).get("stamp", {})
+            self.latest_rgb_stamp = rclpy.time.Time(
+                seconds=stamp.get("sec", 0),
+                nanoseconds=stamp.get("nanosec", 0),
+            ).to_msg()
+            self._ws_rgb_count += 1
+        except Exception as e:
+            print(f"[rosbridge] RGB decode FAILED: {e}", flush=True)
+
+    def _rosbridge_depth_callback(self, msg_dict):
+        try:
+            data = msg_dict["data"]
+            if isinstance(data, str):
+                data = base64.b64decode(data)
+            encoding = msg_dict.get("encoding", "16UC1")
+            if encoding == "16UC1":
+                arr = np.frombuffer(data, dtype=np.uint16).reshape(
+                    msg_dict["height"], msg_dict["width"]
+                )
+            else:
+                arr = np.frombuffer(data, dtype=np.float32).reshape(
+                    msg_dict["height"], msg_dict["width"]
+                )
+            self.latest_depth = arr
+            self._ws_depth_count += 1
+        except Exception as e:
+            self.get_logger().warn(
+                f"rosbridge depth decode failed: {e}",
+                throttle_duration_sec=5.0,
+            )
+
+    def _rosbridge_tf_callback(self, msg_dict):
+        self._republish_tf(msg_dict, self._tf_pub)
+
+    def _rosbridge_tf_static_callback(self, msg_dict):
+        self._republish_tf(msg_dict, self._tf_static_pub)
+
+    def _republish_tf(self, msg_dict, publisher):
+        try:
+            tf_msg = TFMessage()
+            for t in msg_dict.get("transforms", []):
+                ts = TransformStamped()
+                h = t.get("header", {})
+                stamp = h.get("stamp", {})
+                ts.header.stamp.sec = stamp.get("sec", 0)
+                ts.header.stamp.nanosec = stamp.get("nanosec", 0)
+                ts.header.frame_id = h.get("frame_id", "")
+                ts.child_frame_id = t.get("child_frame_id", "")
+                tr = t.get("transform", {})
+                tl = tr.get("translation", {})
+                rot = tr.get("rotation", {})
+                ts.transform.translation = Vector3(
+                    x=tl.get("x", 0.0),
+                    y=tl.get("y", 0.0),
+                    z=tl.get("z", 0.0),
+                )
+                ts.transform.rotation = Quaternion(
+                    x=rot.get("x", 0.0),
+                    y=rot.get("y", 0.0),
+                    z=rot.get("z", 0.0),
+                    w=rot.get("w", 1.0),
+                )
+                tf_msg.transforms.append(ts)
+            publisher.publish(tf_msg)
+        except Exception as e:
+            print(f"[rosbridge] TF decode failed: {e}", flush=True)
+
+    def _ws_log_stats(self):
+        connected = self._ros_client.is_connected
+        self.get_logger().info(
+            f"rosbridge: rgb={self._ws_rgb_count}, "
+            f"depth={self._ws_depth_count}, connected={connected}"
+        )
+
     # ─── Callbacks ────────────────────────────────────────────────────
 
-    def rgb_callback(self, msg: RosImage):
+    def _rgb_dds_callback(self, msg: RosImage):
         self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, "rgb8")
         self.latest_rgb_stamp = msg.header.stamp
 
-    def depth_callback(self, msg: RosImage):
+    def _depth_dds_callback(self, msg: RosImage):
         self.latest_depth = self.bridge.imgmsg_to_cv2(msg, "passthrough")
 
-    def camera_info_callback(self, msg: CameraInfo):
+    def _camera_info_dds_callback(self, msg: CameraInfo):
         if self.camera_K is None:
             k = msg.k
             self.camera_K = np.array([[k[0], k[1], k[2]],
@@ -252,6 +422,12 @@ class DrawerDetectionNode(Node):
         if not self.exploring and not self.test_mode:
             return
         if self.latest_rgb is None or self.latest_depth is None:
+            self.get_logger().info(
+                f"Waiting: rgb={'ok' if self.latest_rgb is not None else 'NONE'}, "
+                f"depth={'ok' if self.latest_depth is not None else 'NONE'}, "
+                f"camera_K={'ok' if self.camera_K is not None else 'NONE'}",
+                throttle_duration_sec=5.0,
+            )
             return
         self._run_detection()
 
@@ -270,14 +446,15 @@ class DrawerDetectionNode(Node):
         # Get camera-to-map transform at the time the image was captured
         camera_frame = "camera_color_optical_frame"
         try:
-            tf_time = rclpy.time.Time.from_msg(rgb_stamp) if rgb_stamp else rclpy.time.Time()
             transform = self.tf_buffer.lookup_transform(
                 "odom", camera_frame,
-                tf_time,
+                rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
-            self.get_logger().debug(f"TF lookup failed: {e}")
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup failed: {e}", throttle_duration_sec=5.0
+            )
             return len(self.drawers)
 
         camera_K = self.camera_K
@@ -296,11 +473,31 @@ class DrawerDetectionNode(Node):
                 (handle_bbox[1] + handle_bbox[3]) / 2,
             )
 
+            u_center = int((handle_bbox[0] + handle_bbox[2]) / 2)
+            v_center = int((handle_bbox[1] + handle_bbox[3]) / 2)
+            depth_at_center = depth[
+                max(0, v_center-3):v_center+3,
+                max(0, u_center-3):u_center+3
+            ]
+            self.get_logger().info(
+                f"Projecting handle {handle_bbox}, "
+                f"depth shape={depth.shape}, dtype={depth.dtype}, "
+                f"rgb shape={rgb.shape}, "
+                f"depth@center min={depth_at_center.min()} max={depth_at_center.max()} "
+                f"nonzero={np.count_nonzero(depth_at_center)}/{depth_at_center.size}, "
+                f"whole_depth nonzero={np.count_nonzero(depth)}/{depth.size}"
+            )
             world_pos = self._project_to_world(
                 handle_bbox, depth, camera_pose, camera_K
             )
             if world_pos is None:
+                self.get_logger().warn(
+                    f"Projection failed for handle {handle_bbox} — "
+                    f"no valid depth at center"
+                )
+                self._save_projection_debug(rgb, depth, drawer_bbox, handle_bbox)
                 continue
+            self.get_logger().info(f"Handle projected to world: {world_pos}")
 
             # Determine handle orientation from bbox aspect ratio
             handle_w = handle_bbox[2] - handle_bbox[0]
@@ -491,14 +688,23 @@ class DrawerDetectionNode(Node):
 
     # ─── Projection and geometry ──────────────────────────────────────
 
+    @staticmethod
+    def _depth_to_meters(depth: np.ndarray) -> np.ndarray:
+        """Convert depth to float32 meters regardless of source format."""
+        if depth.dtype == np.uint16:
+            return depth.astype(np.float32) / 1000.0
+        return depth.astype(np.float32)
+
     def _project_to_world(
         self, bbox, depth, camera_pose, camera_K, max_depth=5.0
     ):
         """Project bbox center to 3D world coordinates using depth."""
+        depth_m = self._depth_to_meters(depth)
+
         try:
             from realrobot.stretch.projection import project_bbox_to_world_se3
             result = project_bbox_to_world_se3(
-                bbox, depth.astype(np.float32),
+                bbox, depth_m,
                 camera_pose, camera_K, max_depth=max_depth
             )
             return result
@@ -507,7 +713,7 @@ class DrawerDetectionNode(Node):
 
         # Fallback: manual projection
         x0, y0, x1, y1 = bbox
-        h, w = depth.shape[:2]
+        h, w = depth_m.shape[:2]
 
         u = int((x0 + x1) / 2)
         v = int((y0 + y1) / 2)
@@ -515,9 +721,7 @@ class DrawerDetectionNode(Node):
         v = max(0, min(v, h - 1))
 
         # Sample depth in a small region around center
-        region = depth[max(0, v-3):v+3, max(0, u-3):u+3]
-        if depth.dtype == np.uint16:
-            region = region.astype(np.float32) / 1000.0
+        region = depth_m[max(0, v-3):v+3, max(0, u-3):u+3]
         valid = region[region > 0.1]
         if len(valid) == 0:
             return None
@@ -542,13 +746,12 @@ class DrawerDetectionNode(Node):
         camera_pose: np.ndarray, camera_K: np.ndarray,
     ):
         """Project a single pixel (u, v) to world coordinates using depth."""
-        h, w = depth.shape[:2]
+        depth_m = self._depth_to_meters(depth)
+        h, w = depth_m.shape[:2]
         u = max(0, min(u, w - 1))
         v = max(0, min(v, h - 1))
 
-        region = depth[max(0, v-3):v+3, max(0, u-3):u+3]
-        if depth.dtype == np.uint16:
-            region = region.astype(np.float32) / 1000.0
+        region = depth_m[max(0, v-3):v+3, max(0, u-3):u+3]
         valid = region[region > 0.1]
         if len(valid) == 0:
             return None
@@ -575,8 +778,9 @@ class DrawerDetectionNode(Node):
         region around that corner pixel. This produces an accurate
         rectangle even when the camera views the drawer at an angle.
         """
+        depth_m = self._depth_to_meters(depth)
         x0, y0, x1, y1 = [int(c) for c in drawer_bbox]
-        h, w = depth.shape[:2]
+        h, w = depth_m.shape[:2]
 
         fx, fy = camera_K[0, 0], camera_K[1, 1]
         cx, cy = camera_K[0, 2], camera_K[1, 2]
@@ -588,7 +792,7 @@ class DrawerDetectionNode(Node):
             uc = max(0, min(u, w - 1))
             vc = max(0, min(v, h - 1))
 
-            d = self._sample_depth_at(depth, uc, vc)
+            d = self._sample_depth_at(depth_m, uc, vc)
             if d is None:
                 return None
 
@@ -603,12 +807,10 @@ class DrawerDetectionNode(Node):
 
     @staticmethod
     def _sample_depth_at(depth: np.ndarray, u: int, v: int, radius: int = 5):
-        """Sample median depth in a small region around (u, v)."""
+        """Sample median depth in a small region around (u, v). Expects meters."""
         h, w = depth.shape[:2]
         r = radius
         region = depth[max(0, v - r):min(h, v + r), max(0, u - r):min(w, u + r)]
-        if depth.dtype == np.uint16:
-            region = region.astype(np.float32) / 1000.0
         valid = region[region > 0.1]
         if len(valid) == 0:
             return None
@@ -730,6 +932,40 @@ class DrawerDetectionNode(Node):
         #       for drawer, score in zip(self.drawers, scores):
         #           drawer.ranking = score
         pass
+
+    def _save_projection_debug(self, rgb, depth, drawer_bbox, handle_bbox):
+        debug_dir = Path("/tmp/detic_debug")
+        debug_dir.mkdir(exist_ok=True)
+        stamp = int(time.time() * 1000) % 1000000
+
+        # RGB with bounding boxes
+        vis = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
+        cv2.rectangle(vis, (drawer_bbox[0], drawer_bbox[1]),
+                       (drawer_bbox[2], drawer_bbox[3]), (255, 0, 0), 2)
+        cv2.rectangle(vis, (handle_bbox[0], handle_bbox[1]),
+                       (handle_bbox[2], handle_bbox[3]), (0, 255, 0), 2)
+        hcx = (handle_bbox[0] + handle_bbox[2]) // 2
+        hcy = (handle_bbox[1] + handle_bbox[3]) // 2
+        cv2.circle(vis, (hcx, hcy), 5, (0, 0, 255), -1)
+        depth_val = depth[min(hcy, depth.shape[0]-1), min(hcx, depth.shape[1]-1)]
+        cv2.putText(vis, f"d={depth_val}", (hcx+10, hcy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imwrite(str(debug_dir / f"proj_rgb_{stamp}.jpg"), vis)
+
+        # Depth as normalized grayscale
+        depth_vis = depth.copy().astype(np.float32)
+        depth_vis[depth_vis == 0] = np.nan
+        dmin = np.nanmin(depth_vis) if np.any(~np.isnan(depth_vis)) else 0
+        dmax = np.nanmax(depth_vis) if np.any(~np.isnan(depth_vis)) else 1
+        depth_norm = ((depth_vis - dmin) / max(dmax - dmin, 1) * 255)
+        depth_norm = np.nan_to_num(depth_norm, 0).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+        cv2.rectangle(depth_color, (handle_bbox[0], handle_bbox[1]),
+                       (handle_bbox[2], handle_bbox[3]), (0, 255, 0), 2)
+        cv2.circle(depth_color, (hcx, hcy), 5, (255, 255, 255), -1)
+        cv2.imwrite(str(debug_dir / f"proj_depth_{stamp}.jpg"), depth_color)
+
+        self.get_logger().info(f"Projection debug saved to {debug_dir}/proj_*_{stamp}.jpg")
 
     # ─── Annotation and visualization ─────────────────────────────────
 
