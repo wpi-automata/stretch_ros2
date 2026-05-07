@@ -499,10 +499,12 @@ class DrawerDetectionNode(Node):
                 continue
             self.get_logger().info(f"Handle projected to world: {world_pos}")
 
-            # Determine handle orientation from bbox aspect ratio
+            # TODO: rotate the camera image to match reality instead of
+            # swapping the orientation here. The camera is mounted rotated
+            # 90° left, so image-wide = real-world vertical.
             handle_w = handle_bbox[2] - handle_bbox[0]
             handle_h = handle_bbox[3] - handle_bbox[1]
-            orientation = "horizontal" if handle_w > handle_h else "vertical"
+            orientation = "vertical" if handle_w > handle_h else "horizontal"
 
             # Check reachability
             reachable = self._check_reachability(world_pos)

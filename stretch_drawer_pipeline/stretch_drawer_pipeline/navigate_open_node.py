@@ -612,40 +612,49 @@ class NavigateOpenNode(Node):
         current_extension = 0.0
         step = self.arm_extension_speed
 
+        time.sleep(0.5)
+        baseline_efforts = [self.current_effort.get(f"joint_arm_l{i}", 0.0) for i in range(4)]
+        baseline_ext = self.current_effort.get("wrist_extension", 0.0)
+        self.get_logger().info(
+            f"Effort baseline: wrist_extension={baseline_ext:.3f}, "
+            f"arm_l0..l3={[f'{e:.3f}' for e in baseline_efforts]}"
+        )
+
         while current_extension < max_extension and not self.stop_requested:
             current_extension += step
             self._send_joint_command("wrist_extension", current_extension)
             time.sleep(0.2)
 
-            contact, effort = self._detect_contact()
+            contact, delta = self._detect_contact(baseline_ext, baseline_efforts)
             if contact:
                 self.get_logger().info(
-                    f"Contact detected at extension={current_extension:.3f}m, effort={effort:.2f}"
+                    f"Contact detected at extension={current_extension:.3f}m, "
+                    f"effort delta={delta:.2f}"
                 )
                 return True
 
         self.get_logger().warn("Max extension reached without contact")
         return False
 
-    def _detect_contact(self) -> tuple:
-        """Check if the gripper is in contact based on effort readings.
-
-        Checks both wrist_extension (real robot virtual joint) and the
-        individual arm telescoping joints (joint_arm_l0..l3).
-        """
+    def _detect_contact(self, baseline_ext: float,
+                        baseline_arms: list) -> tuple:
+        """Check if effort has increased significantly above baseline."""
         ext_effort = self.current_effort.get("wrist_extension", 0.0)
         arm_efforts = [self.current_effort.get(f"joint_arm_l{i}", 0.0) for i in range(4)]
-        max_arm = max(abs(e) for e in arm_efforts) if arm_efforts else 0.0
-        effort = max(abs(ext_effort), max_arm)
+
+        ext_delta = abs(ext_effort - baseline_ext)
+        arm_deltas = [abs(a - b) for a, b in zip(arm_efforts, baseline_arms)]
+        max_arm_delta = max(arm_deltas) if arm_deltas else 0.0
+        delta = max(ext_delta, max_arm_delta)
 
         self.get_logger().info(
-            f"  effort: wrist_extension={ext_effort:.3f}, "
-            f"arm_l0..l3={[f'{e:.3f}' for e in arm_efforts]}, "
+            f"  effort delta: wrist_ext={ext_delta:.3f}, "
+            f"arm_l0..l3={[f'{d:.3f}' for d in arm_deltas]}, "
             f"threshold={self.grasp_force_threshold}",
             throttle_duration_sec=1.0,
         )
 
-        return effort > self.grasp_force_threshold, effort
+        return delta > self.grasp_force_threshold, delta
 
     def _close_gripper(self):
         """Close the gripper to grasp the handle."""
