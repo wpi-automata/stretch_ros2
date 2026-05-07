@@ -610,13 +610,13 @@ class NavigateOpenNode(Node):
         """Real robot: incrementally extend until force contact is detected."""
         max_extension = 0.52
         current_extension = 0.0
-        step = self.arm_extension_speed
+        step = 0.05
         contact_threshold = 20.0
 
         while current_extension < max_extension and not self.stop_requested:
             current_extension += step
             self._send_joint_command("wrist_extension", current_extension)
-            time.sleep(0.2)
+            time.sleep(0.5)
 
             arm_efforts = [abs(self.current_effort.get(f"joint_arm_l{i}", 0.0)) for i in range(4)]
             max_effort = max(arm_efforts)
