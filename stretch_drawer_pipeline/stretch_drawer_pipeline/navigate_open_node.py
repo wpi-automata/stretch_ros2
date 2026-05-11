@@ -305,22 +305,11 @@ class NavigateOpenNode(Node):
         Priority: ranking score > closest distance.
         Only considers reachable drawers.
         """
-        drawers_json = None
-        if self.get_drawers_client.wait_for_service(timeout_sec=2.0):
-            future = self.get_drawers_client.call_async(Trigger.Request())
-            timeout = time.time() + 10.0
-            while not future.done() and time.time() < timeout:
-                time.sleep(0.05)
-            if future.done() and future.result() is not None and future.result().success:
-                drawers_json = future.result().message
-        if drawers_json is None and self._latest_drawer_json is not None:
-            self.get_logger().info("Using drawer detections from rosbridge topic")
-            drawers_json = self._latest_drawer_json
-        if drawers_json is None:
-            self.get_logger().error("No drawer detections available (service and topic both empty)")
+        if self._latest_drawer_json is None:
+            self.get_logger().error("No drawer detections received yet")
             return None
 
-        drawers = json.loads(drawers_json)
+        drawers = json.loads(self._latest_drawer_json)
         if not drawers:
             return None
 
