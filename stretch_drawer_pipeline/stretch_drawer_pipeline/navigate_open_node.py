@@ -465,6 +465,7 @@ class NavigateOpenNode(Node):
                 return normal_2d
 
         # Fallback: use mast-to-handle direction
+        self.get_logger().warn("No valid drawer corners — falling back to robot-to-handle direction for approach angle")
         mast_pose = self._get_mast_pose()
         if mast_pose is not None:
             dx = mast_pose[0] - handle_pos[0]
@@ -483,11 +484,9 @@ class NavigateOpenNode(Node):
         orientation, so what appears horizontal in the image is vertical
         in reality and vice versa.
         """
+        self._send_joint_command("joint_wrist_pitch", 0.0)
+        self._send_joint_command("joint_wrist_roll", 0.0)
         self._send_joint_command("joint_wrist_yaw", math.pi / 2)
-        # if handle_orientation == "vertical":
-        #     self._send_joint_command("joint_wrist_roll", math.pi / 2)
-        # else:
-        #     self._send_joint_command("joint_wrist_roll", 0.0)
         time.sleep(1.0)
 
     # ─── Head control ─────────────────────────────────────────────────
@@ -756,6 +755,7 @@ class NavigateOpenNode(Node):
         self.get_logger().info(
             f"Orienting gripper: yaw=0, roll={'pi/2' if handle_orientation == 'vertical' else '0'}"
         )
+        self._send_joint_command("joint_wrist_pitch", 0.0)
         self._send_joint_command("joint_wrist_yaw", 0.0)
         self._send_joint_command("joint_wrist_roll", roll)
         time.sleep(1.0)

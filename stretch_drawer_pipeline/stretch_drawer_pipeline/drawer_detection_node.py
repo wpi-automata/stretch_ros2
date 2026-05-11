@@ -487,9 +487,19 @@ class DrawerDetectionNode(Node):
                 f"nonzero={np.count_nonzero(depth_at_center)}/{depth_at_center.size}, "
                 f"whole_depth nonzero={np.count_nonzero(depth)}/{depth.size}"
             )
+            cam_xyz = camera_pose[:3, 3]
+            self.get_logger().info(
+                f"Camera pose in odom: ({cam_xyz[0]:.3f}, {cam_xyz[1]:.3f}, {cam_xyz[2]:.3f})"
+            )
             world_pos = self._project_to_world(
                 handle_bbox, depth, camera_pose, camera_K
             )
+            if world_pos is not None:
+                dist = np.linalg.norm(world_pos[:2] - cam_xyz[:2])
+                self.get_logger().info(
+                    f"Handle world: ({world_pos[0]:.3f}, {world_pos[1]:.3f}, {world_pos[2]:.3f}), "
+                    f"distance from camera={dist:.3f}m"
+                )
             if world_pos is None:
                 self.get_logger().warn(
                     f"Projection failed for handle {handle_bbox} — "
@@ -608,6 +618,7 @@ class DrawerDetectionNode(Node):
         drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.3)
 
         handle_dets = [d for d in detections if d.object_type in handle_classes]
+        handle_dets = self._cross_class_nms(handle_dets, iou_threshold=0.3)
 
         self.get_logger().info(
             f"Detic pass: {len(detections)} total, "
@@ -783,6 +794,14 @@ class DrawerDetectionNode(Node):
         depth_m = self._depth_to_meters(depth)
         x0, y0, x1, y1 = [int(c) for c in drawer_bbox]
         h, w = depth_m.shape[:2]
+
+        # Shrink bbox by 15% on each side to avoid sampling wall/background
+        margin_x = int((x1 - x0) * 0.15)
+        margin_y = int((y1 - y0) * 0.15)
+        x0 += margin_x
+        y0 += margin_y
+        x1 -= margin_x
+        y1 -= margin_y
 
         fx, fy = camera_K[0, 0], camera_K[1, 1]
         cx, cy = camera_K[0, 2], camera_K[1, 2]
