@@ -143,6 +143,13 @@ class NavigateOpenNode(Node):
             Trigger, "/detection/get_drawers"
         )
 
+        # Fallback: receive detections via topic (works across rosbridge)
+        self._latest_drawer_json = None
+        self.create_subscription(
+            String, "/drawer_detections_json",
+            self._drawer_detections_callback, 10
+        )
+
         # Mode switching (sim needs position mode for base translate/rotate)
         self.position_mode_client = self.create_client(
             Trigger, "/switch_to_position_mode"
@@ -155,6 +162,9 @@ class NavigateOpenNode(Node):
         self.create_timer(0.5, self.publish_status)
 
         self.get_logger().info("Navigate and open node initialized")
+
+    def _drawer_detections_callback(self, msg: String):
+        self._latest_drawer_json = msg.data
 
     # ─── Callbacks ────────────────────────────────────────────────────
 
@@ -295,22 +305,22 @@ class NavigateOpenNode(Node):
         Priority: ranking score > closest distance.
         Only considers reachable drawers.
         """
-        if not self.get_drawers_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("Drawer detection service not available")
+        drawers_json = None
+        if self.get_drawers_client.wait_for_service(timeout_sec=2.0):
+            future = self.get_drawers_client.call_async(Trigger.Request())
+            timeout = time.time() + 10.0
+            while not future.done() and time.time() < timeout:
+                time.sleep(0.05)
+            if future.done() and future.result() is not None and future.result().success:
+                drawers_json = future.result().message
+        if drawers_json is None and self._latest_drawer_json is not None:
+            self.get_logger().info("Using drawer detections from rosbridge topic")
+            drawers_json = self._latest_drawer_json
+        if drawers_json is None:
+            self.get_logger().error("No drawer detections available (service and topic both empty)")
             return None
 
-        future = self.get_drawers_client.call_async(Trigger.Request())
-        timeout = time.time() + 10.0
-        while not future.done() and time.time() < timeout:
-            time.sleep(0.05)
-        if not future.done() or future.result() is None:
-            return None
-
-        response = future.result()
-        if not response.success:
-            return None
-
-        drawers = json.loads(response.message)
+        drawers = json.loads(drawers_json)
         if not drawers:
             return None
 

@@ -262,10 +262,28 @@ class DrawerDetectionNode(Node):
             ),
         )
 
+        self._robot_desc_topic = roslibpy.Topic(
+            self._ros_client, "/robot_description", "std_msgs/msg/String",
+        )
+        self._robot_desc_pub = self.create_publisher(
+            String, "/robot_description",
+            rclpy.qos.QoSProfile(
+                depth=1,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+
+        self._ws_drawer_pub = roslibpy.Topic(
+            self._ros_client, "/drawer_detections_json", "std_msgs/msg/String",
+        )
+
+        self._static_tf_cache = {}
+
         self._rgb_topic.subscribe(self._rosbridge_rgb_callback)
         self._depth_topic.subscribe(self._rosbridge_depth_callback)
         self._tf_topic.subscribe(self._rosbridge_tf_callback)
         self._tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
+        self._robot_desc_topic.subscribe(self._rosbridge_robot_desc_callback)
 
         self._ros_client_thread = threading.Thread(
             target=self._ros_client.run, daemon=True
@@ -273,6 +291,8 @@ class DrawerDetectionNode(Node):
         self._ros_client_thread.start()
 
         self.create_timer(10.0, self._ws_log_stats)
+        self.create_timer(5.0, self._republish_static_tf_cache)
+        self.create_timer(30.0, self._resubscribe_tf_static)
 
     def _rosbridge_rgb_callback(self, msg_dict):
         try:
@@ -321,7 +341,50 @@ class DrawerDetectionNode(Node):
         self._republish_tf(msg_dict, self._tf_pub)
 
     def _rosbridge_tf_static_callback(self, msg_dict):
+        try:
+            for t in msg_dict.get("transforms", []):
+                child = t.get("child_frame_id", "")
+                if child:
+                    self._static_tf_cache[child] = t
+            self.get_logger().info(
+                f"tf_static via rosbridge: +{len(msg_dict.get('transforms', []))} transforms, "
+                f"cache total: {len(self._static_tf_cache)}",
+                throttle_duration_sec=10.0,
+            )
+        except Exception as e:
+            self.get_logger().warn(f"tf_static cache update failed: {e}")
         self._republish_tf(msg_dict, self._tf_static_pub)
+
+    def _rosbridge_robot_desc_callback(self, msg_dict):
+        try:
+            data = msg_dict.get("data", "")
+            if data:
+                msg = String()
+                msg.data = data
+                self._robot_desc_pub.publish(msg)
+                self.get_logger().info(
+                    f"Republished /robot_description ({len(data)} bytes)"
+                )
+        except Exception as e:
+            self.get_logger().warn(f"robot_description relay failed: {e}")
+
+    def _republish_static_tf_cache(self):
+        if not self._static_tf_cache:
+            return
+        msg_dict = {"transforms": list(self._static_tf_cache.values())}
+        self._republish_tf(msg_dict, self._tf_static_pub)
+
+    def _resubscribe_tf_static(self):
+        if not self._ros_client.is_connected:
+            return
+        self._tf_static_topic.unsubscribe()
+        self._tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
+        self._robot_desc_topic.unsubscribe()
+        self._robot_desc_topic.subscribe(self._rosbridge_robot_desc_callback)
+        self.get_logger().info(
+            f"Re-subscribed to tf_static and robot_description "
+            f"(tf_static cache: {len(self._static_tf_cache)})"
+        )
 
     def _republish_tf(self, msg_dict, publisher):
         try:
@@ -359,6 +422,16 @@ class DrawerDetectionNode(Node):
             f"rosbridge: rgb={self._ws_rgb_count}, "
             f"depth={self._ws_depth_count}, connected={connected}"
         )
+
+    def _publish_drawers_via_rosbridge(self):
+        if not hasattr(self, "_ws_drawer_pub") or not self._ros_client.is_connected:
+            return
+        try:
+            response = Trigger.Response()
+            self.get_drawers_callback(None, response)
+            self._ws_drawer_pub.publish(roslibpy.Message({"data": response.message}))
+        except Exception as e:
+            self.get_logger().warn(f"rosbridge drawer publish failed: {e}", throttle_duration_sec=10.0)
 
     # ─── Callbacks ────────────────────────────────────────────────────
 
@@ -559,6 +632,7 @@ class DrawerDetectionNode(Node):
                 f"total: {len(self.drawers)}"
             )
             self._save_debug_image(rgb, all_detections, drawer_bboxes)
+            self._publish_drawers_via_rosbridge()
 
         return len(self.drawers)
 
