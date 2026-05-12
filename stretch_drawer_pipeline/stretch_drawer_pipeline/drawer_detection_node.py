@@ -398,8 +398,62 @@ class DrawerDetectionNode(Node):
                 self.get_logger().info(
                     f"Republished /robot_description ({len(data)} bytes)"
                 )
+                self._publish_static_tfs_from_urdf(data)
         except Exception as e:
             self.get_logger().warn(f"robot_description relay failed: {e}")
+
+    def _publish_static_tfs_from_urdf(self, urdf_xml: str):
+        """Parse URDF and publish all fixed-joint transforms on local /tf_static.
+
+        Rosbridge doesn't replay latched /tf_static messages to late
+        subscribers, so extracting them from the URDF guarantees the
+        full static chain is available regardless of startup order.
+        """
+        import xml.etree.ElementTree as ET
+        from tf_transformations import quaternion_from_euler
+
+        try:
+            root = ET.fromstring(urdf_xml)
+        except ET.ParseError as e:
+            self.get_logger().warn(f"URDF parse failed: {e}")
+            return
+
+        tf_msg = TFMessage()
+        now = self.get_clock().now().to_msg()
+
+        for joint in root.findall("joint"):
+            if joint.get("type") != "fixed":
+                continue
+
+            parent = joint.find("parent")
+            child = joint.find("child")
+            if parent is None or child is None:
+                continue
+
+            origin = joint.find("origin")
+            xyz = [0.0, 0.0, 0.0]
+            rpy = [0.0, 0.0, 0.0]
+            if origin is not None:
+                xyz_str = origin.get("xyz", "0 0 0").split()
+                rpy_str = origin.get("rpy", "0 0 0").split()
+                xyz = [float(v) for v in xyz_str]
+                rpy = [float(v) for v in rpy_str]
+
+            q = quaternion_from_euler(rpy[0], rpy[1], rpy[2])
+
+            ts = TransformStamped()
+            ts.header.stamp = now
+            ts.header.frame_id = parent.get("link")
+            ts.child_frame_id = child.get("link")
+            ts.transform.translation = Vector3(x=xyz[0], y=xyz[1], z=xyz[2])
+            ts.transform.rotation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+            tf_msg.transforms.append(ts)
+
+        if tf_msg.transforms:
+            self._tf_static_pub.publish(tf_msg)
+            self.get_logger().info(
+                f"Published {len(tf_msg.transforms)} static TFs from URDF"
+            )
 
     def _republish_static_tf_cache(self):
         if not self._static_tf_cache:
@@ -941,17 +995,17 @@ class DrawerDetectionNode(Node):
         """Project bbox center to 3D world coordinates using depth."""
         depth_m = self._depth_to_meters(depth)
 
-        try:
-            from realrobot.stretch.projection import project_bbox_to_world_se3
-            result = project_bbox_to_world_se3(
-                bbox, depth_m,
-                camera_pose, camera_K, max_depth=max_depth
-            )
-            return result
-        except ImportError:
-            pass
+        if self.use_sim:
+            try:
+                from realrobot.stretch.projection import project_bbox_to_world_se3
+                result = project_bbox_to_world_se3(
+                    bbox, depth_m,
+                    camera_pose, camera_K, max_depth=max_depth
+                )
+                return result
+            except ImportError:
+                pass
 
-        # Fallback: manual projection
         x0, y0, x1, y1 = bbox
         h, w = depth_m.shape[:2]
 
@@ -960,7 +1014,6 @@ class DrawerDetectionNode(Node):
         u = max(0, min(u, w - 1))
         v = max(0, min(v, h - 1))
 
-        # Sample depth in a small region around center
         region = depth_m[max(0, v-3):v+3, max(0, u-3):u+3]
         valid = region[region > 0.1]
         if len(valid) == 0:
@@ -977,7 +1030,10 @@ class DrawerDetectionNode(Node):
         y_cam = (v - cy) / fy * d
         z_cam = d
 
-        p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        if not self.use_sim:
+            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
+        else:
+            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
         p_world = camera_pose @ p_cam
         return p_world[:3]
 
@@ -1004,7 +1060,10 @@ class DrawerDetectionNode(Node):
         y_cam = (v - cy) / fy * d
         z_cam = d
 
-        p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        if not self.use_sim:
+            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
+        else:
+            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
         p_world = camera_pose @ p_cam
         return p_world[:3]
 
@@ -1047,7 +1106,10 @@ class DrawerDetectionNode(Node):
             x_cam = (uc - cx) / fx * d
             y_cam = (vc - cy) / fy * d
             z_cam = d
-            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+            if not self.use_sim:
+                p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
+            else:
+                p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
             p_world = camera_pose @ p_cam
             corners_world.append(p_world[:3])
 

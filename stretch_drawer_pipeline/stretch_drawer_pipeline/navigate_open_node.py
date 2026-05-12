@@ -782,12 +782,11 @@ class NavigateOpenNode(Node):
         """Align the gripper for grasping the handle.
 
         Yaw = 0: gripper in line with arm axis, pointing toward drawer.
-        Roll = pi/2 for vertical handles, 0 for horizontal.
-        Note: camera image is rotated 90 deg from real life.
+        Roll = pi/2 for horizontal handles, 0 for vertical.
         """
-        roll = math.pi / 2 if handle_orientation == "vertical" else 0.0
+        roll = math.pi / 2 if handle_orientation == "horizontal" else 0.0
         self.get_logger().info(
-            f"Orienting gripper: yaw=0, roll={'pi/2' if handle_orientation == 'vertical' else '0'}"
+            f"Orienting gripper: yaw=0, roll={'pi/2' if handle_orientation == 'horizontal' else '0'}"
         )
         self._send_joint_command("joint_wrist_pitch", 0.0)
         self._send_joint_command("joint_wrist_yaw", 0.0)
