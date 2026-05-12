@@ -377,15 +377,16 @@ class DrawerDetectionNode(Node):
             for t in msg_dict.get("transforms", []):
                 child = t.get("child_frame_id", "")
                 if child:
+                    t.setdefault("header", {})["stamp"] = {"sec": 0, "nanosec": 0}
                     self._static_tf_cache[child] = t
             self.get_logger().info(
-                f"tf_static via rosbridge: +{len(msg_dict.get('transforms', []))} transforms, "
-                f"cache total: {len(self._static_tf_cache)}",
-                throttle_duration_sec=10.0,
+                f"tf_static via rosbridge: {len(self._static_tf_cache)} transforms cached"
             )
         except Exception as e:
             self.get_logger().warn(f"tf_static cache update failed: {e}")
         self._republish_tf(msg_dict, self._tf_static_pub)
+        self._tf_static_topic.unsubscribe()
+        self.get_logger().info("Unsubscribed from tf_static_volatile (static TFs received)")
 
     def _rosbridge_robot_desc_callback(self, msg_dict):
         try:
