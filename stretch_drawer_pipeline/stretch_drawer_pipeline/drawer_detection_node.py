@@ -135,12 +135,23 @@ class DrawerDetectionNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_rgb_stamp = None
-        # D435i intrinsics at 1280x720 — fallback if camera_info topic is unavailable
-        self.camera_K = np.array([
-            [911.968, 0.0,     639.360],
-            [0.0,     911.456, 375.114],
-            [0.0,     0.0,     1.0],
-        ])
+        # D435i intrinsics — fallback if camera_info topic is unavailable.
+        # Original at 1280x720: fx=911.968, fy=911.456, cx=639.360, cy=375.114
+        if self.use_sim:
+            self.camera_K = np.array([
+                [911.968, 0.0,     639.360],
+                [0.0,     911.456, 375.114],
+                [0.0,     0.0,     1.0],
+            ])
+        else:
+            # After ROTATE_90_CLOCKWISE to 720x1280:
+            # new_fx=old_fy, new_fy=old_fx,
+            # new_cx=H-1-old_cy=719-375.114, new_cy=old_cx
+            self.camera_K = np.array([
+                [911.456, 0.0,     343.886],
+                [0.0,     911.968, 639.360],
+                [0.0,     0.0,     1.0],
+            ])
         self.detector = None
         self.exploring = False
 
@@ -323,6 +334,8 @@ class DrawerDetectionNode(Node):
             if arr is None:
                 return
             arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            if not self.use_sim:
+                arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_rgb = arr
             stamp = msg_dict.get("header", {}).get("stamp", {})
             self.latest_rgb_stamp = rclpy.time.Time(
@@ -347,6 +360,8 @@ class DrawerDetectionNode(Node):
                 arr = np.frombuffer(data, dtype=np.float32).reshape(
                     msg_dict["height"], msg_dict["width"]
                 )
+            if not self.use_sim:
+                arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = arr
             self._ws_depth_count += 1
         except Exception as e:
@@ -454,18 +469,32 @@ class DrawerDetectionNode(Node):
     # ─── Callbacks ────────────────────────────────────────────────────
 
     def _rgb_dds_callback(self, msg: RosImage):
-        self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        arr = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        if not self.use_sim:
+            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        self.latest_rgb = arr
         self.latest_rgb_stamp = msg.header.stamp
 
     def _depth_dds_callback(self, msg: RosImage):
-        self.latest_depth = self.bridge.imgmsg_to_cv2(msg, "passthrough")
+        arr = self.bridge.imgmsg_to_cv2(msg, "passthrough")
+        if not self.use_sim:
+            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        self.latest_depth = arr
 
     def _camera_info_dds_callback(self, msg: CameraInfo):
         if self.camera_K is None:
             k = msg.k
-            self.camera_K = np.array([[k[0], k[1], k[2]],
-                                      [k[3], k[4], k[5]],
-                                      [k[6], k[7], k[8]]])
+            K = np.array([[k[0], k[1], k[2]],
+                          [k[3], k[4], k[5]],
+                          [k[6], k[7], k[8]]])
+            if not self.use_sim:
+                fx, fy = K[0, 0], K[1, 1]
+                cx, cy = K[0, 2], K[1, 2]
+                h = msg.height
+                K = np.array([[fy,  0.0, h - 1 - cy],
+                              [0.0, fx,  cx],
+                              [0.0, 0.0, 1.0]])
+            self.camera_K = K
 
     def exploration_status_callback(self, msg: String):
         self.exploring = msg.data in ("rotating", "planning", "navigating")
@@ -709,12 +738,9 @@ class DrawerDetectionNode(Node):
                 continue
             self.get_logger().info(f"Handle projected to world: {world_pos}")
 
-            # TODO: rotate the camera image to match reality instead of
-            # swapping the orientation here. The camera is mounted rotated
-            # 90° left, so image-wide = real-world vertical.
             handle_w = handle_bbox[2] - handle_bbox[0]
             handle_h = handle_bbox[3] - handle_bbox[1]
-            orientation = "vertical" if handle_w > handle_h else "horizontal"
+            orientation = "horizontal" if handle_w > handle_h else "vertical"
 
             # Check reachability
             reachable = self._check_reachability(world_pos)
