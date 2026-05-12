@@ -143,7 +143,14 @@ class NavigateOpenNode(Node):
             Trigger, "/detection/get_drawers"
         )
 
-        # Fallback: receive detections via topic (works across rosbridge)
+        # Receive chosen drawer from detection node on automata-3
+        self._chosen_drawer_json = None
+        self.create_subscription(
+            String, "/detection/chosen_drawer_json",
+            self._chosen_drawer_callback, 10
+        )
+
+        # Fallback: receive all detections via topic (works across rosbridge)
         self._latest_drawer_json = None
         self.create_subscription(
             String, "/drawer_detections_json",
@@ -163,6 +170,10 @@ class NavigateOpenNode(Node):
 
         self.get_logger().info("Navigate and open node initialized")
 
+    def _chosen_drawer_callback(self, msg: String):
+        self._chosen_drawer_json = msg.data
+        self.get_logger().info(f"Received chosen drawer from detection node")
+
     def _drawer_detections_callback(self, msg: String):
         self._latest_drawer_json = msg.data
 
@@ -171,8 +182,28 @@ class NavigateOpenNode(Node):
     def joint_state_callback(self, msg: JointState):
         """Track joint positions and efforts for force feedback."""
         self.current_joint_state = msg
-        for name, effort in zip(msg.name, msg.effort):
-            self.current_effort[name] = effort
+        if not hasattr(self, '_js_logged'):
+            self._js_logged = True
+            self.get_logger().info(
+                f"joint_states source: names={list(msg.name)}, "
+                f"effort_len={len(msg.effort)}, "
+                f"has_nonzero_effort={any(abs(e) > 0.01 for e in msg.effort)}"
+            )
+        if msg.effort:
+            for name, effort in zip(msg.name, msg.effort):
+                self.current_effort[name] = effort
+            arm_efforts = {n: e for n, e in zip(msg.name, msg.effort)
+                          if n.startswith("joint_arm_l")}
+            if any(abs(e) > 1.0 for e in arm_efforts.values()):
+                self.get_logger().info(
+                    f"Arm effort spike: {arm_efforts}",
+                    throttle_duration_sec=2.0,
+                )
+        else:
+            self.get_logger().warn(
+                "joint_states has EMPTY effort array!",
+                throttle_duration_sec=10.0,
+            )
 
     def execute_callback(self, request, response):
         """Execute the full navigate-and-open sequence."""
@@ -227,7 +258,11 @@ class NavigateOpenNode(Node):
             self._publish_target_marker(drawer)
 
             # Switch to position mode so base translate/rotate commands work
-            self._switch_to_position_mode()
+            if not self._switch_to_position_mode():
+                self.get_logger().error("Cannot proceed without position mode")
+                self._set_state(OpenState.FAILED)
+                return
+            time.sleep(0.5)
 
             # Step 2: Navigate to approach pose (in front of handle,
             # perpendicular to drawer face) and align arm toward handle
@@ -300,31 +335,15 @@ class NavigateOpenNode(Node):
     # ─── Drawer selection ─────────────────────────────────────────────
 
     def _select_target_drawer(self):
-        """Get drawers from Node 2 and select the best one.
-
-        Priority: ranking score > closest distance.
-        Only considers reachable drawers.
-        """
-        if self._latest_drawer_json is None:
-            self.get_logger().error("No drawer detections received yet")
+        """Return the drawer chosen by the detection node on automata-3."""
+        if self._chosen_drawer_json is None:
+            self.get_logger().error(
+                "No chosen drawer received from detection node. "
+                "Call /detection/choose_drawer on automata-3 first."
+            )
             return None
 
-        drawers = json.loads(self._latest_drawer_json)
-        if not drawers:
-            return None
-
-        # Filter reachable
-        reachable = [d for d in drawers if d["reachable"]]
-        if not reachable:
-            self.get_logger().warn("No reachable drawers. Using all drawers.")
-            reachable = drawers
-
-        # Sort by ranking (descending), then by distance (ascending)
-        reachable.sort(
-            key=lambda d: (-d["ranking"], d["distance_to_robot"])
-        )
-
-        return reachable[0]
+        return json.loads(self._chosen_drawer_json)
 
     # ─── Navigation ───────────────────────────────────────────────────
 
@@ -418,7 +437,9 @@ class NavigateOpenNode(Node):
 
                 step = min(remaining, 0.2)
                 self.get_logger().info(f"Phase 2: Driving {step:.2f}m (remaining {remaining:.2f}m)")
-                self._send_joint_command("translate_mobile_base", step, duration_sec=3)
+                if not self._send_joint_command("translate_mobile_base", step, duration_sec=3):
+                    self.get_logger().error("Translate command failed — check driver mode")
+                    return False
                 time.sleep(1.0)
 
             if self.stop_requested:
@@ -607,13 +628,27 @@ class NavigateOpenNode(Node):
     def _approach_handle_real(self) -> bool:
         """Real robot: incrementally extend until force contact is detected."""
         max_extension = 0.52
-        current_extension = 0.0
         step = 0.05
         contact_threshold = 20.0
 
+        # Retract first to establish known starting position
+        self.get_logger().info("Retracting arm before approach")
+        if not self._send_joint_command("wrist_extension", 0.0, duration_sec=4):
+            self.get_logger().error("Failed to retract arm before approach")
+            return False
+        time.sleep(1.0)
+
+        actual_ext = self._get_current_extension()
+        self.get_logger().info(f"Arm at {actual_ext:.3f}m after retract, extending in {step}m steps")
+
+        current_extension = 0.0
         while current_extension < max_extension and not self.stop_requested:
             current_extension += step
-            self._send_joint_command("wrist_extension", current_extension)
+            if not self._send_joint_command("wrist_extension", current_extension):
+                self.get_logger().error(
+                    f"Arm extension command failed at {current_extension:.3f}m"
+                )
+                return False
             time.sleep(0.5)
 
             arm_efforts = [abs(self.current_effort.get(f"joint_arm_l{i}", 0.0)) for i in range(4)]
@@ -623,7 +658,6 @@ class NavigateOpenNode(Node):
                 f"  ext={current_extension:.3f}m, "
                 f"arm_effort={[f'{e:.1f}' for e in arm_efforts]}, "
                 f"max={max_effort:.1f}, threshold={contact_threshold}",
-                throttle_duration_sec=1.0,
             )
 
             if max_effort > contact_threshold:
@@ -805,6 +839,7 @@ class NavigateOpenNode(Node):
         point.time_from_start = Duration(sec=duration_sec, nanosec=0)
         goal.trajectory.points = [point]
 
+        t0 = time.time()
         self.get_logger().info(f"Sending joint command: {joint_name}={position:.3f}")
         future = self.trajectory_client.send_goal_async(goal)
 
@@ -829,26 +864,46 @@ class NavigateOpenNode(Node):
         while not result_future.done() and time.time() < timeout:
             time.sleep(0.05)
 
+        elapsed = time.time() - t0
         if not result_future.done():
             self.get_logger().warn(f"Joint command execution timed out: {joint_name}")
             return False
 
-        self.get_logger().info(f"Joint command complete: {joint_name}={position:.3f}")
+        result = result_future.result()
+        status = goal_handle.status
+        # status: 2=ACTIVE, 4=SUCCEEDED, 5=CANCELED, 6=ABORTED
+        if status != 4:  # GoalStatus.STATUS_SUCCEEDED
+            error_code = result.result.error_code if result and result.result else "N/A"
+            error_string = result.result.error_string if result and result.result else "N/A"
+            self.get_logger().error(
+                f"Joint command FAILED: {joint_name}={position:.3f}, "
+                f"status={status}, error_code={error_code}, "
+                f"error_string={error_string}, elapsed={elapsed:.3f}s"
+            )
+            return False
+
+        self.get_logger().info(
+            f"Joint command complete: {joint_name}={position:.3f} ({elapsed:.3f}s)"
+        )
         return True
 
     def _switch_to_position_mode(self) -> bool:
         """Switch the driver to position mode (needed for base translate/rotate)."""
         if not self.position_mode_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn("Position mode service not available — may already be in position mode")
-            return True
+            self.get_logger().error("Position mode service not available!")
+            return False
         future = self.position_mode_client.call_async(Trigger.Request())
         timeout = time.time() + 5.0
         while not future.done() and time.time() < timeout:
             time.sleep(0.05)
         if future.done() and future.result() is not None:
-            self.get_logger().info(f"Switched to position mode: {future.result().message}")
-            return future.result().success
-        self.get_logger().warn("Position mode switch timed out")
+            result = future.result()
+            if result.success:
+                self.get_logger().info(f"Switched to position mode: {result.message}")
+            else:
+                self.get_logger().error(f"Position mode switch FAILED: {result.message}")
+            return result.success
+        self.get_logger().error("Position mode switch timed out")
         return False
 
     def _switch_to_navigation_mode(self) -> bool:
@@ -904,7 +959,10 @@ class NavigateOpenNode(Node):
 
             duration_sec = max(2, int(abs(remaining) / 0.3))
             self.get_logger().info(f"Rotating {math.degrees(remaining):.1f} deg remaining")
-            self._send_joint_command("rotate_mobile_base", remaining, duration_sec=duration_sec)
+            success = self._send_joint_command("rotate_mobile_base", remaining, duration_sec=duration_sec)
+            if not success:
+                self.get_logger().error("Rotation command failed — aborting rotation")
+                return
             time.sleep(1.0)
 
     def _get_gripper_z(self):

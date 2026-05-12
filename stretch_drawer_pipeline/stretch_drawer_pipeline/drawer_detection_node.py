@@ -130,6 +130,7 @@ class DrawerDetectionNode(Node):
         # State
         self.drawers: list[DetectedDrawer] = []
         self.drawers_lock = threading.Lock()
+        self.chosen_drawer_id = None
         self.bridge = CvBridge()
         self.latest_rgb = None
         self.latest_depth = None
@@ -156,6 +157,9 @@ class DrawerDetectionNode(Node):
         self.marker_pub = self.create_publisher(
             MarkerArray, "/drawer_markers", 10
         )
+        self.chosen_marker_pub = self.create_publisher(
+            Marker, "/drawer_chosen_marker", 10
+        )
 
         self.create_subscription(
             String, "/exploration_status",
@@ -178,6 +182,11 @@ class DrawerDetectionNode(Node):
         self.create_service(
             Trigger, "/detection/get_drawers",
             self.get_drawers_callback,
+            callback_group=self.cb_group,
+        )
+        self.create_service(
+            Trigger, "/detection/choose_drawer",
+            self.choose_drawer_callback,
             callback_group=self.cb_group,
         )
 
@@ -275,6 +284,9 @@ class DrawerDetectionNode(Node):
 
         self._ws_drawer_pub = roslibpy.Topic(
             self._ros_client, "/drawer_detections_json", "std_msgs/msg/String",
+        )
+        self._ws_chosen_pub = roslibpy.Topic(
+            self._ros_client, "/detection/chosen_drawer_json", "std_msgs/msg/String",
         )
 
         self._static_tf_cache = {}
@@ -461,7 +473,6 @@ class DrawerDetectionNode(Node):
 
     def get_drawers_callback(self, request, response):
         """Return current drawer list as JSON."""
-        import json
         with self.drawers_lock:
             drawer_data = []
             for d in self.drawers:
@@ -487,6 +498,101 @@ class DrawerDetectionNode(Node):
         response.success = True
         response.message = json.dumps(drawer_data)
         return response
+
+    def choose_drawer_callback(self, request, response):
+        """Select the best drawer and publish its marker locally for RViz.
+
+        Priority: ranking score (descending), then distance (ascending).
+        Only considers reachable drawers unless none are reachable.
+        Returns the chosen drawer as JSON. Also sends the chosen drawer
+        to the robot via rosbridge so navigate_open_node can act on it.
+        """
+        with self.drawers_lock:
+            if not self.drawers:
+                response.success = False
+                response.message = "No drawers detected"
+                return response
+
+            reachable = [d for d in self.drawers if d.reachable]
+            candidates = reachable if reachable else self.drawers
+
+            candidates.sort(
+                key=lambda d: (-d.ranking, d.distance_to_robot)
+            )
+            chosen = candidates[0]
+            self.chosen_drawer_id = chosen.drawer_id
+
+        self._publish_chosen_marker(chosen)
+
+        corners_list = None
+        if chosen.drawer_corners_world is not None:
+            corners_list = [
+                {"x": float(c[0]), "y": float(c[1]), "z": float(c[2])}
+                for c in chosen.drawer_corners_world
+            ]
+        chosen_data = {
+            "drawer_id": chosen.drawer_id,
+            "handle_center_world": {
+                "x": float(chosen.handle_center_world[0]),
+                "y": float(chosen.handle_center_world[1]),
+                "z": float(chosen.handle_center_world[2]),
+            },
+            "drawer_corners_world": corners_list,
+            "reachable": chosen.reachable,
+            "handle_orientation": chosen.handle_orientation,
+            "ranking": chosen.ranking,
+            "distance_to_robot": chosen.distance_to_robot,
+        }
+        chosen_json = json.dumps(chosen_data)
+
+        if hasattr(self, "_ws_chosen_pub") and self._ros_client.is_connected:
+            self._ws_chosen_pub.publish(
+                roslibpy.Message({"data": chosen_json})
+            )
+
+        self.get_logger().info(
+            f"Chosen drawer: {chosen.drawer_id}, "
+            f"distance={chosen.distance_to_robot:.2f}m, "
+            f"reachable={chosen.reachable}"
+        )
+        response.success = True
+        response.message = chosen_json
+        return response
+
+    def _publish_chosen_marker(self, drawer):
+        """Publish a pink cube marker for the chosen drawer, visible in local RViz."""
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "chosen_drawer"
+        marker.id = 0
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+
+        if drawer.drawer_corners_world is not None and len(drawer.drawer_corners_world) == 4:
+            xs = [float(c[0]) for c in drawer.drawer_corners_world]
+            ys = [float(c[1]) for c in drawer.drawer_corners_world]
+            zs = [float(c[2]) for c in drawer.drawer_corners_world]
+            marker.pose.position.x = (min(xs) + max(xs)) / 2
+            marker.pose.position.y = (min(ys) + max(ys)) / 2
+            marker.pose.position.z = (min(zs) + max(zs)) / 2
+            marker.scale.x = max(max(xs) - min(xs), 0.02)
+            marker.scale.y = max(max(ys) - min(ys), 0.02)
+            marker.scale.z = max(max(zs) - min(zs), 0.02)
+        else:
+            p = drawer.handle_center_world
+            marker.pose.position.x = float(p[0])
+            marker.pose.position.y = float(p[1])
+            marker.pose.position.z = float(p[2])
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.15
+
+        marker.color = ColorRGBA(r=1.0, g=0.4, b=0.7, a=0.9)
+        marker.lifetime.sec = 120
+
+        self.chosen_marker_pub.publish(marker)
 
     # ─── Detection logic ──────────────────────────────────────────────
 
