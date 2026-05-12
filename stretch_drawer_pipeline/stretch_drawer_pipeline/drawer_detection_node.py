@@ -276,7 +276,7 @@ class DrawerDetectionNode(Node):
             self._ros_client, "/tf", "tf2_msgs/msg/TFMessage",
         )
         self._tf_static_topic = roslibpy.Topic(
-            self._ros_client, "/tf_static", "tf2_msgs/msg/TFMessage",
+            self._ros_client, "/tf_static_volatile", "tf2_msgs/msg/TFMessage",
         )
 
         self._tf_pub = self.create_publisher(TFMessage, "/tf", 100)
@@ -397,68 +397,16 @@ class DrawerDetectionNode(Node):
                 self.get_logger().info(
                     f"Republished /robot_description ({len(data)} bytes)"
                 )
-                self._publish_static_tfs_from_urdf(data)
         except Exception as e:
             self.get_logger().warn(f"robot_description relay failed: {e}")
 
-    def _publish_static_tfs_from_urdf(self, urdf_xml: str):
-        """Parse URDF and publish all fixed-joint transforms on local /tf_static.
-
-        Rosbridge doesn't replay latched /tf_static messages to late
-        subscribers, so extracting them from the URDF guarantees the
-        full static chain is available regardless of startup order.
-        """
-        import xml.etree.ElementTree as ET
-        from tf_transformations import quaternion_from_euler
-
-        try:
-            root = ET.fromstring(urdf_xml)
-        except ET.ParseError as e:
-            self.get_logger().warn(f"URDF parse failed: {e}")
-            return
-
-        tf_msg = TFMessage()
-        now = self.get_clock().now().to_msg()
-
-        for joint in root.findall("joint"):
-            if joint.get("type") != "fixed":
-                continue
-
-            parent = joint.find("parent")
-            child = joint.find("child")
-            if parent is None or child is None:
-                continue
-
-            origin = joint.find("origin")
-            xyz = [0.0, 0.0, 0.0]
-            rpy = [0.0, 0.0, 0.0]
-            if origin is not None:
-                xyz_str = origin.get("xyz", "0 0 0").split()
-                rpy_str = origin.get("rpy", "0 0 0").split()
-                xyz = [float(v) for v in xyz_str]
-                rpy = [float(v) for v in rpy_str]
-
-            q = quaternion_from_euler(rpy[0], rpy[1], rpy[2])
-
-            ts = TransformStamped()
-            ts.header.stamp = now
-            ts.header.frame_id = parent.get("link")
-            ts.child_frame_id = child.get("link")
-            ts.transform.translation = Vector3(x=xyz[0], y=xyz[1], z=xyz[2])
-            ts.transform.rotation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
-            tf_msg.transforms.append(ts)
-
-        if tf_msg.transforms:
-            self._tf_static_pub.publish(tf_msg)
-            self.get_logger().info(
-                f"Published {len(tf_msg.transforms)} static TFs from URDF"
-            )
 
     def _republish_static_tf_cache(self):
         if not self._static_tf_cache:
             return
         msg_dict = {"transforms": list(self._static_tf_cache.values())}
         self._republish_tf(msg_dict, self._tf_static_pub)
+
 
 
     def _republish_tf(self, msg_dict, publisher):
@@ -900,18 +848,14 @@ class DrawerDetectionNode(Node):
             # Associate: find the best handle whose bbox center falls inside this drawer bbox
             handle_bbox, _ = self._match_handle_to_drawer(drawer_bbox, handle_dets)
             if handle_bbox is None:
-                self.get_logger().warn(
-                    f"No handle found in drawer bbox {drawer_bbox}, using center fallback"
-                )
-                cx = (drawer_bbox[0] + drawer_bbox[2]) // 2
-                cy = (drawer_bbox[1] + drawer_bbox[3]) // 2
-                hw, hh = 20, 10
-                handle_bbox = [cx - hw, cy - hh, cx + hw, cy + hh]
-            else:
                 self.get_logger().info(
-                    f"Handle matched to drawer {drawer_bbox}: handle bbox={handle_bbox}"
+                    f"Skipping drawer bbox {drawer_bbox} — no handle detected"
                 )
+                continue
 
+            self.get_logger().info(
+                f"Handle matched to drawer {drawer_bbox}: handle bbox={handle_bbox}"
+            )
             results.append((drawer_bbox, handle_bbox, det.score))
 
         return results, detections

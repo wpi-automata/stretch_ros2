@@ -258,47 +258,14 @@ class NavigateOpenNode(Node):
                 f"orientation={orientation}"
             )
 
-            # Switch to position mode so base translate/rotate commands work
-            if not self._switch_to_position_mode():
-                self.get_logger().error("Cannot proceed without position mode")
-                self._set_state(OpenState.FAILED)
-                return
-            time.sleep(0.5)
-
-            # Step 2: Navigate to approach pose (in front of handle,
-            # perpendicular to drawer face) and align arm toward handle
-            self._set_state(OpenState.NAVIGATING)
-            corners = drawer.get("drawer_corners_world")
-            nav_success = self._navigate_to_approach_pose(handle_pos, corners)
-            if not nav_success or self.stop_requested:
-                self._set_state(OpenState.FAILED)
-                return
-
-            # Step 4: Set wrist orientation for handle type
-            self._orient_wrist(orientation)
-
-            # Step 5: Extend arm toward handle to find bump point
-            self._set_state(OpenState.APPROACHING)
-            bump_point = self._approach_handle(handle_pos)
-            if bump_point is None or self.stop_requested:
-                self._set_state(OpenState.FAILED)
-                return
-            self.get_logger().info(
-                f"Bump point recorded: ({bump_point[0]:.3f}, "
-                f"{bump_point[1]:.3f}, {bump_point[2]:.3f})"
-            )
-
-            # Step 6: Retract arm fully
-            self._retract_arm()
-
-            # Step 7: Open gripper and orient toward bump point
+            # Step 2: Open gripper and orient toward handle
             self._open_gripper()
             time.sleep(0.5)
-            self._orient_gripper_toward(bump_point, orientation)
+            self._orient_gripper_toward(handle_pos, orientation)
 
-            # Step 8: Extend arm back to bump point
+            # Step 3: Extend arm to handle location
             self._set_state(OpenState.GRASPING)
-            self._extend_to_point(bump_point)
+            self._extend_to_point(handle_pos)
 
             # Step 9: Close gripper
             self._close_gripper()
