@@ -147,6 +147,9 @@ class DrawerDetectionNode(Node):
         # TF
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self._tf_ready = False
+        self._tf_consecutive_ok = 0
+        self._TF_READY_THRESHOLD = 5
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -159,6 +162,9 @@ class DrawerDetectionNode(Node):
         )
         self.chosen_marker_pub = self.create_publisher(
             Marker, "/drawer_chosen_marker", 10
+        )
+        self.chosen_drawer_json_pub = self.create_publisher(
+            String, "/detection/chosen_drawer_json", 10
         )
 
         self.create_subscription(
@@ -545,6 +551,10 @@ class DrawerDetectionNode(Node):
         }
         chosen_json = json.dumps(chosen_data)
 
+        chosen_msg = String()
+        chosen_msg.data = chosen_json
+        self.chosen_drawer_json_pub.publish(chosen_msg)
+
         if hasattr(self, "_ws_chosen_pub") and self._ros_client.is_connected:
             self._ws_chosen_pub.publish(
                 roslibpy.Message({"data": chosen_json})
@@ -618,11 +628,7 @@ class DrawerDetectionNode(Node):
             self.get_logger().debug("Waiting for camera_info...")
             return 0
 
-        rgb = self.latest_rgb.copy()
-        depth = self.latest_depth.copy()
-        rgb_stamp = self.latest_rgb_stamp
-
-        # Get camera-to-map transform at the time the image was captured
+        # Get camera-to-odom transform
         camera_frame = "camera_color_optical_frame"
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -631,11 +637,26 @@ class DrawerDetectionNode(Node):
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
         except Exception as e:
+            self._tf_consecutive_ok = 0
             self.get_logger().warn(
                 f"TF lookup failed: {e}", throttle_duration_sec=5.0
             )
             return len(self.drawers)
 
+        # Gate: require N consecutive successful lookups before allowing detections
+        if not self._tf_ready:
+            self._tf_consecutive_ok += 1
+            if self._tf_consecutive_ok < self._TF_READY_THRESHOLD:
+                self.get_logger().info(
+                    f"TF warming up: {self._tf_consecutive_ok}/{self._TF_READY_THRESHOLD}",
+                    throttle_duration_sec=2.0,
+                )
+                return 0
+            self._tf_ready = True
+            self.get_logger().info("TF chain confirmed — detections enabled")
+
+        rgb = self.latest_rgb.copy()
+        depth = self.latest_depth.copy()
         camera_K = self.camera_K
 
         # Build camera pose matrix from TF
@@ -1318,6 +1339,15 @@ class DrawerDetectionNode(Node):
                 marker_array.markers.append(text_marker)
 
         self.marker_pub.publish(marker_array)
+
+        if self.chosen_drawer_id is not None:
+            with self.drawers_lock:
+                chosen = next(
+                    (d for d in self.drawers if d.drawer_id == self.chosen_drawer_id),
+                    None,
+                )
+            if chosen is not None:
+                self._publish_chosen_marker(chosen)
 
 
 def main(args=None):

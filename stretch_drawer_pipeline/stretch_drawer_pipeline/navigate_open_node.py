@@ -14,7 +14,6 @@ Works in both MuJoCo simulation and on the real Stretch3 robot.
 
 Publishes:
   - /navigate_open/path (nav_msgs/Path): planned path to drawer (for RViz)
-  - /navigate_open/target_marker (visualization_msgs/Marker): pink marker on target
   - /navigate_open/status (std_msgs/String): current state
 
 Subscribes:
@@ -47,9 +46,8 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import Path
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String, Header, ColorRGBA
+from std_msgs.msg import String, Header
 from std_srvs.srv import Trigger
-from visualization_msgs.msg import Marker
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
@@ -110,9 +108,6 @@ class NavigateOpenNode(Node):
 
         # Publishers
         self.path_pub = self.create_publisher(Path, "/navigate_open/path", 10)
-        self.target_pub = self.create_publisher(
-            Marker, "/navigate_open/target_marker", 10
-        )
         self.status_pub = self.create_publisher(
             String, "/navigate_open/status", 10
         )
@@ -165,6 +160,10 @@ class NavigateOpenNode(Node):
             Trigger, "/switch_to_navigation_mode"
         )
 
+        # Monitor driver mode
+        self._driver_mode = None
+        self.create_subscription(String, "/mode", self._mode_callback, 10)
+
         # Status timer
         self.create_timer(0.5, self.publish_status)
 
@@ -176,6 +175,11 @@ class NavigateOpenNode(Node):
 
     def _drawer_detections_callback(self, msg: String):
         self._latest_drawer_json = msg.data
+
+    def _mode_callback(self, msg: String):
+        if self._driver_mode != msg.data:
+            self.get_logger().info(f"Driver mode: {msg.data}")
+            self._driver_mode = msg.data
 
     # ─── Callbacks ────────────────────────────────────────────────────
 
@@ -253,9 +257,6 @@ class NavigateOpenNode(Node):
                 f"({handle_pos[0]:.2f}, {handle_pos[1]:.2f}, {handle_pos[2]:.2f}), "
                 f"orientation={orientation}"
             )
-
-            # Publish target marker (pink) sized to drawer bounding box
-            self._publish_target_marker(drawer)
 
             # Switch to position mode so base translate/rotate commands work
             if not self._switch_to_position_mode():
@@ -840,8 +841,23 @@ class NavigateOpenNode(Node):
         goal.trajectory.points = [point]
 
         t0 = time.time()
-        self.get_logger().info(f"Sending joint command: {joint_name}={position:.3f}")
-        future = self.trajectory_client.send_goal_async(goal)
+        self.get_logger().info(
+            f"Sending joint command: {joint_name}={position:.3f} "
+            f"(driver_mode={self._driver_mode})"
+        )
+        def _feedback_cb(fb_msg):
+            fb = fb_msg.feedback
+            if fb.error and fb.error.positions:
+                errors = {n: f"{e:.4f}" for n, e in
+                          zip(fb.joint_names, fb.error.positions)}
+                self.get_logger().info(
+                    f"  feedback: errors={errors}",
+                    throttle_duration_sec=0.5,
+                )
+
+        future = self.trajectory_client.send_goal_async(
+            goal, feedback_callback=_feedback_cb
+        )
 
         timeout = time.time() + 5.0
         while not future.done() and time.time() < timeout:
@@ -1062,42 +1078,6 @@ class NavigateOpenNode(Node):
             path_msg.poses.append(pose)
 
         self.path_pub.publish(path_msg)
-
-    def _publish_target_marker(self, drawer: dict):
-        """Publish a pink cube matching the drawer's bounding box in RViz."""
-        marker = Marker()
-        marker.header.frame_id = "odom"
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "target_drawer"
-        marker.id = 0
-        marker.type = Marker.CUBE
-        marker.action = Marker.ADD
-        marker.pose.orientation.w = 1.0
-
-        corners = drawer.get("drawer_corners_world")
-        if corners is not None and len(corners) == 4:
-            xs = [c["x"] for c in corners]
-            ys = [c["y"] for c in corners]
-            zs = [c["z"] for c in corners]
-            marker.pose.position.x = (min(xs) + max(xs)) / 2
-            marker.pose.position.y = (min(ys) + max(ys)) / 2
-            marker.pose.position.z = (min(zs) + max(zs)) / 2
-            marker.scale.x = max(max(xs) - min(xs), 0.02)
-            marker.scale.y = max(max(ys) - min(ys), 0.02)
-            marker.scale.z = max(max(zs) - min(zs), 0.02)
-        else:
-            h = drawer["handle_center_world"]
-            marker.pose.position.x = h["x"]
-            marker.pose.position.y = h["y"]
-            marker.pose.position.z = h["z"]
-            marker.scale.x = 0.3
-            marker.scale.y = 0.3
-            marker.scale.z = 0.15
-
-        marker.color = ColorRGBA(r=1.0, g=0.4, b=0.7, a=0.9)
-        marker.lifetime.sec = 60
-
-        self.target_pub.publish(marker)
 
     def publish_status(self):
         """Publish current state."""
