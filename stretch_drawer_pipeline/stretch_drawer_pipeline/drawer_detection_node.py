@@ -321,7 +321,6 @@ class DrawerDetectionNode(Node):
 
         self.create_timer(10.0, self._ws_log_stats)
         self.create_timer(5.0, self._republish_static_tf_cache)
-        self.create_timer(30.0, self._resubscribe_tf_static)
 
     def _rosbridge_rgb_callback(self, msg_dict):
         try:
@@ -461,17 +460,6 @@ class DrawerDetectionNode(Node):
         msg_dict = {"transforms": list(self._static_tf_cache.values())}
         self._republish_tf(msg_dict, self._tf_static_pub)
 
-    def _resubscribe_tf_static(self):
-        if not self._ros_client.is_connected:
-            return
-        self._tf_static_topic.unsubscribe()
-        self._tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
-        self._robot_desc_topic.unsubscribe()
-        self._robot_desc_topic.subscribe(self._rosbridge_robot_desc_callback)
-        self.get_logger().info(
-            f"Re-subscribed to tf_static and robot_description "
-            f"(tf_static cache: {len(self._static_tf_cache)})"
-        )
 
     def _republish_tf(self, msg_dict, publisher):
         try:
