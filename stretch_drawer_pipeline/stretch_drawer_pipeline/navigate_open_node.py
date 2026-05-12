@@ -258,12 +258,26 @@ class NavigateOpenNode(Node):
                 f"orientation={orientation}"
             )
 
-            # Step 2: Open gripper and orient toward handle
+            # Step 2: Switch to position mode and navigate to approach pose
+            if not self._switch_to_position_mode():
+                self.get_logger().error("Cannot proceed without position mode")
+                self._set_state(OpenState.FAILED)
+                return
+            time.sleep(0.5)
+
+            self._set_state(OpenState.NAVIGATING)
+            corners = drawer.get("drawer_corners_world")
+            nav_success = self._navigate_to_approach_pose(handle_pos, corners)
+            if not nav_success or self.stop_requested:
+                self._set_state(OpenState.FAILED)
+                return
+
+            # Step 3: Open gripper and orient toward handle
             self._open_gripper()
             time.sleep(0.5)
             self._orient_gripper_toward(handle_pos, orientation)
 
-            # Step 3: Extend arm to handle location
+            # Step 4: Extend arm to handle location
             self._set_state(OpenState.GRASPING)
             self._extend_to_point(handle_pos)
 
@@ -776,17 +790,32 @@ class NavigateOpenNode(Node):
                 self._send_joint_command("joint_lift", target_lift)
                 time.sleep(2.0)
 
-        # Compute extension distance from mast (where arm originates)
+        # Compute extension: measure how far the gripper tip extends
+        # past the wrist, then subtract so the fingers land on the target
         mast_pose = self._get_mast_pose()
         if mast_pose is None:
             self.get_logger().error("Cannot get mast pose for extension")
             return
 
+        gripper_pos = self._get_gripper_world_pos()
+        current_ext = self._get_current_extension()
+        if gripper_pos is not None and current_ext is not None:
+            gx = gripper_pos[0] - mast_pose[0]
+            gy = gripper_pos[1] - mast_pose[1]
+            gripper_reach = math.sqrt(gx * gx + gy * gy)
+            gripper_offset = gripper_reach - current_ext
+        else:
+            gripper_offset = 0.0
+
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        target_extension = min(dist, 0.52)
-        self.get_logger().info(f"Extending to bump point: {target_extension:.3f}m")
+        target_extension = max(0.0, min(dist - gripper_offset, 0.52))
+        self.get_logger().info(
+            f"Extending to handle: dist={dist:.3f}m, "
+            f"gripper_offset={gripper_offset:.3f}m, "
+            f"target_extension={target_extension:.3f}m"
+        )
         self._send_joint_command("wrist_extension", target_extension, duration_sec=4)
         time.sleep(1.0)
 
