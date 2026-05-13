@@ -99,6 +99,7 @@ class NavigateOpenNode(Node):
         self.current_joint_state = None
         self.current_effort = {}
         self.operation_thread = None
+        self.opened_drawers = {}
 
         # TF
         self.tf_buffer = tf2_ros.Buffer()
@@ -110,6 +111,12 @@ class NavigateOpenNode(Node):
         self.path_pub = self.create_publisher(Path, "/navigate_open/path", 10)
         self.status_pub = self.create_publisher(
             String, "/navigate_open/status", 10
+        )
+        self.opened_drawers_pub = self.create_publisher(
+            String, "/navigate_open/opened_drawers_json", 10
+        )
+        self.opened_drawer_id_pub = self.create_publisher(
+            String, "/navigate_open/opened_drawer_id", 10
         )
         self.trajectory_client = ActionClient(
             self, FollowJointTrajectory,
@@ -272,7 +279,8 @@ class NavigateOpenNode(Node):
                 self._set_state(OpenState.FAILED)
                 return
 
-            # Step 3: Open gripper and orient toward handle
+            # Step 3: Retract arm, open gripper, orient toward handle
+            self._retract_arm()
             self._open_gripper()
             time.sleep(0.5)
             self._orient_gripper_toward(handle_pos, orientation)
@@ -289,6 +297,9 @@ class NavigateOpenNode(Node):
             self._set_state(OpenState.PULLING)
             pull_success = self._pull_drawer()
 
+            # Record opened handle position (gripper is at the handle)
+            opened_handle_pos = self._get_gripper_world_pos()
+
             # Step 11: Release
             self._set_state(OpenState.RELEASING)
             self._open_gripper()
@@ -301,6 +312,7 @@ class NavigateOpenNode(Node):
             self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
 
             if pull_success:
+                self._record_opened_drawer(drawer, handle_pos, opened_handle_pos)
                 self._set_state(OpenState.COMPLETE)
                 self.get_logger().info("Drawer opened successfully!")
             else:
@@ -326,6 +338,51 @@ class NavigateOpenNode(Node):
             return None
 
         return json.loads(self._chosen_drawer_json)
+
+    def _record_opened_drawer(self, drawer: dict, closed_handle_pos: np.ndarray,
+                               opened_handle_pos):
+        """Record a successfully opened drawer with its closed and opened locations."""
+        drawer_id = drawer["drawer_id"]
+
+        opened_handle = None
+        if opened_handle_pos is not None:
+            opened_handle = {
+                "x": float(opened_handle_pos[0]),
+                "y": float(opened_handle_pos[1]),
+                "z": float(opened_handle_pos[2]),
+            }
+
+        self.opened_drawers[drawer_id] = {
+            "drawer_id": drawer_id,
+            "closed": {
+                "handle_center_world": {
+                    "x": float(closed_handle_pos[0]),
+                    "y": float(closed_handle_pos[1]),
+                    "z": float(closed_handle_pos[2]),
+                },
+                "drawer_corners_world": drawer.get("drawer_corners_world"),
+            },
+            "opened": {
+                "handle_center_world": opened_handle,
+                "drawer_corners_world": None,
+            },
+        }
+
+        self.get_logger().info(
+            f"Recorded opened drawer {drawer_id}: "
+            f"closed handle=({closed_handle_pos[0]:.3f}, {closed_handle_pos[1]:.3f}, {closed_handle_pos[2]:.3f}), "
+            f"opened handle={opened_handle}"
+        )
+
+        # Publish full opened-drawers dict
+        msg = String()
+        msg.data = json.dumps(list(self.opened_drawers.values()))
+        self.opened_drawers_pub.publish(msg)
+
+        # Notify detection node to remove this drawer from candidates
+        id_msg = String()
+        id_msg.data = drawer_id
+        self.opened_drawer_id_pub.publish(id_msg)
 
     # ─── Navigation ───────────────────────────────────────────────────
 
