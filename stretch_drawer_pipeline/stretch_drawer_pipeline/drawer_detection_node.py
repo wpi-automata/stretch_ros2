@@ -902,11 +902,6 @@ class DrawerDetectionNode(Node):
     
     def _create_drawer(self, projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth):
         # Project handle center to world
-            handle_center_pixel = (
-                (handle_bbox[0] + handle_bbox[2]) / 2,
-                (handle_bbox[1] + handle_bbox[3]) / 2,
-            )
-
             u_center = int((handle_bbox[0] + handle_bbox[2]) / 2)
             v_center = int((handle_bbox[1] + handle_bbox[3]) / 2)
             depth_at_center = depth[
@@ -1347,36 +1342,6 @@ class DrawerDetectionNode(Node):
         p_world = camera_pose @ p_cam
         return p_world[:3]
 
-    def _project_pixel_to_world(
-        self, u: int, v: int, depth: np.ndarray,
-        camera_pose: np.ndarray, camera_K: np.ndarray,
-    ):
-        """Project a single pixel (u, v) to world coordinates using depth."""
-        depth_m = self._depth_to_meters(depth)
-        h, w = depth_m.shape[:2]
-        u = max(0, min(u, w - 1))
-        v = max(0, min(v, h - 1))
-
-        region = depth_m[max(0, v-3):v+3, max(0, u-3):u+3]
-        valid = region[region > 0.1]
-        if len(valid) == 0:
-            return None
-
-        d = float(np.median(valid))
-        fx, fy = camera_K[0, 0], camera_K[1, 1]
-        cx, cy = camera_K[0, 2], camera_K[1, 2]
-
-        x_cam = (u - cx) / fx * d
-        y_cam = (v - cy) / fy * d
-        z_cam = d
-
-        if not self.use_sim:
-            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
-        else:
-            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-        p_world = camera_pose @ p_cam
-        return p_world[:3]
-
     def _project_drawer_corners(
         self, drawer_bbox: list, depth: np.ndarray,
         camera_pose: np.ndarray, camera_K: np.ndarray,
@@ -1495,15 +1460,6 @@ class DrawerDetectionNode(Node):
                     return True
 
         return False
-
-    @staticmethod
-    def _corners_area(corners):
-        """Approximate area of a quadrilateral from its 4 world-frame corners."""
-        pts = np.array([[c[0], c[1], c[2]] if isinstance(c, (list, np.ndarray))
-                        else [c["x"], c["y"], c["z"]] for c in corners])
-        v1 = pts[2] - pts[0]
-        v2 = pts[3] - pts[1]
-        return np.linalg.norm(np.cross(v1, v2)) * 0.5
 
     def _update_distances(self):
         """Update distance_to_robot for all drawers."""
@@ -1633,7 +1589,7 @@ class DrawerDetectionNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
         # Draw matched drawer (blue) and handle (green) bboxes on top
-        for drawer_bbox, handle_bbox, conf in matched_results:
+        for drawer_bbox, handle_bbox, _conf in matched_results:
             cv2.rectangle(debug_img, (drawer_bbox[0], drawer_bbox[1]),
                           (drawer_bbox[2], drawer_bbox[3]), (255, 0, 0), 2)
             cv2.rectangle(debug_img, (handle_bbox[0], handle_bbox[1]),

@@ -43,13 +43,13 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
-from geometry_msgs.msg import PoseStamped, Point
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String, Header
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from control_msgs.action import FollowJointTrajectory
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from rclpy.action import ActionClient
 import tf2_ros
@@ -93,7 +93,7 @@ class NavigateOpenNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.arm_extension_speed = self.get_parameter("arm_extension_speed").value
         self.max_pull_distance = self.get_parameter("max_pull_distance").value
-        self. keep_drawers_open = self.get_parameter("keep_drawers_open").value
+        self.keep_drawers_open = self.get_parameter("keep_drawers_open").value
 
         # State
         self.state = OpenState.IDLE
@@ -139,11 +139,6 @@ class NavigateOpenNode(Node):
             callback_group=self.cb_group,
         )
 
-        # Client to get drawers from Node 2
-        self.get_drawers_client = self.create_client(
-            Trigger, "/detection/get_drawers"
-        )
-
         # Receive chosen drawer from detection node on automata-3
         self._chosen_drawer_json = None
         self.create_subscription(
@@ -152,7 +147,6 @@ class NavigateOpenNode(Node):
         )
 
         # Fallback: receive all detections via topic (works across rosbridge)
-        self._latest_drawer_json = None
         self.create_subscription(
             String, "/drawer_detections_json",
             self._drawer_detections_callback, 10
@@ -186,7 +180,7 @@ class NavigateOpenNode(Node):
         self.get_logger().info(f"Received chosen drawer from detection node")
 
     def _drawer_detections_callback(self, msg: String):
-        self._latest_drawer_json = msg.data
+        pass
 
     def _mode_callback(self, msg: String):
         if self._driver_mode != msg.data:
@@ -591,20 +585,6 @@ class NavigateOpenNode(Node):
                 return np.array([dx / norm, dy / norm])
         return np.array([1.0, 0.0])
 
-    def _orient_wrist(self, handle_orientation: str):
-        """Set wrist orientation for the bump/contact approach.
-
-        Yaw = pi/2 so the flat of the gripper faces away from the handle for bumping.
-        Roll = pi/2 for vertical handles, 0 for horizontal.
-        Note: the camera image is rotated 90 degrees from the real-world
-        orientation, so what appears horizontal in the image is vertical
-        in reality and vice versa.
-        """
-        self._send_joint_command("joint_wrist_pitch", 0.0)
-        self._send_joint_command("joint_wrist_roll", 0.0)
-        self._send_joint_command("joint_wrist_yaw", math.pi / 2)
-        time.sleep(1.0)
-
     # ─── Head control ─────────────────────────────────────────────────
 
     def _look_at_drawer(self, handle_pos: np.ndarray, corners_world=None):
@@ -657,114 +637,6 @@ class NavigateOpenNode(Node):
             self.get_logger().warn(f"Cannot look at drawer: {e}")
 
     # ─── Arm control ──────────────────────────────────────────────────
-
-    def _approach_handle(self, handle_pos: np.ndarray):
-        """Extend arm toward the handle to find the bump/contact point.
-
-        1. Sets lift height so gripper tip matches handle Z
-        2. Extends arm until contact (real) or computed distance (sim)
-        3. Records the gripper tip position in world frame as the bump point
-
-        Returns bump_point_world_frame (np.ndarray) or None on failure.
-        """
-        # Set lift height to match handle z, compensating for the
-        # offset between the lift joint and the gripper tip
-        gripper_z = self._get_gripper_z()
-        if gripper_z is not None:
-            current_lift = self._get_joint_position("joint_lift")
-            if current_lift is not None:
-                offset = gripper_z - current_lift
-                target_lift = float(handle_pos[2]) - offset
-                self.get_logger().info(
-                    f"Lift: handle_z={handle_pos[2]:.3f}, gripper_offset={offset:.3f}, "
-                    f"target_lift={target_lift:.3f}"
-                )
-                self._send_joint_command("joint_lift", target_lift)
-                time.sleep(2.0)
-            else:
-                self._send_joint_command("joint_lift", float(handle_pos[2]))
-                time.sleep(2.0)
-        else:
-            self._send_joint_command("joint_lift", float(handle_pos[2]))
-            time.sleep(2.0)
-
-        # Extend arm toward the handle
-        if self.use_sim:
-            reached = self._approach_handle_sim(handle_pos)
-        else:
-            reached = self._approach_handle_real()
-
-        if not reached:
-            return None
-
-        # Record where the gripper tip ended up = bump point
-        return self._get_gripper_world_pos()
-
-    def _approach_handle_sim(self, handle_pos: np.ndarray) -> bool:
-        """Sim: extend arm to computed distance (no force feedback available)."""
-        mast_pose = self._get_mast_pose()
-        if mast_pose is None:
-            self.get_logger().error("Cannot get mast pose for extension calc")
-            return False
-
-        dx = handle_pos[0] - mast_pose[0]
-        dy = handle_pos[1] - mast_pose[1]
-        dist_to_handle = math.sqrt(dx * dx + dy * dy)
-
-        # Small overshoot to ensure contact
-        target_extension = min(dist_to_handle + 0.02, 0.52)
-        self.get_logger().info(
-            f"Sim approach: dist_to_handle={dist_to_handle:.3f}m, "
-            f"extending to {target_extension:.3f}m"
-        )
-        self._send_joint_command("wrist_extension", target_extension, duration_sec=4)
-        time.sleep(1.0)
-        return True
-
-    def _approach_handle_real(self) -> bool:
-        """Real robot: incrementally extend until force contact is detected."""
-        max_extension = 0.52
-        step = 0.05
-        contact_threshold = 20.0
-
-        # Retract first to establish known starting position
-        self.get_logger().info("Retracting arm before approach")
-        if not self._send_joint_command("wrist_extension", 0.0, duration_sec=4):
-            self.get_logger().error("Failed to retract arm before approach")
-            return False
-        time.sleep(1.0)
-
-        actual_ext = self._get_current_extension()
-        self.get_logger().info(f"Arm at {actual_ext:.3f}m after retract, extending in {step}m steps")
-
-        current_extension = 0.0
-        while current_extension < max_extension and not self.stop_requested:
-            current_extension += step
-            if not self._send_joint_command("wrist_extension", current_extension):
-                self.get_logger().error(
-                    f"Arm extension command failed at {current_extension:.3f}m"
-                )
-                return False
-            time.sleep(0.5)
-
-            arm_efforts = [abs(self.current_effort.get(f"joint_arm_l{i}", 0.0)) for i in range(4)]
-            max_effort = max(arm_efforts)
-
-            self.get_logger().info(
-                f"  ext={current_extension:.3f}m, "
-                f"arm_effort={[f'{e:.1f}' for e in arm_efforts]}, "
-                f"max={max_effort:.1f}, threshold={contact_threshold}",
-            )
-
-            if max_effort > contact_threshold:
-                self.get_logger().info(
-                    f"Contact detected at extension={current_extension:.3f}m, "
-                    f"effort={max_effort:.1f}"
-                )
-                return True
-
-        self.get_logger().warn("Max extension reached without contact")
-        return False
 
     def _close_gripper(self):
         """Close the gripper to grasp the handle."""
