@@ -911,7 +911,29 @@ class DrawerDetectionNode(Node):
                 self.drawers.append(drawer)
             new_detections += 1
 
-        # Project unpaired handles and add to projected list
+        # Update distances to robot
+        self._update_distances()
+
+        # Optionally rank via LOCUS GNN
+        if self.rank_via_locus:
+            self._rank_via_locus_stub()
+
+        self._save_debug_image(rgb, all_detections, drawer_bboxes)
+
+        self.get_logger().info(
+            f"Detection pass: {new_detections} new | "
+            f"{len(self.drawers)} closed | "
+            f"{len(self.opened_drawers_data)} opened"
+        )
+
+        if new_detections > 0:
+            self._save_debug_image(rgb, all_detections, drawer_bboxes)
+            self._publish_drawers_via_rosbridge()
+
+        return len(self.drawers)
+    
+    def _pair_handles_to_gripper_pos_after_opening_drawer(self, projected_handles, unpaired_handles, depth, camera_pose, camera_K):
+         # Project unpaired handles and add to projected list
         for handle_bbox in unpaired_handles:
             world_pos = self._project_to_world(
                 handle_bbox, depth, camera_pose, camera_K
@@ -950,27 +972,6 @@ class DrawerDetectionNode(Node):
                         break
             for idx in sorted(matched_indices, reverse=True):
                 self.gripper_handle_locations.pop(idx)
-
-        # Update distances to robot
-        self._update_distances()
-
-        # Optionally rank via LOCUS GNN
-        if self.rank_via_locus:
-            self._rank_via_locus_stub()
-
-        self._save_debug_image(rgb, all_detections, drawer_bboxes)
-
-        self.get_logger().info(
-            f"Detection pass: {new_detections} new | "
-            f"{len(self.drawers)} closed | "
-            f"{len(self.opened_drawers_data)} opened"
-        )
-
-        if new_detections > 0:
-            self._save_debug_image(rgb, all_detections, drawer_bboxes)
-            self._publish_drawers_via_rosbridge()
-
-        return len(self.drawers)
 
     def _translate_closed_corners(self, new_handle_pos: np.ndarray, entry: dict):
         """Translate the closed drawer bbox to the new handle location."""
