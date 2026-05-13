@@ -115,9 +115,6 @@ class NavigateOpenNode(Node):
         self.opened_drawers_pub = self.create_publisher(
             String, "/navigate_open/opened_drawers_json", 10
         )
-        self.opened_drawer_id_pub = self.create_publisher(
-            String, "/navigate_open/opened_drawer_id", 10
-        )
         self.trajectory_client = ActionClient(
             self, FollowJointTrajectory,
             "/stretch_controller/follow_joint_trajectory",
@@ -341,48 +338,40 @@ class NavigateOpenNode(Node):
 
     def _record_opened_drawer(self, drawer: dict, closed_handle_pos: np.ndarray,
                                opened_handle_pos):
-        """Record a successfully opened drawer with its closed and opened locations."""
+        """Record a successfully opened drawer and notify the detection node."""
         drawer_id = drawer["drawer_id"]
 
-        opened_handle = None
+        gripper_pos = None
         if opened_handle_pos is not None:
-            opened_handle = {
+            gripper_pos = {
                 "x": float(opened_handle_pos[0]),
                 "y": float(opened_handle_pos[1]),
                 "z": float(opened_handle_pos[2]),
             }
 
-        self.opened_drawers[drawer_id] = {
+        entry = {
             "drawer_id": drawer_id,
-            "closed": {
-                "handle_center_world": {
-                    "x": float(closed_handle_pos[0]),
-                    "y": float(closed_handle_pos[1]),
-                    "z": float(closed_handle_pos[2]),
-                },
-                "drawer_corners_world": drawer.get("drawer_corners_world"),
+            "closed_handle": {
+                "x": float(closed_handle_pos[0]),
+                "y": float(closed_handle_pos[1]),
+                "z": float(closed_handle_pos[2]),
             },
-            "opened": {
-                "handle_center_world": opened_handle,
-                "drawer_corners_world": None,
-            },
+            "closed_corners": drawer.get("drawer_corners_world"),
+            "handle_orientation": drawer.get("handle_orientation", "horizontal"),
+            "gripper_pos": gripper_pos,
         }
+
+        self.opened_drawers[drawer_id] = entry
 
         self.get_logger().info(
             f"Recorded opened drawer {drawer_id}: "
             f"closed handle=({closed_handle_pos[0]:.3f}, {closed_handle_pos[1]:.3f}, {closed_handle_pos[2]:.3f}), "
-            f"opened handle={opened_handle}"
+            f"gripper_pos={gripper_pos}"
         )
 
-        # Publish full opened-drawers dict
         msg = String()
-        msg.data = json.dumps(list(self.opened_drawers.values()))
+        msg.data = json.dumps(entry)
         self.opened_drawers_pub.publish(msg)
-
-        # Notify detection node to remove this drawer from candidates
-        id_msg = String()
-        id_msg.data = drawer_id
-        self.opened_drawer_id_pub.publish(id_msg)
 
     # ─── Navigation ───────────────────────────────────────────────────
 
