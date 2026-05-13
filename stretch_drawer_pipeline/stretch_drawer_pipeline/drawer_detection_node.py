@@ -137,7 +137,6 @@ class DrawerDetectionNode(Node):
 
         # State
         self.drawers: list[DetectedDrawer] = []
-        self.opened_drawers_data: list[dict] = []
         self.interacted_drawers: dict[str, dict] = {}
         self.drawer_items: dict[str, list[dict]] = {}
         self.drawers_lock = threading.Lock()
@@ -399,7 +398,7 @@ class DrawerDetectionNode(Node):
             now_ns = time.time_ns()
             image_ns = image_sec * 1_000_000_000 + image_nsec
             lag = (now_ns - image_ns) / 1e9
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[rosbridge] RGB lag: {lag:.2f}s",
                 throttle_duration_sec=5.0,
             )
@@ -461,7 +460,7 @@ class DrawerDetectionNode(Node):
         self._republish_tf(msg_dict, self._tf_pub)
 
     def _rosbridge_tf_static_callback(self, msg_dict):
-        self._republish_tf(msg_dict, self._tf_static_pub)
+        self._republish_tf(msg_dict, self._tf_static_pub, static=True)
         self._tf_static_topic.unsubscribe()
         self.get_logger().info("Received and republished static TFs via rosbridge")
 
@@ -500,7 +499,7 @@ class DrawerDetectionNode(Node):
             self.get_logger().warn(f"rosbridge opened_drawers_json relay failed: {e}")
 
 
-    def _republish_tf(self, msg_dict, publisher):
+    def _republish_tf(self, msg_dict, publisher, static=False):
         try:
             tf_msg = TFMessage()
             for t in msg_dict.get("transforms", []):
@@ -526,10 +525,16 @@ class DrawerDetectionNode(Node):
                     w=rot.get("w", 1.0),
                 )
                 tf_msg.transforms.append(ts)
-                self.tf_buffer.set_transform(ts, "rosbridge")
+                if static:
+                    self.tf_buffer.set_transform_static(ts, "rosbridge")
+                else:
+                    self.tf_buffer.set_transform(ts, "rosbridge")
+        except Exception as e:
+            self.get_logger().warn(f"TF decode failed: {e}", throttle_duration_sec=5.0)
+        try:
             publisher.publish(tf_msg)
         except Exception as e:
-            print(f"[rosbridge] TF decode failed: {e}", flush=True)
+            self.get_logger().warn(f"TF republish failed: {e}", throttle_duration_sec=10.0)
 
     def _ws_log_stats(self):
         connected = self._ros_client.is_connected
@@ -633,18 +638,18 @@ class DrawerDetectionNode(Node):
         )
 
     # UNUSED!!!
-    def _get_gripper_world_pos(self):
-        """Get gripper tip position in odom frame via TF."""
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "odom", "link_gripper_finger_left",
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.2),
-            )
-            t = transform.transform.translation
-            return np.array([t.x, t.y, t.z])
-        except Exception:
-            return None
+    # def _get_gripper_world_pos(self):
+    #     """Get gripper tip position in odom frame via TF."""
+    #     try:
+    #         transform = self.tf_buffer.lookup_transform(
+    #             "odom", "link_gripper_finger_left",
+    #             rclpy.time.Time(),
+    #             timeout=rclpy.duration.Duration(seconds=0.2),
+    #         )
+    #         t = transform.transform.translation
+    #         return np.array([t.x, t.y, t.z])
+    #     except Exception:
+            # return None
 
     def trigger_detection_callback(self, request, response):
         """Manually trigger a detection pass."""
@@ -886,7 +891,7 @@ class DrawerDetectionNode(Node):
         self.get_logger().info(
             f"Detection pass: {new_detections} new | "
             f"{len(self.drawers)} closed | "
-            f"{len(self.opened_drawers_data)} opened"
+            f"{len(self.interacted_drawers)} opened"
         )
 
         if new_detections > 0:
@@ -1042,19 +1047,6 @@ class DrawerDetectionNode(Node):
         opened_corners_dicts = [_pos_dict(c) for c in opened_corners]
         opened_handle_dict = _pos_dict(opened_handle)
 
-        opened_entry = {
-            "drawer_id": drawer_id,
-            "closed": {
-                "handle_center_world": entry["closed_handle"],
-                "drawer_corners_world": entry["closed_corners"],
-            },
-            "opened": {
-                "handle_center_world": opened_handle_dict,
-                "drawer_corners_world": opened_corners_dicts,
-            },
-        }
-        self.opened_drawers_data.append(opened_entry)
-
         if drawer_id in self.interacted_drawers:
             self.interacted_drawers[drawer_id]["opened_handle"] = opened_handle_dict
             self.interacted_drawers[drawer_id]["opened_corners"] = opened_corners_dicts
@@ -1062,7 +1054,7 @@ class DrawerDetectionNode(Node):
         self.get_logger().info(
             f"Opened drawer {drawer_id} recorded — "
             f"handle at ({opened_handle[0]:.3f}, {opened_handle[1]:.3f}, {opened_handle[2]:.3f}). "
-            f"{len(self.drawers)} closed | {len(self.opened_drawers_data)} opened."
+            f"{len(self.drawers)} closed | {len(self.interacted_drawers)} opened."
         )
 
     def _scan_drawer_items(self, drawer_id, all_detections, depth, camera_pose, camera_K):
@@ -1132,7 +1124,7 @@ class DrawerDetectionNode(Node):
 
         self.drawer_items[drawer_id] = items
         self.get_logger().info(
-            f"Drawer {drawer_id} items ({len(items)}): "
+            f"Drawer items: id: {drawer_id} items: ({len(items)}): "
             f"{[i['label'] for i in items]}"
         )
 
