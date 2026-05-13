@@ -265,7 +265,7 @@ class NavigateOpenNode(Node):
                 f"orientation={orientation}"
             )
 
-            # Step 2: Switch to position mode and navigate to approach pose
+            # Step 2: Switch to position mode, retract arm, and navigate to approach pose
             if not self._switch_to_position_mode():
                 self.get_logger().error("Cannot proceed without position mode")
                 self._set_state(OpenState.FAILED)
@@ -274,13 +274,13 @@ class NavigateOpenNode(Node):
 
             self._set_state(OpenState.NAVIGATING)
             corners = drawer.get("drawer_corners_world")
+            self._retract_arm()
             nav_success = self._navigate_to_approach_pose(handle_pos, corners)
             if not nav_success or self.stop_requested:
                 self._set_state(OpenState.FAILED)
                 return
 
-            # Step 3: Retract arm, open gripper, orient toward handle
-            self._retract_arm()
+            # Step 3: Open gripper, orient toward handle
             self._open_gripper()
             time.sleep(0.5)
             self._orient_gripper_toward(handle_pos, orientation)
