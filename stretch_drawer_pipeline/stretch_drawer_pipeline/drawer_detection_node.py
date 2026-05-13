@@ -113,8 +113,9 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("robot_ip", "")
         self.declare_parameter("robot_port", 9090)
         self.declare_parameter("remote_rgb_topic", "/camera/color/image_raw/compressed")
-        self.declare_parameter("remote_depth_topic", "/camera/depth/image_rect_raw")
-        self.declare_parameter("throttle_rate_ms", 500)
+        self.declare_parameter("remote_depth_topic", "/camera/aligned_depth_to_color/image_raw/compressedDepth")
+        self.declare_parameter("remote_camera_info_topic", "/camera/color/camera_info")
+        self.declare_parameter("throttle_rate_ms", 2000)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -126,6 +127,11 @@ class DrawerDetectionNode(Node):
         self.rank_via_locus = self.get_parameter("rank_via_LOCUS").value
         self.use_sim = self.get_parameter("use_sim").value
         self.detection_rate = self.get_parameter("detection_rate_hz").value
+
+        params = {p.name: p.value for p in self.get_parameters(
+            [d.name for d in self._parameters.values()]
+        )}
+        self.get_logger().info(f"Parameters: {params}")
 
         # State
         self.drawers: list[DetectedDrawer] = []
@@ -156,7 +162,7 @@ class DrawerDetectionNode(Node):
         self.exploring = False
 
         # TF
-        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=30))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._tf_ready = False
         self._tf_consecutive_ok = 0
@@ -252,8 +258,11 @@ class DrawerDetectionNode(Node):
         self.get_logger().info(
             f"Image transport: rosbridge at {self._robot_ip}:{robot_port}"
         )
+        remote_camera_info = self.get_parameter("remote_camera_info_topic").value
+
         self.get_logger().info(
-            f"Remote topics: rgb={remote_rgb}, depth={remote_depth}"
+            f"Remote topics: rgb={remote_rgb}, depth={remote_depth}, "
+            f"camera_info={remote_camera_info}"
         )
 
         self._ws_rgb_count = 0
@@ -268,8 +277,11 @@ class DrawerDetectionNode(Node):
             throttle_rate=throttle_ms,
         )
         self._depth_topic = roslibpy.Topic(
-            self._ros_client, remote_depth, "sensor_msgs/msg/Image",
+            self._ros_client, remote_depth, "sensor_msgs/msg/CompressedImage",
             throttle_rate=throttle_ms,
+        )
+        self._camera_info_topic = roslibpy.Topic(
+            self._ros_client, remote_camera_info, "sensor_msgs/msg/CameraInfo",
         )
 
         self._tf_topic = roslibpy.Topic(
@@ -310,6 +322,7 @@ class DrawerDetectionNode(Node):
 
         self._rgb_topic.subscribe(self._rosbridge_rgb_callback)
         self._depth_topic.subscribe(self._rosbridge_depth_callback)
+        self._camera_info_topic.subscribe(self._rosbridge_camera_info_callback)
         self._tf_topic.subscribe(self._rosbridge_tf_callback)
         self._tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
         self._robot_desc_topic.subscribe(self._rosbridge_robot_desc_callback)
@@ -337,10 +350,18 @@ class DrawerDetectionNode(Node):
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_rgb = arr
             stamp = msg_dict.get("header", {}).get("stamp", {})
+            image_sec = stamp.get("sec", 0)
+            image_nsec = stamp.get("nanosec", 0)
             self.latest_rgb_stamp = rclpy.time.Time(
-                seconds=stamp.get("sec", 0),
-                nanoseconds=stamp.get("nanosec", 0),
+                seconds=image_sec, nanoseconds=image_nsec,
             ).to_msg()
+            now_ns = time.time_ns()
+            image_ns = image_sec * 1_000_000_000 + image_nsec
+            lag = (now_ns - image_ns) / 1e9
+            self.get_logger().info(
+                f"[rosbridge] RGB lag: {lag:.2f}s",
+                throttle_duration_sec=5.0,
+            )
             self._ws_rgb_count += 1
         except Exception as e:
             print(f"[rosbridge] RGB decode FAILED: {e}", flush=True)
@@ -350,15 +371,14 @@ class DrawerDetectionNode(Node):
             data = msg_dict["data"]
             if isinstance(data, str):
                 data = base64.b64decode(data)
-            encoding = msg_dict.get("encoding", "16UC1")
-            if encoding == "16UC1":
-                arr = np.frombuffer(data, dtype=np.uint16).reshape(
-                    msg_dict["height"], msg_dict["width"]
-                )
-            else:
-                arr = np.frombuffer(data, dtype=np.float32).reshape(
-                    msg_dict["height"], msg_dict["width"]
-                )
+            raw = np.frombuffer(data, dtype=np.uint8)
+            # compressedDepth has a 12-byte header before the PNG data
+            arr = cv2.imdecode(raw[12:], cv2.IMREAD_UNCHANGED)
+            if arr is None:
+                arr = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
+            if arr is None:
+                self.get_logger().warn("Failed to decode compressed depth")
+                return
             if not self.use_sim:
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = arr
@@ -368,6 +388,33 @@ class DrawerDetectionNode(Node):
                 f"rosbridge depth decode failed: {e}",
                 throttle_duration_sec=5.0,
             )
+
+    def _rosbridge_camera_info_callback(self, msg_dict):
+        try:
+            k = msg_dict.get("k", msg_dict.get("K", []))
+            if len(k) == 9 and k[0] > 0:
+                raw_K = np.array([
+                    [k[0], k[1], k[2]],
+                    [k[3], k[4], k[5]],
+                    [k[6], k[7], k[8]],
+                ])
+                if not self.use_sim:
+                    h = msg_dict.get("height", 720)
+                    self.camera_K = np.array([
+                        [raw_K[1, 1], 0.0,         h - 1 - raw_K[1, 2]],
+                        [0.0,         raw_K[0, 0],  raw_K[0, 2]],
+                        [0.0,         0.0,          1.0],
+                    ])
+                else:
+                    self.camera_K = raw_K
+                self.get_logger().info(
+                    f"Camera intrinsics from rosbridge: "
+                    f"fx={self.camera_K[0,0]:.1f}, fy={self.camera_K[1,1]:.1f}, "
+                    f"cx={self.camera_K[0,2]:.1f}, cy={self.camera_K[1,2]:.1f}"
+                )
+                self._camera_info_topic.unsubscribe()
+        except Exception as e:
+            self.get_logger().warn(f"camera_info decode failed: {e}")
 
     def _rosbridge_tf_callback(self, msg_dict):
         self._republish_tf(msg_dict, self._tf_pub)
@@ -473,19 +520,25 @@ class DrawerDetectionNode(Node):
         self.latest_depth = arr
 
     def _camera_info_dds_callback(self, msg: CameraInfo):
-        if self.camera_K is None:
-            k = msg.k
-            K = np.array([[k[0], k[1], k[2]],
-                          [k[3], k[4], k[5]],
-                          [k[6], k[7], k[8]]])
-            if not self.use_sim:
-                fx, fy = K[0, 0], K[1, 1]
-                cx, cy = K[0, 2], K[1, 2]
-                h = msg.height
-                K = np.array([[fy,  0.0, h - 1 - cy],
-                              [0.0, fx,  cx],
-                              [0.0, 0.0, 1.0]])
-            self.camera_K = K
+        k = msg.k
+        if k[0] == 0:
+            return
+        K = np.array([[k[0], k[1], k[2]],
+                      [k[3], k[4], k[5]],
+                      [k[6], k[7], k[8]]])
+        if not self.use_sim:
+            h = msg.height
+            K = np.array([[K[1, 1], 0.0,     h - 1 - K[1, 2]],
+                          [0.0,     K[0, 0], K[0, 2]],
+                          [0.0,     0.0,     1.0]])
+        if not hasattr(self, '_camera_info_logged'):
+            self._camera_info_logged = True
+            self.get_logger().info(
+                f"Camera intrinsics from DDS: "
+                f"fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, "
+                f"cx={K[0,2]:.1f}, cy={K[1,2]:.1f}"
+            )
+        self.camera_K = K
 
     def exploration_status_callback(self, msg: String):
         self.exploring = msg.data in ("rotating", "planning", "navigating")
@@ -663,6 +716,18 @@ class DrawerDetectionNode(Node):
             )
             return len(self.drawers)
 
+        tf_stamp = transform.header.stamp
+        now = self.get_clock().now()
+        tf_age = now.nanoseconds / 1e9 - (tf_stamp.sec + tf_stamp.nanosec / 1e9)
+        self.get_logger().info(
+            f"TF lookup OK — stamp={tf_stamp.sec}.{tf_stamp.nanosec:09d}, "
+            f"age={tf_age:.1f}s, "
+            f"t=({transform.transform.translation.x:.3f}, "
+            f"{transform.transform.translation.y:.3f}, "
+            f"{transform.transform.translation.z:.3f})",
+            throttle_duration_sec=5.0,
+        )
+
         # Gate: require N consecutive successful lookups before allowing detections
         if not self._tf_ready:
             self._tf_consecutive_ok += 1
@@ -699,11 +764,15 @@ class DrawerDetectionNode(Node):
                 max(0, v_center-3):v_center+3,
                 max(0, u_center-3):u_center+3
             ]
+            depth_m_center = self._depth_to_meters(depth_at_center)
+            valid_m = depth_m_center[depth_m_center > 0.1]
+            median_m = float(np.median(valid_m)) if len(valid_m) > 0 else 0.0
             self.get_logger().info(
                 f"Projecting handle {handle_bbox}, "
                 f"depth shape={depth.shape}, dtype={depth.dtype}, "
                 f"rgb shape={rgb.shape}, "
-                f"depth@center min={depth_at_center.min()} max={depth_at_center.max()} "
+                f"depth@center raw min={depth_at_center.min()} max={depth_at_center.max()} "
+                f"median_m={median_m:.3f}m, "
                 f"nonzero={np.count_nonzero(depth_at_center)}/{depth_at_center.size}, "
                 f"whole_depth nonzero={np.count_nonzero(depth)}/{depth.size}"
             )
@@ -770,12 +839,14 @@ class DrawerDetectionNode(Node):
         if self.rank_via_locus:
             self._rank_via_locus_stub()
 
+        self._save_debug_image(rgb, all_detections, drawer_bboxes)
+
         if new_detections > 0:
             self.get_logger().info(
                 f"Detected {new_detections} new drawer(s), "
                 f"total: {len(self.drawers)}"
             )
-            self._save_debug_image(rgb, all_detections, drawer_bboxes)
+            # self._save_debug_image(rgb, all_detections, drawer_bboxes)
             self._publish_drawers_via_rosbridge()
 
         return len(self.drawers)
@@ -811,11 +882,11 @@ class DrawerDetectionNode(Node):
         detections = nms_by_type(detections)
 
         # Log all Detic detections for debugging
-        for d in detections:
-            self.get_logger().debug(
-                f"Detic: {d.object_type} ({d.detic_class}) "
-                f"score={d.score:.2f} bbox={d.bbox}"
-            )
+        # for d in detections:
+        #     self.get_logger().info(
+        #         f"Detic: {d.object_type} ({d.detic_class}) "
+        #         f"score={d.score:.2f} bbox={d.bbox}"
+        #     )
 
         drawer_classes = {
             "Drawer", "Cabinet", "Chest", "FilingCabinet",
