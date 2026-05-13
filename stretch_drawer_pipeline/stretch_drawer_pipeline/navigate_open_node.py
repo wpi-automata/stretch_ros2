@@ -83,6 +83,7 @@ class NavigateOpenNode(Node):
         self.declare_parameter("use_sim", False)
         self.declare_parameter("arm_extension_speed", 0.01)
         self.declare_parameter("max_pull_distance", 0.4)
+        self.declare_parameter("keep_drawers_open", True)
 
         self.approach_distance = self.get_parameter("approach_distance").value
         self.grasp_force_threshold = self.get_parameter("grasp_force_threshold").value
@@ -92,6 +93,7 @@ class NavigateOpenNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.arm_extension_speed = self.get_parameter("arm_extension_speed").value
         self.max_pull_distance = self.get_parameter("max_pull_distance").value
+        self. keep_drawers_open = self.get_parameter("keep_drawers_open").value
 
         # State
         self.state = OpenState.IDLE
@@ -167,6 +169,12 @@ class NavigateOpenNode(Node):
         # Monitor driver mode
         self._driver_mode = None
         self.create_subscription(String, "/mode", self._mode_callback, 10)
+
+        # Close-drawer command from detection node
+        self.create_subscription(
+            String, "/detection/close_drawer_json",
+            self._close_drawer_callback, 10
+        )
 
         # Status timer
         self.create_timer(0.5, self.publish_status)
@@ -292,7 +300,7 @@ class NavigateOpenNode(Node):
 
             # Step 10: Pull drawer open
             self._set_state(OpenState.PULLING)
-            pull_success = self._pull_drawer()
+            pull_success, pull_distance = self._pull_drawer()
 
             # Record opened handle position (gripper is at the handle)
             opened_handle_pos = self._get_gripper_world_pos()
@@ -309,7 +317,7 @@ class NavigateOpenNode(Node):
             self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
 
             if pull_success:
-                self._record_opened_drawer(drawer, handle_pos, opened_handle_pos)
+                self._record_opened_drawer(drawer, handle_pos, opened_handle_pos, pull_distance)
                 self._set_state(OpenState.COMPLETE)
                 self.get_logger().info("Drawer opened successfully!")
             else:
@@ -337,7 +345,7 @@ class NavigateOpenNode(Node):
         return json.loads(self._chosen_drawer_json)
 
     def _record_opened_drawer(self, drawer: dict, closed_handle_pos: np.ndarray,
-                               opened_handle_pos):
+                               opened_handle_pos, pull_distance: float = 0.0):
         """Record a successfully opened drawer and notify the detection node."""
         drawer_id = drawer["drawer_id"]
 
@@ -359,6 +367,7 @@ class NavigateOpenNode(Node):
             "closed_corners": drawer.get("drawer_corners_world"),
             "handle_orientation": drawer.get("handle_orientation", "horizontal"),
             "gripper_pos": gripper_pos,
+            "pull_distance": float(pull_distance),
         }
 
         self.opened_drawers[drawer_id] = entry
@@ -366,12 +375,71 @@ class NavigateOpenNode(Node):
         self.get_logger().info(
             f"Recorded opened drawer {drawer_id}: "
             f"closed handle=({closed_handle_pos[0]:.3f}, {closed_handle_pos[1]:.3f}, {closed_handle_pos[2]:.3f}), "
-            f"gripper_pos={gripper_pos}"
+            f"gripper_pos={gripper_pos}, pull_distance={pull_distance:.3f}m"
         )
 
         msg = String()
         msg.data = json.dumps(entry)
         self.opened_drawers_pub.publish(msg)
+
+    def _close_drawer_callback(self, msg: String):
+        """Handle close-drawer command from detection node."""
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f"Bad close_drawer JSON: {e}")
+            return
+        self.get_logger().info(f"Close drawer command received for {data.get('drawer_id')}")
+        thread = threading.Thread(target=self._close_drawer_pipeline, args=(data,), daemon=True)
+        thread.start()
+
+    def _close_drawer_pipeline(self, data: dict):
+        """Close a drawer by pushing it back the same distance it was pulled."""
+        drawer_id = data.get("drawer_id", "?")
+        pull_distance = data.get("pull_distance", 0.0)
+        handle_pos_d = data.get("opened_handle")
+        orientation = data.get("handle_orientation", "horizontal")
+
+        if not handle_pos_d or pull_distance <= 0:
+            self.get_logger().warn(
+                f"Cannot close drawer {drawer_id}: "
+                f"handle={handle_pos_d}, pull_distance={pull_distance}"
+            )
+            return
+
+        handle_pos = np.array([handle_pos_d["x"], handle_pos_d["y"], handle_pos_d["z"]])
+
+        try:
+            if not self._switch_to_position_mode():
+                self.get_logger().error("Cannot switch to position mode for close")
+                return
+            time.sleep(0.5)
+
+            self._open_gripper()
+            time.sleep(0.5)
+            self._orient_gripper_toward(handle_pos, orientation)
+            self._extend_to_point(handle_pos)
+
+            self._close_gripper()
+            time.sleep(1.0)
+
+            current_ext = self._get_current_extension()
+            push_target = min(current_ext + pull_distance, 0.52)
+            self.get_logger().info(
+                f"Pushing drawer {drawer_id}: ext {current_ext:.3f} → {push_target:.3f}m"
+            )
+            self._send_joint_command("wrist_extension", push_target, duration_sec=4)
+            time.sleep(2.0)
+
+            self._open_gripper()
+            time.sleep(0.5)
+            self._retract_arm()
+
+            self.get_logger().info(f"Drawer {drawer_id} closed successfully")
+        except Exception as e:
+            self.get_logger().error(f"Close drawer failed: {e}")
+        finally:
+            self._switch_to_navigation_mode()
 
     # ─── Navigation ───────────────────────────────────────────────────
 
@@ -724,7 +792,7 @@ class NavigateOpenNode(Node):
         else:
             return self._pull_drawer_real()
 
-    def _pull_drawer_sim(self) -> bool:
+    def _pull_drawer_sim(self) -> tuple[bool, float]:
         """Sim: retract arm by max_pull_distance (no force feedback)."""
         start_extension = self._get_current_extension()
         target = max(0.0, start_extension - self.max_pull_distance)
@@ -735,9 +803,9 @@ class NavigateOpenNode(Node):
         time.sleep(1.0)
         pulled = start_extension - target
         self.get_logger().info(f"Pulled {pulled:.3f}m")
-        return pulled > 0.05
+        return pulled > 0.05, pulled
 
-    def _pull_drawer_real(self) -> bool:
+    def _pull_drawer_real(self) -> tuple[bool, float]:
         """Real robot: retract incrementally with force threshold check."""
         start_extension = self._get_current_extension()
         target_extension = max(0.0, start_extension - self.max_pull_distance)
@@ -751,14 +819,16 @@ class NavigateOpenNode(Node):
 
             effort = abs(self.current_effort.get("wrist_extension", 0.0))
             if effort > self.pull_force_threshold:
+                pulled_distance = start_extension - current
                 self.get_logger().info(
-                    f"Pull force threshold reached: {effort:.1f}N > {self.pull_force_threshold}N"
+                    f"Pull force threshold reached: {effort:.1f}N > {self.pull_force_threshold}N, "
+                    f"pulled {pulled_distance:.3f}m"
                 )
-                return True
+                return True, pulled_distance
 
         pulled_distance = start_extension - current
         self.get_logger().info(f"Pulled {pulled_distance:.3f}m")
-        return pulled_distance > 0.05
+        return pulled_distance > 0.05, pulled_distance
 
     def _get_current_extension(self) -> float:
         """Read current arm extension from joint_states.

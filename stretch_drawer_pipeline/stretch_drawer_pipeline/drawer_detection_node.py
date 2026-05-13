@@ -138,10 +138,27 @@ class DrawerDetectionNode(Node):
         # State
         self.drawers: list[DetectedDrawer] = []
         self.opened_drawers_data: list[dict] = []
+        self.interacted_drawers: dict[str, dict] = {}
+        self.drawer_items: dict[str, list[dict]] = {}
         self.drawers_lock = threading.Lock()
         self.chosen_drawer_id = None
         self._detection_mode = "detecting"
+        self._pending_items_scan = None
         self.gripper_handle_locations = []
+
+        self._drawer_classes = {
+            "Drawer", "Cabinet", "Chest", "FilingCabinet",
+            "Dresser", "NightStand", "SideTable",
+            "Armoire", "Buffet", "CedarChest", "ChestOfDrawers",
+            "ChinaCabinet", "Credenza", "Cupboard", "AiringCupboard",
+            "HopeChest", "Hutch", "Locker", "Footlocker",
+            "MedicineChest", "Pantry", "Sideboard", "Wardrobe",
+            "Cabinetwork",
+        }
+        self._handle_classes = {
+            "Handle", "Knob", "Doorknob",
+            "Pull", "Bellpull", "PullChain",
+        }
         self.bridge = CvBridge()
         self.latest_rgb = None
         self.latest_depth = None
@@ -186,6 +203,9 @@ class DrawerDetectionNode(Node):
         )
         self.chosen_drawer_json_pub = self.create_publisher(
             String, "/detection/chosen_drawer_json", 10
+        )
+        self.close_drawer_pub = self.create_publisher(
+            String, "/detection/close_drawer_json", 10
         )
 
         self.create_subscription(
@@ -326,6 +346,9 @@ class DrawerDetectionNode(Node):
         )
         self._ws_chosen_pub = roslibpy.Topic(
             self._ros_client, "/detection/chosen_drawer_json", "std_msgs/msg/String",
+        )
+        self._ws_close_drawer_pub = roslibpy.Topic(
+            self._ros_client, "/detection/close_drawer_json", "std_msgs/msg/String",
         )
 
         # Subscribe to robot-side topics via rosbridge
@@ -585,6 +608,19 @@ class DrawerDetectionNode(Node):
             self.drawers = [d for d in self.drawers if d.drawer_id != drawer_id]
 
         self.gripper_handle_locations.append(entry)
+
+        self.interacted_drawers[drawer_id] = {
+            "drawer_id": drawer_id,
+            "closed_handle": entry.get("closed_handle"),
+            "closed_corners": entry.get("closed_corners"),
+            "opened_handle": None,
+            "opened_corners": None,
+            "handle_orientation": entry.get("handle_orientation", "horizontal"),
+            "pull_distance": entry.get("pull_distance", 0.0),
+            "status": "opened",
+        }
+
+        self._pending_items_scan = drawer_id
         self._detection_mode = "detecting"
 
         gripper = entry.get("gripper_pos")
@@ -593,7 +629,7 @@ class DrawerDetectionNode(Node):
         self.get_logger().info(
             f"Drawer {drawer_id} opened — removed from closed "
             f"({len(self.drawers)} remaining), gripper at {gstr}, "
-            f"detection resumed"
+            f"items scan pending, detection resumed"
         )
 
     # UNUSED!!!
@@ -823,7 +859,44 @@ class DrawerDetectionNode(Node):
         new_detections = 0
         projected_handles = []
         for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
-            # Project handle center to world
+
+            drawer = self._create_drawer(projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth)
+
+            if drawer is not None:
+                with self.drawers_lock:
+                    self.drawers.append(drawer)
+                new_detections += 1
+        
+        self._pair_handles_to_gripper_pos_after_opening_drawer(projected_handles, unpaired_handles, depth, camera_pose, camera_K)
+
+        if self._pending_items_scan:
+            scan_id = self._pending_items_scan
+            self._pending_items_scan = None
+            self._scan_drawer_items(scan_id, all_detections, depth, camera_pose, camera_K)
+
+        # Update distances to robot
+        self._update_distances()
+
+        # Optionally rank via LOCUS GNN
+        if self.rank_via_locus:
+            self._rank_via_locus_stub()
+
+        self._save_debug_image(rgb, all_detections, drawer_bboxes)
+
+        self.get_logger().info(
+            f"Detection pass: {new_detections} new | "
+            f"{len(self.drawers)} closed | "
+            f"{len(self.opened_drawers_data)} opened"
+        )
+
+        if new_detections > 0:
+            self._save_debug_image(rgb, all_detections, drawer_bboxes)
+            self._publish_drawers_via_rosbridge()
+
+        return len(self.drawers)
+    
+    def _create_drawer(self, projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth):
+        # Project handle center to world
             handle_center_pixel = (
                 (handle_bbox[0] + handle_bbox[2]) / 2,
                 (handle_bbox[1] + handle_bbox[3]) / 2,
@@ -866,7 +939,7 @@ class DrawerDetectionNode(Node):
                     f"no valid depth at center"
                 )
                 self._save_projection_debug(rgb, depth, drawer_bbox, handle_bbox)
-                continue
+                return None
             self.get_logger().info(f"Handle projected to world: {world_pos}")
             projected_handles.append((world_pos, drawer_bbox, handle_bbox))
 
@@ -887,13 +960,13 @@ class DrawerDetectionNode(Node):
                     f"bad depth at corners, cannot project 3D bounding box"
                 )
                 self._save_projection_debug(rgb, depth, drawer_bbox, handle_bbox)
-                continue
+                return None
 
             # De-duplicate against existing drawers
             if self.enable_dedup:
                 merged = self._try_merge_detection(world_pos, confidence, drawer_corners)
                 if merged:
-                    continue
+                    return None
 
             # Create new drawer entry
             drawer = DetectedDrawer()
@@ -906,32 +979,8 @@ class DrawerDetectionNode(Node):
             drawer.annotated_image = self._annotate_image(
                 rgb, drawer_bbox, handle_bbox
             )
+            return drawer
 
-            with self.drawers_lock:
-                self.drawers.append(drawer)
-            new_detections += 1
-
-        # Update distances to robot
-        self._update_distances()
-
-        # Optionally rank via LOCUS GNN
-        if self.rank_via_locus:
-            self._rank_via_locus_stub()
-
-        self._save_debug_image(rgb, all_detections, drawer_bboxes)
-
-        self.get_logger().info(
-            f"Detection pass: {new_detections} new | "
-            f"{len(self.drawers)} closed | "
-            f"{len(self.opened_drawers_data)} opened"
-        )
-
-        if new_detections > 0:
-            self._save_debug_image(rgb, all_detections, drawer_bboxes)
-            self._publish_drawers_via_rosbridge()
-
-        return len(self.drawers)
-    
     def _pair_handles_to_gripper_pos_after_opening_drawer(self, projected_handles, unpaired_handles, depth, camera_pose, camera_K):
          # Project unpaired handles and add to projected list
         for handle_bbox in unpaired_handles:
@@ -990,6 +1039,9 @@ class DrawerDetectionNode(Node):
         def _pos_dict(pos):
             return {"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])}
 
+        opened_corners_dicts = [_pos_dict(c) for c in opened_corners]
+        opened_handle_dict = _pos_dict(opened_handle)
+
         opened_entry = {
             "drawer_id": drawer_id,
             "closed": {
@@ -997,17 +1049,128 @@ class DrawerDetectionNode(Node):
                 "drawer_corners_world": entry["closed_corners"],
             },
             "opened": {
-                "handle_center_world": _pos_dict(opened_handle),
-                "drawer_corners_world": [_pos_dict(c) for c in opened_corners],
+                "handle_center_world": opened_handle_dict,
+                "drawer_corners_world": opened_corners_dicts,
             },
         }
         self.opened_drawers_data.append(opened_entry)
+
+        if drawer_id in self.interacted_drawers:
+            self.interacted_drawers[drawer_id]["opened_handle"] = opened_handle_dict
+            self.interacted_drawers[drawer_id]["opened_corners"] = opened_corners_dicts
 
         self.get_logger().info(
             f"Opened drawer {drawer_id} recorded — "
             f"handle at ({opened_handle[0]:.3f}, {opened_handle[1]:.3f}, {opened_handle[2]:.3f}). "
             f"{len(self.drawers)} closed | {len(self.opened_drawers_data)} opened."
         )
+
+    def _scan_drawer_items(self, drawer_id, all_detections, depth, camera_pose, camera_K):
+        """Detect objects inside an opened drawer using 3D volume check.
+
+        Uses the stored closed drawer bbox (4 corners) extruded outward
+        along the face normal by pull_distance to define the drawer volume.
+        """
+        interacted = self.interacted_drawers.get(drawer_id)
+        if not interacted:
+            return
+
+        closed_corners = interacted.get("closed_corners")
+        pull_distance = interacted.get("pull_distance", 0.0)
+        if not closed_corners or len(closed_corners) != 4 or pull_distance <= 0:
+            self.get_logger().info(
+                f"No closed corners or pull_distance for drawer {drawer_id}, skipping items scan"
+            )
+            self.drawer_items[drawer_id] = []
+            return
+
+        pts = np.array([[c["x"], c["y"], c["z"]] for c in closed_corners])
+
+        # Compute face normal from corners (outward = toward robot)
+        v1 = pts[1] - pts[0]
+        v2 = pts[3] - pts[0]
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-6:
+            self.drawer_items[drawer_id] = []
+            return
+        normal = normal / norm_len
+
+        # Normal should point outward (toward robot/camera).
+        # Use closed_handle to determine direction: handle is on the
+        # front face, so normal should point from face toward handle.
+        ch = interacted.get("closed_handle")
+        if ch:
+            handle_pos = np.array([ch["x"], ch["y"], ch["z"]])
+            face_center = pts.mean(axis=0)
+            if np.dot(normal, handle_pos - face_center) < 0:
+                normal = -normal
+
+        # The drawer volume: closed face extruded outward by pull_distance
+        extruded_pts = pts + normal * pull_distance
+        all_pts = np.vstack([pts, extruded_pts])
+        bbox_min = all_pts.min(axis=0) - 0.03
+        bbox_max = all_pts.max(axis=0) + 0.03
+
+        items = []
+        for det in all_detections:
+            if det.object_type in self._drawer_classes or det.object_type in self._handle_classes:
+                continue
+            world_pos = self._project_to_world(det.bbox, depth, camera_pose, camera_K)
+            if world_pos is None:
+                continue
+            if np.all(world_pos >= bbox_min) and np.all(world_pos <= bbox_max):
+                items.append({
+                    "label": det.object_type,
+                    "confidence": float(det.score),
+                    "bbox_world": {
+                        "x": float(world_pos[0]),
+                        "y": float(world_pos[1]),
+                        "z": float(world_pos[2]),
+                    },
+                })
+
+        self.drawer_items[drawer_id] = items
+        self.get_logger().info(
+            f"Drawer {drawer_id} items ({len(items)}): "
+            f"{[i['label'] for i in items]}"
+        )
+
+        if not self.keep_drawers_open:
+            self._send_close_drawer_command(drawer_id)
+
+    def _send_close_drawer_command(self, drawer_id):
+        """Publish a close-drawer command to the robot."""
+        interacted = self.interacted_drawers.get(drawer_id)
+        if not interacted:
+            return
+
+        close_data = {
+            "drawer_id": drawer_id,
+            "opened_handle": interacted.get("opened_handle"),
+            "opened_corners": interacted.get("opened_corners"),
+            "handle_orientation": interacted.get("handle_orientation", "horizontal"),
+            "pull_distance": interacted.get("pull_distance", 0.0),
+        }
+
+        if close_data["opened_handle"] is None:
+            for g in self.gripper_handle_locations:
+                if g["drawer_id"] == drawer_id:
+                    close_data["opened_handle"] = g.get("gripper_pos")
+                    break
+
+        close_json = json.dumps(close_data)
+        close_msg = String()
+        close_msg.data = close_json
+        self.close_drawer_pub.publish(close_msg)
+
+        if hasattr(self, "_ws_close_drawer_pub") and self._ros_client.is_connected:
+            self._ws_close_drawer_pub.publish(
+                roslibpy.Message({"data": close_json})
+            )
+
+        interacted["status"] = "closing"
+        self.get_logger().info(f"Sent close command for drawer {drawer_id}")
 
     def _detect_drawers_detic(self, rgb: np.ndarray):
         """Use Detic to find drawer and handle bboxes in a single pass.
@@ -1046,25 +1209,11 @@ class DrawerDetectionNode(Node):
         #         f"score={d.score:.2f} bbox={d.bbox}"
         #     )
 
-        drawer_classes = {
-            "Drawer", "Cabinet", "Chest", "FilingCabinet",
-            "Dresser", "NightStand", "SideTable",
-            "Armoire", "Buffet", "CedarChest", "ChestOfDrawers",
-            "ChinaCabinet", "Credenza", "Cupboard", "AiringCupboard",
-            "HopeChest", "Hutch", "Locker", "Footlocker",
-            "MedicineChest", "Pantry", "Sideboard", "Wardrobe",
-            "Cabinetwork",
-        }
-        handle_classes = {
-            "Handle", "Knob", "Doorknob",
-            "Pull", "Bellpull", "PullChain",
-        }
-
         drawer_dets = [d for d in detections
-                       if d.object_type in drawer_classes and d.score >= self.detection_confidence]
+                       if d.object_type in self._drawer_classes and d.score >= self.detection_confidence]
         drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.3)
 
-        handle_dets = [d for d in detections if d.object_type in handle_classes]
+        handle_dets = [d for d in detections if d.object_type in self._handle_classes]
         handle_dets = self._cross_class_nms(handle_dets, iou_threshold=0.3)
 
         self.get_logger().info(
@@ -1318,11 +1467,11 @@ class DrawerDetectionNode(Node):
 
     def _try_merge_detection(self, world_pos: np.ndarray, confidence: float,
                              drawer_corners=None) -> bool:
-        """Check if this detection matches an existing drawer. If so, merge.
+        """Check if this detection matches an existing or interacted drawer.
 
         If the new detection has higher confidence, its position and
         bounding box replace the existing one entirely.
-        Returns True if merged (i.e., it's a duplicate).
+        Returns True if merged (i.e., it's a duplicate or already interacted).
         """
         with self.drawers_lock:
             for existing in self.drawers:
@@ -1340,6 +1489,19 @@ class DrawerDetectionNode(Node):
                         if drawer_corners is not None:
                             existing.drawer_corners_world = drawer_corners
                     return True
+
+        for info in self.interacted_drawers.values():
+            ch = info.get("closed_handle")
+            if ch:
+                closed_pos = np.array([ch["x"], ch["y"], ch["z"]])
+                if np.linalg.norm(world_pos - closed_pos) < self.dedup_distance:
+                    return True
+            oh = info.get("opened_handle")
+            if oh:
+                opened_pos = np.array([oh["x"], oh["y"], oh["z"]])
+                if np.linalg.norm(world_pos - opened_pos) < self.dedup_distance:
+                    return True
+
         return False
 
     @staticmethod
@@ -1578,18 +1740,43 @@ class DrawerDetectionNode(Node):
                 )
                 marker_array.markers.append(text_marker)
 
-        # Opened drawers in yellow
-        for j, od in enumerate(self.opened_drawers_data):
+        # Interacted drawers in yellow (both closed and opened positions)
+        for j, (did, info) in enumerate(self.interacted_drawers.items()):
             od_header = Header(frame_id="odom", stamp=now)
-            marker_id_base = 1000 + j
+            marker_id_base = 1000 + j * 10
+            status = info.get("status", "opened")
+            label_suffix = status.upper()
 
-            # Opened bbox (translated to new position)
-            opened_corners = od.get("opened", {}).get("drawer_corners_world")
+            # Closed position bbox
+            closed_corners = info.get("closed_corners")
+            if closed_corners and len(closed_corners) == 4:
+                cc_marker = Marker()
+                cc_marker.header = od_header
+                cc_marker.ns = "interacted_closed"
+                cc_marker.id = marker_id_base
+                cc_marker.type = Marker.LINE_STRIP
+                cc_marker.action = Marker.ADD
+                cc_marker.scale.x = 0.01
+                cc_marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.5)
+                cc_marker.pose.orientation.w = 1.0
+                for c in closed_corners:
+                    cc_marker.points.append(
+                        Point(x=float(c["x"]), y=float(c["y"]), z=float(c["z"]))
+                    )
+                cc_marker.points.append(
+                    Point(x=float(closed_corners[0]["x"]),
+                          y=float(closed_corners[0]["y"]),
+                          z=float(closed_corners[0]["z"]))
+                )
+                marker_array.markers.append(cc_marker)
+
+            # Opened position bbox (if resolved)
+            opened_corners = info.get("opened_corners")
             if opened_corners and len(opened_corners) == 4:
                 ob_marker = Marker()
                 ob_marker.header = od_header
-                ob_marker.ns = "opened_drawers"
-                ob_marker.id = marker_id_base
+                ob_marker.ns = "interacted_opened"
+                ob_marker.id = marker_id_base + 1
                 ob_marker.type = Marker.LINE_STRIP
                 ob_marker.action = Marker.ADD
                 ob_marker.scale.x = 0.01
@@ -1606,18 +1793,18 @@ class DrawerDetectionNode(Node):
                 )
                 marker_array.markers.append(ob_marker)
 
-            # Opened handle sphere
-            opened_handle = od.get("opened", {}).get("handle_center_world")
-            if opened_handle:
+            # Handle sphere at opened or closed position
+            handle_pos = info.get("opened_handle") or info.get("closed_handle")
+            if handle_pos:
                 oh_marker = Marker()
                 oh_marker.header = od_header
-                oh_marker.ns = "opened_handles"
-                oh_marker.id = marker_id_base
+                oh_marker.ns = "interacted_handles"
+                oh_marker.id = marker_id_base + 2
                 oh_marker.type = Marker.SPHERE
                 oh_marker.action = Marker.ADD
-                oh_marker.pose.position.x = float(opened_handle["x"])
-                oh_marker.pose.position.y = float(opened_handle["y"])
-                oh_marker.pose.position.z = float(opened_handle["z"])
+                oh_marker.pose.position.x = float(handle_pos["x"])
+                oh_marker.pose.position.y = float(handle_pos["y"])
+                oh_marker.pose.position.z = float(handle_pos["z"])
                 oh_marker.pose.orientation.w = 1.0
                 oh_marker.scale.x = 0.04
                 oh_marker.scale.y = 0.04
@@ -1625,20 +1812,20 @@ class DrawerDetectionNode(Node):
                 oh_marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
                 marker_array.markers.append(oh_marker)
 
-            # Label at opened handle position
+            # Label
+            label_pos = info.get("opened_handle") or info.get("closed_handle") or {}
             od_label = Marker()
             od_label.header = od_header
-            od_label.ns = "opened_labels"
-            od_label.id = marker_id_base
+            od_label.ns = "interacted_labels"
+            od_label.id = marker_id_base + 3
             od_label.type = Marker.TEXT_VIEW_FACING
             od_label.action = Marker.ADD
-            label_pos = opened_handle or od.get("closed", {}).get("handle_center_world", {})
             od_label.pose.position.x = float(label_pos.get("x", 0))
             od_label.pose.position.y = float(label_pos.get("y", 0))
             od_label.pose.position.z = float(label_pos.get("z", 0)) + 0.2
             od_label.scale.z = 0.08
             od_label.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
-            od_label.text = f"{od.get('drawer_id', '?')} OPENED"
+            od_label.text = f"{did} {label_suffix}"
             od_label.pose.orientation.w = 1.0
             marker_array.markers.append(od_label)
 
