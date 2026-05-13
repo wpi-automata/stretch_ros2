@@ -135,8 +135,11 @@ class DrawerDetectionNode(Node):
 
         # State
         self.drawers: list[DetectedDrawer] = []
+        self.opened_drawers_data: list[dict] = []
         self.drawers_lock = threading.Lock()
         self.chosen_drawer_id = None
+        self._detection_mode = "detecting"
+        self._pending_opened_info = None
         self.bridge = CvBridge()
         self.latest_rgb = None
         self.latest_depth = None
@@ -187,6 +190,14 @@ class DrawerDetectionNode(Node):
         self.create_subscription(
             String, "/exploration_status",
             self.exploration_status_callback, 10
+        )
+        self.create_subscription(
+            String, "/navigate_open/opened_drawer_id",
+            self._opened_drawer_id_callback, 10
+        )
+        self.create_subscription(
+            String, "/navigate_open/opened_drawers_json",
+            self._opened_drawers_json_callback, 10
         )
 
         # Image transport: rosbridge WebSocket (real) or DDS (sim)
@@ -318,6 +329,17 @@ class DrawerDetectionNode(Node):
             self._ros_client, "/detection/chosen_drawer_json", "std_msgs/msg/String",
         )
 
+        # Subscribe to robot-side topics via rosbridge
+        self._ws_opened_id_topic = roslibpy.Topic(
+            self._ros_client, "/navigate_open/opened_drawer_id", "std_msgs/msg/String",
+        )
+        self._ws_opened_json_topic = roslibpy.Topic(
+            self._ros_client, "/navigate_open/opened_drawers_json", "std_msgs/msg/String",
+        )
+        self._ws_exploration_status_topic = roslibpy.Topic(
+            self._ros_client, "/exploration_status", "std_msgs/msg/String",
+        )
+
         self._static_tf_cache = {}
 
         self._rgb_topic.subscribe(self._rosbridge_rgb_callback)
@@ -326,6 +348,9 @@ class DrawerDetectionNode(Node):
         self._tf_topic.subscribe(self._rosbridge_tf_callback)
         self._tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
         self._robot_desc_topic.subscribe(self._rosbridge_robot_desc_callback)
+        self._ws_opened_id_topic.subscribe(self._rosbridge_opened_id_callback)
+        self._ws_opened_json_topic.subscribe(self._rosbridge_opened_json_callback)
+        self._ws_exploration_status_topic.subscribe(self._rosbridge_exploration_status_callback)
 
         self._ros_client_thread = threading.Thread(
             target=self._ros_client.run, daemon=True
@@ -449,6 +474,36 @@ class DrawerDetectionNode(Node):
             self.get_logger().warn(f"robot_description relay failed: {e}")
 
 
+    def _rosbridge_exploration_status_callback(self, msg_dict):
+        try:
+            data = msg_dict.get("data", "")
+            if data:
+                msg = String()
+                msg.data = data
+                self.exploration_status_callback(msg)
+        except Exception as e:
+            self.get_logger().warn(f"rosbridge exploration_status relay failed: {e}")
+
+    def _rosbridge_opened_id_callback(self, msg_dict):
+        try:
+            data = msg_dict.get("data", "")
+            if data:
+                msg = String()
+                msg.data = data
+                self._opened_drawer_id_callback(msg)
+        except Exception as e:
+            self.get_logger().warn(f"rosbridge opened_drawer_id relay failed: {e}")
+
+    def _rosbridge_opened_json_callback(self, msg_dict):
+        try:
+            data = msg_dict.get("data", "")
+            if data:
+                msg = String()
+                msg.data = data
+                self._opened_drawers_json_callback(msg)
+        except Exception as e:
+            self.get_logger().warn(f"rosbridge opened_drawers_json relay failed: {e}")
+
     def _republish_static_tf_cache(self):
         if not self._static_tf_cache:
             return
@@ -483,6 +538,7 @@ class DrawerDetectionNode(Node):
                     w=rot.get("w", 1.0),
                 )
                 tf_msg.transforms.append(ts)
+                self.tf_buffer.set_transform(ts, "rosbridge")
             publisher.publish(tf_msg)
         except Exception as e:
             print(f"[rosbridge] TF decode failed: {e}", flush=True)
@@ -542,6 +598,69 @@ class DrawerDetectionNode(Node):
 
     def exploration_status_callback(self, msg: String):
         self.exploring = msg.data in ("rotating", "planning", "navigating")
+
+    def _opened_drawer_id_callback(self, msg: String):
+        """Move drawer from closed to opened and trigger opened-drawer detection."""
+        drawer_id = msg.data
+        closed_drawer = None
+        with self.drawers_lock:
+            for d in self.drawers:
+                if d.drawer_id == drawer_id:
+                    closed_drawer = d
+                    break
+            self.drawers = [d for d in self.drawers if d.drawer_id != drawer_id]
+
+        if closed_drawer is None:
+            self.get_logger().warn(
+                f"Opened drawer {drawer_id} not found in closed drawers"
+            )
+            return
+
+        closed_handle = closed_drawer.handle_center_world.copy()
+        closed_corners = [c.copy() for c in closed_drawer.drawer_corners_world]
+
+        self._pending_opened_info = {
+            "drawer_id": drawer_id,
+            "closed_handle": closed_handle,
+            "closed_corners": closed_corners,
+            "handle_orientation": closed_drawer.handle_orientation,
+        }
+        self._detection_mode = "detecting_opened"
+        self.get_logger().info(
+            f"Drawer {drawer_id} opened — removed from closed "
+            f"({len(self.drawers)} remaining), detecting opened position"
+        )
+
+    def _opened_drawers_json_callback(self, msg: String):
+        """Store Node 3's opened drawer data (gripper position at pull time)."""
+        try:
+            data = json.loads(msg.data)
+            for entry in data:
+                opened_handle = entry.get("opened", {}).get("handle_center_world")
+                if opened_handle and self._pending_opened_info is not None:
+                    if entry.get("drawer_id") == self._pending_opened_info["drawer_id"]:
+                        self._pending_opened_info["node3_opened_handle"] = np.array([
+                            opened_handle["x"], opened_handle["y"], opened_handle["z"]
+                        ])
+                        self.get_logger().info(
+                            f"Got Node 3 opened handle reference for {entry['drawer_id']}: "
+                            f"({opened_handle['x']:.3f}, {opened_handle['y']:.3f}, {opened_handle['z']:.3f})"
+                        )
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f"Bad opened drawers JSON: {e}")
+
+    def _get_gripper_world_pos(self):
+        """Get gripper tip position in odom frame via TF."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "link_gripper_finger_left",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.2),
+            )
+            t = transform.transform.translation
+            return np.array([t.x, t.y, t.z])
+        except Exception:
+            return None
 
     def trigger_detection_callback(self, request, response):
         """Manually trigger a detection pass."""
@@ -633,10 +752,11 @@ class DrawerDetectionNode(Node):
                 roslibpy.Message({"data": chosen_json})
             )
 
+        self._detection_mode = "stopped"
         self.get_logger().info(
             f"Chosen drawer: {chosen.drawer_id}, "
             f"distance={chosen.distance_to_robot:.2f}m, "
-            f"reachable={chosen.reachable}"
+            f"reachable={chosen.reachable} — detection stopped"
         )
         response.success = True
         response.message = chosen_json
@@ -680,8 +800,10 @@ class DrawerDetectionNode(Node):
     # ─── Detection logic ──────────────────────────────────────────────
 
     def detection_tick(self):
-        """Periodic detection pass (only when exploring or in test mode)."""
-        if not self.exploring and not self.test_mode:
+        """Periodic detection pass gated by detection mode."""
+        if self._detection_mode == "stopped":
+            return
+        if not self.exploring and not self.test_mode and self._detection_mode != "detecting_opened":
             return
         if self.latest_rgb is None or self.latest_depth is None:
             self.get_logger().info(
@@ -691,7 +813,10 @@ class DrawerDetectionNode(Node):
                 throttle_duration_sec=5.0,
             )
             return
-        self._run_detection()
+        if self._detection_mode == "detecting_opened":
+            self._run_opened_detection()
+        else:
+            self._run_detection()
 
     def _run_detection(self) -> int:
         """Run Detic detection on current frame, find drawers and handles."""
@@ -701,7 +826,6 @@ class DrawerDetectionNode(Node):
             self.get_logger().debug("Waiting for camera_info...")
             return 0
 
-        # Get camera-to-odom transform
         camera_frame = "camera_color_optical_frame"
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -712,7 +836,8 @@ class DrawerDetectionNode(Node):
         except Exception as e:
             self._tf_consecutive_ok = 0
             self.get_logger().warn(
-                f"TF lookup failed: {e}", throttle_duration_sec=5.0
+                f"TF lookup failed (skipping frame): {e}",
+                throttle_duration_sec=5.0,
             )
             return len(self.drawers)
 
@@ -748,7 +873,7 @@ class DrawerDetectionNode(Node):
         camera_pose = self._transform_to_matrix(transform)
 
         # Detect drawers in the frame
-        drawer_bboxes, all_detections = self._detect_drawers_detic(rgb)
+        drawer_bboxes, all_detections, _ = self._detect_drawers_detic(rgb)
 
         new_detections = 0
         for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
@@ -805,10 +930,17 @@ class DrawerDetectionNode(Node):
             # Check reachability
             reachable = self._check_reachability(world_pos)
 
-            # Project drawer corners to world for RViz bounding box
+            # Project drawer corners to world for bounding box
             drawer_corners = self._project_drawer_corners(
                 drawer_bbox, depth, camera_pose, camera_K
             )
+            if drawer_corners is None:
+                self.get_logger().warn(
+                    f"REJECTED drawer bbox {drawer_bbox} — "
+                    f"bad depth at corners, cannot project 3D bounding box"
+                )
+                self._save_projection_debug(rgb, depth, drawer_bbox, handle_bbox)
+                continue
 
             # De-duplicate against existing drawers
             if self.enable_dedup:
@@ -841,15 +973,150 @@ class DrawerDetectionNode(Node):
 
         self._save_debug_image(rgb, all_detections, drawer_bboxes)
 
+        self.get_logger().info(
+            f"Detection pass: {new_detections} new | "
+            f"{len(self.drawers)} closed | "
+            f"{len(self.opened_drawers_data)} opened"
+        )
+
         if new_detections > 0:
-            self.get_logger().info(
-                f"Detected {new_detections} new drawer(s), "
-                f"total: {len(self.drawers)}"
-            )
-            # self._save_debug_image(rgb, all_detections, drawer_bboxes)
+            self._save_debug_image(rgb, all_detections, drawer_bboxes)
             self._publish_drawers_via_rosbridge()
 
         return len(self.drawers)
+
+    def _run_opened_detection(self):
+        """Detect the opened drawer near the gripper position.
+
+        After Node 3 opens a drawer, this runs to find the handle in its
+        new (opened) position. If a handle is detected near the gripper
+        with a drawer bbox, uses the real detection. If the handle is
+        detected without a drawer bbox, creates a synthetic bbox by
+        translating the closed bbox to the new handle location.
+        """
+        if self._pending_opened_info is None:
+            self._detection_mode = "detecting"
+            return
+
+        if self.latest_rgb is None or self.latest_depth is None:
+            return
+        if self.camera_K is None:
+            return
+
+        camera_frame = "camera_color_optical_frame"
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "odom", camera_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup failed during opened detection: {e}",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        rgb = self.latest_rgb.copy()
+        depth = self.latest_depth.copy()
+        camera_K = self.camera_K
+        camera_pose = self._transform_to_matrix(transform)
+
+        # Reference position: Node 3's gripper pos at pull time, or current gripper TF
+        ref_pos = self._pending_opened_info.get("node3_opened_handle")
+        if ref_pos is None:
+            ref_pos = self._get_gripper_world_pos()
+        if ref_pos is None:
+            self.get_logger().warn(
+                "No reference position for opened drawer — waiting for "
+                "Node 3 data or gripper TF",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        NEAR_THRESHOLD = 0.15  # ~6 inches
+
+        drawer_bboxes, all_detections, unpaired_handles = self._detect_drawers_detic(rgb)
+
+        # Check paired drawer+handle detections near the reference
+        for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
+            world_pos = self._project_to_world(
+                handle_bbox, depth, camera_pose, camera_K
+            )
+            if world_pos is None:
+                continue
+            dist = np.linalg.norm(world_pos - ref_pos)
+            if dist < NEAR_THRESHOLD:
+                drawer_corners = self._project_drawer_corners(
+                    drawer_bbox, depth, camera_pose, camera_K
+                )
+                if drawer_corners is None:
+                    drawer_corners = self._translate_closed_corners(
+                        world_pos
+                    )
+                self._store_opened_drawer(world_pos, drawer_corners)
+                return
+
+        # Check unpaired handles near the reference — create synthetic bbox
+        for handle_bbox in unpaired_handles:
+            world_pos = self._project_to_world(
+                handle_bbox, depth, camera_pose, camera_K
+            )
+            if world_pos is None:
+                continue
+            dist = np.linalg.norm(world_pos - ref_pos)
+            if dist < NEAR_THRESHOLD:
+                self.get_logger().info(
+                    f"Unpaired handle near gripper at dist={dist:.3f}m — "
+                    f"creating synthetic bbox from closed drawer"
+                )
+                drawer_corners = self._translate_closed_corners(world_pos)
+                self._store_opened_drawer(world_pos, drawer_corners)
+                return
+
+        self.get_logger().info(
+            f"No handle detected near opened position — retrying",
+            throttle_duration_sec=5.0,
+        )
+
+    def _translate_closed_corners(self, new_handle_pos: np.ndarray):
+        """Translate the closed drawer bbox to the new handle location."""
+        info = self._pending_opened_info
+        closed_handle = info["closed_handle"]
+        closed_corners = info["closed_corners"]
+        offset = new_handle_pos - closed_handle
+        return [c + offset for c in closed_corners]
+
+    def _store_opened_drawer(self, opened_handle: np.ndarray,
+                              opened_corners: list):
+        """Finalize an opened drawer detection and resume normal detection."""
+        info = self._pending_opened_info
+        drawer_id = info["drawer_id"]
+
+        def _pos_dict(pos):
+            return {"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])}
+
+        opened_entry = {
+            "drawer_id": drawer_id,
+            "closed": {
+                "handle_center_world": _pos_dict(info["closed_handle"]),
+                "drawer_corners_world": [_pos_dict(c) for c in info["closed_corners"]],
+            },
+            "opened": {
+                "handle_center_world": _pos_dict(opened_handle),
+                "drawer_corners_world": [_pos_dict(c) for c in opened_corners],
+            },
+        }
+        self.opened_drawers_data.append(opened_entry)
+        self._pending_opened_info = None
+        self._detection_mode = "detecting"
+
+        self.get_logger().info(
+            f"Opened drawer {drawer_id} recorded — "
+            f"handle at ({opened_handle[0]:.3f}, {opened_handle[1]:.3f}, {opened_handle[2]:.3f}). "
+            f"{len(self.drawers)} closed | {len(self.opened_drawers_data)} opened. "
+            f"Resuming normal detection."
+        )
 
     def _detect_drawers_detic(self, rgb: np.ndarray):
         """Use Detic to find drawer and handle bboxes in a single pass.
@@ -914,23 +1181,30 @@ class DrawerDetectionNode(Node):
             f"{len(drawer_dets)} drawers, {len(handle_dets)} handles"
         )
 
+        paired_handle_indices = set()
         for det in drawer_dets:
             drawer_bbox = det.bbox
 
             # Associate: find the best handle whose bbox center falls inside this drawer bbox
-            handle_bbox, _ = self._match_handle_to_drawer(drawer_bbox, handle_dets)
+            handle_bbox, h_idx = self._match_handle_to_drawer(drawer_bbox, handle_dets)
             if handle_bbox is None:
                 self.get_logger().info(
                     f"Skipping drawer bbox {drawer_bbox} — no handle detected"
                 )
                 continue
 
+            paired_handle_indices.add(h_idx)
             self.get_logger().info(
                 f"Handle matched to drawer {drawer_bbox}: handle bbox={handle_bbox}"
             )
             results.append((drawer_bbox, handle_bbox, det.score))
 
-        return results, detections
+        unpaired_handles = [
+            handle_dets[i].bbox for i in range(len(handle_dets))
+            if i not in paired_handle_indices
+        ]
+
+        return results, detections, unpaired_handles
 
     @staticmethod
     def _cross_class_nms(detections, iou_threshold=0.3):
@@ -1155,8 +1429,8 @@ class DrawerDetectionNode(Node):
                              drawer_corners=None) -> bool:
         """Check if this detection matches an existing drawer. If so, merge.
 
-        Handle position is updated with a weighted average. Drawer corners
-        are replaced if the new detection has higher confidence.
+        If the new detection has higher confidence, its position and
+        bounding box replace the existing one entirely.
         Returns True if merged (i.e., it's a duplicate).
         """
         with self.drawers_lock:
@@ -1168,22 +1442,12 @@ class DrawerDetectionNode(Node):
                 )
                 if dist < self.dedup_distance:
                     existing.observations += 1
-                    # Only replace corners if the new bbox is larger
-                    if drawer_corners is not None and existing.drawer_corners_world is not None:
-                        new_area = self._corners_area(drawer_corners)
-                        old_area = self._corners_area(existing.drawer_corners_world)
-                        if new_area > old_area:
+                    if confidence > existing.confidence:
+                        existing.handle_center_world = world_pos
+                        existing.handle_grasp_world = world_pos.copy()
+                        existing.confidence = confidence
+                        if drawer_corners is not None:
                             existing.drawer_corners_world = drawer_corners
-                    elif drawer_corners is not None and existing.drawer_corners_world is None:
-                        existing.drawer_corners_world = drawer_corners
-
-                    # Average handle position
-                    n = existing.observations
-                    existing.handle_center_world = (
-                        existing.handle_center_world * (n - 1) + world_pos
-                    ) / n
-                    existing.handle_grasp_world = existing.handle_center_world.copy()
-                    existing.confidence = max(existing.confidence, confidence)
                     return True
         return False
 
@@ -1369,26 +1633,19 @@ class DrawerDetectionNode(Node):
                 else:
                     box_marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.9)
 
-                if drawer.drawer_corners_world is not None and len(drawer.drawer_corners_world) == 4:
-                    for c in drawer.drawer_corners_world:
-                        box_marker.points.append(
-                            Point(x=float(c[0]), y=float(c[1]), z=float(c[2]))
-                        )
+                if drawer.drawer_corners_world is None or len(drawer.drawer_corners_world) != 4:
+                    continue
+                for c in drawer.drawer_corners_world:
                     box_marker.points.append(
-                        Point(
-                            x=float(drawer.drawer_corners_world[0][0]),
-                            y=float(drawer.drawer_corners_world[0][1]),
-                            z=float(drawer.drawer_corners_world[0][2]),
-                        )
+                        Point(x=float(c[0]), y=float(c[1]), z=float(c[2]))
                     )
-                else:
-                    p = drawer.handle_center_world
-                    hw, hh = 0.15, 0.075
-                    box_marker.points.append(Point(x=float(p[0]) - hw, y=float(p[1]), z=float(p[2]) - hh))
-                    box_marker.points.append(Point(x=float(p[0]) + hw, y=float(p[1]), z=float(p[2]) - hh))
-                    box_marker.points.append(Point(x=float(p[0]) + hw, y=float(p[1]), z=float(p[2]) + hh))
-                    box_marker.points.append(Point(x=float(p[0]) - hw, y=float(p[1]), z=float(p[2]) + hh))
-                    box_marker.points.append(Point(x=float(p[0]) - hw, y=float(p[1]), z=float(p[2]) - hh))
+                box_marker.points.append(
+                    Point(
+                        x=float(drawer.drawer_corners_world[0][0]),
+                        y=float(drawer.drawer_corners_world[0][1]),
+                        z=float(drawer.drawer_corners_world[0][2]),
+                    )
+                )
 
                 box_marker.pose.orientation.w = 1.0
                 marker_array.markers.append(box_marker)
@@ -1429,6 +1686,70 @@ class DrawerDetectionNode(Node):
                     f"{drawer.distance_to_robot:.1f}m"
                 )
                 marker_array.markers.append(text_marker)
+
+        # Opened drawers in yellow
+        for j, od in enumerate(self.opened_drawers_data):
+            od_header = Header(frame_id="odom", stamp=now)
+            marker_id_base = 1000 + j
+
+            # Opened bbox (translated to new position)
+            opened_corners = od.get("opened", {}).get("drawer_corners_world")
+            if opened_corners and len(opened_corners) == 4:
+                ob_marker = Marker()
+                ob_marker.header = od_header
+                ob_marker.ns = "opened_drawers"
+                ob_marker.id = marker_id_base
+                ob_marker.type = Marker.LINE_STRIP
+                ob_marker.action = Marker.ADD
+                ob_marker.scale.x = 0.01
+                ob_marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.9)
+                ob_marker.pose.orientation.w = 1.0
+                for c in opened_corners:
+                    ob_marker.points.append(
+                        Point(x=float(c["x"]), y=float(c["y"]), z=float(c["z"]))
+                    )
+                ob_marker.points.append(
+                    Point(x=float(opened_corners[0]["x"]),
+                          y=float(opened_corners[0]["y"]),
+                          z=float(opened_corners[0]["z"]))
+                )
+                marker_array.markers.append(ob_marker)
+
+            # Opened handle sphere
+            opened_handle = od.get("opened", {}).get("handle_center_world")
+            if opened_handle:
+                oh_marker = Marker()
+                oh_marker.header = od_header
+                oh_marker.ns = "opened_handles"
+                oh_marker.id = marker_id_base
+                oh_marker.type = Marker.SPHERE
+                oh_marker.action = Marker.ADD
+                oh_marker.pose.position.x = float(opened_handle["x"])
+                oh_marker.pose.position.y = float(opened_handle["y"])
+                oh_marker.pose.position.z = float(opened_handle["z"])
+                oh_marker.pose.orientation.w = 1.0
+                oh_marker.scale.x = 0.04
+                oh_marker.scale.y = 0.04
+                oh_marker.scale.z = 0.04
+                oh_marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
+                marker_array.markers.append(oh_marker)
+
+            # Label at opened handle position
+            od_label = Marker()
+            od_label.header = od_header
+            od_label.ns = "opened_labels"
+            od_label.id = marker_id_base
+            od_label.type = Marker.TEXT_VIEW_FACING
+            od_label.action = Marker.ADD
+            label_pos = opened_handle or od.get("closed", {}).get("handle_center_world", {})
+            od_label.pose.position.x = float(label_pos.get("x", 0))
+            od_label.pose.position.y = float(label_pos.get("y", 0))
+            od_label.pose.position.z = float(label_pos.get("z", 0)) + 0.2
+            od_label.scale.z = 0.08
+            od_label.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
+            od_label.text = f"{od.get('drawer_id', '?')} OPENED"
+            od_label.pose.orientation.w = 1.0
+            marker_array.markers.append(od_label)
 
         self.marker_pub.publish(marker_array)
 
