@@ -385,12 +385,29 @@ class NavigateOpenNode(Node):
         thread = threading.Thread(target=self._close_drawer_pipeline, args=(data,), daemon=True)
         thread.start()
 
+    def _speak(self, text: str):
+        """Speak text using espeak (non-blocking)."""
+        try:
+            import subprocess
+            subprocess.Popen(["espeak", "-s", "140", text],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.get_logger().warn(f"Speech failed: {e}")
+
     def _close_drawer_pipeline(self, data: dict):
         """Close a drawer: extend to opened handle, grab, push back, release."""
         drawer_id = data.get("drawer_id", "?")
         pull_distance = data.get("pull_distance", 0.0)
         handle_pos_d = data.get("opened_handle")
         orientation = data.get("handle_orientation", "horizontal")
+        items = data.get("items", [])
+
+        if items:
+            labels = [i["label"] for i in items]
+            unique = list(dict.fromkeys(labels))
+            self._speak(f"I found {', '.join(unique)} in the drawer")
+        else:
+            self._speak("The drawer is empty")
 
         if not handle_pos_d or pull_distance <= 0:
             self.get_logger().warn(

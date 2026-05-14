@@ -1159,6 +1159,7 @@ class DrawerDetectionNode(Node):
             "opened_corners": interacted.get("opened_corners"),
             "handle_orientation": interacted.get("handle_orientation", "horizontal"),
             "pull_distance": interacted.get("pull_distance", 0.0),
+            "items": self.drawer_items.get(drawer_id, []),
         }
 
         if close_data["opened_handle"] is None:
