@@ -207,6 +207,16 @@ Visualization Manager:
         Value: /drawer_chosen_marker
       Value: true
 
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Scene Graph
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /scene_graph/markers
+      Value: true
+
     - Class: rviz_default_plugins/Path
       Enabled: true
       Name: Navigation Path

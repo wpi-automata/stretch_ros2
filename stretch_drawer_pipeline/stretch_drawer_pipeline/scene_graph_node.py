@@ -35,8 +35,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo, Image as RosImage
-from std_msgs.msg import String
+from std_msgs.msg import ColorRGBA, String
 from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+from builtin_interfaces.msg import Duration as RosDuration
 import tf2_ros
 
 _SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent / "semantic-object-container-room"
@@ -103,6 +106,15 @@ class SceneGraphNode(Node):
         self._rankings = []
         self._rankings_lock = threading.Lock()
         self._n_observations = 0
+
+        # Detection tracking for visualization
+        self._detected_objects = []
+        self._detected_objects_lock = threading.Lock()
+
+        # Marker publishers
+        self._marker_pub = self.create_publisher(
+            MarkerArray, "/scene_graph/markers", 10
+        )
 
         # Image transport
         self._robot_ip = self.get_parameter("robot_ip").value
@@ -475,12 +487,20 @@ class SceneGraphNode(Node):
             )
             n_added += 1
 
+            with self._detected_objects_lock:
+                self._detected_objects.append({
+                    "type": det.object_type,
+                    "pos": world_pos.tolist() if hasattr(world_pos, "tolist") else list(world_pos),
+                    "score": det.score,
+                })
+
         self._n_observations += 1
         self.get_logger().info(
             f"Frame {self._n_observations}: {len(dets)} dets, {n_added} added, "
             f"{self._builder.n_raw_detections} total raw, "
             f"{self._builder.n_nodes} nodes"
         )
+        self._publish_markers()
 
     def _ensure_type_text_embeddings(self, obj_types):
         import torch
@@ -542,6 +562,7 @@ class SceneGraphNode(Node):
                 f"(score={top.get('score', 0):.3f})"
             )
 
+        self._publish_markers()
         return ranking
 
     def _push_rankings_to_node2(self, ranking: list):
@@ -600,6 +621,112 @@ class SceneGraphNode(Node):
         return self._build_and_rank_callback(request, response)
 
     # ── Helpers ───────────────────────────────────────────────────────
+
+    # ── RViz markers ──────────────────────────────────────────────────
+
+    def _publish_markers(self):
+        """Publish detected objects and ranked containers as RViz markers."""
+        ma = MarkerArray()
+
+        # Delete all previous markers
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        delete_marker.header.frame_id = "odom"
+        delete_marker.header.stamp = self.get_clock().now().to_msg()
+        ma.markers.append(delete_marker)
+
+        marker_id = 0
+
+        # Raw detections: cyan spheres with text labels
+        with self._detected_objects_lock:
+            for obj in self._detected_objects:
+                pos = obj["pos"]
+
+                sphere = Marker()
+                sphere.header.frame_id = "odom"
+                sphere.header.stamp = self.get_clock().now().to_msg()
+                sphere.ns = "scene_detections"
+                sphere.id = marker_id
+                sphere.type = Marker.SPHERE
+                sphere.action = Marker.ADD
+                sphere.pose.position.x = pos[0]
+                sphere.pose.position.y = pos[1]
+                sphere.pose.position.z = pos[2] if len(pos) > 2 else 0.5
+                sphere.pose.orientation.w = 1.0
+                sphere.scale.x = 0.08
+                sphere.scale.y = 0.08
+                sphere.scale.z = 0.08
+                sphere.color = ColorRGBA(r=0.2, g=0.8, b=0.8, a=0.6)
+                sphere.lifetime = RosDuration(sec=0, nanosec=0)
+                ma.markers.append(sphere)
+                marker_id += 1
+
+                label = Marker()
+                label.header.frame_id = "odom"
+                label.header.stamp = self.get_clock().now().to_msg()
+                label.ns = "scene_labels"
+                label.id = marker_id
+                label.type = Marker.TEXT_VIEW_FACING
+                label.action = Marker.ADD
+                label.pose.position.x = pos[0]
+                label.pose.position.y = pos[1]
+                label.pose.position.z = (pos[2] if len(pos) > 2 else 0.5) + 0.1
+                label.pose.orientation.w = 1.0
+                label.scale.z = 0.06
+                label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9)
+                label.text = obj["type"]
+                label.lifetime = RosDuration(sec=0, nanosec=0)
+                ma.markers.append(label)
+                marker_id += 1
+
+        # Ranked containers: colored by score (green=high, red=low)
+        with self._rankings_lock:
+            for rank in self._rankings:
+                pos = rank.get("position_3d")
+                if pos is None:
+                    continue
+                score = rank.get("score", 0.0)
+
+                sphere = Marker()
+                sphere.header.frame_id = "odom"
+                sphere.header.stamp = self.get_clock().now().to_msg()
+                sphere.ns = "ranked_containers"
+                sphere.id = marker_id
+                sphere.type = Marker.SPHERE
+                sphere.action = Marker.ADD
+                sphere.pose.position.x = pos[0]
+                sphere.pose.position.y = pos[1]
+                sphere.pose.position.z = pos[2] if len(pos) > 2 else 0.5
+                sphere.pose.orientation.w = 1.0
+                sphere.scale.x = 0.15
+                sphere.scale.y = 0.15
+                sphere.scale.z = 0.15
+                sphere.color = ColorRGBA(
+                    r=1.0 - score, g=score, b=0.0, a=0.9
+                )
+                sphere.lifetime = RosDuration(sec=0, nanosec=0)
+                ma.markers.append(sphere)
+                marker_id += 1
+
+                label = Marker()
+                label.header.frame_id = "odom"
+                label.header.stamp = self.get_clock().now().to_msg()
+                label.ns = "ranked_labels"
+                label.id = marker_id
+                label.type = Marker.TEXT_VIEW_FACING
+                label.action = Marker.ADD
+                label.pose.position.x = pos[0]
+                label.pose.position.y = pos[1]
+                label.pose.position.z = (pos[2] if len(pos) > 2 else 0.5) + 0.15
+                label.pose.orientation.w = 1.0
+                label.scale.z = 0.08
+                label.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
+                label.text = f"{rank.get('container_type', '?')} ({score:.2f})"
+                label.lifetime = RosDuration(sec=0, nanosec=0)
+                ma.markers.append(label)
+                marker_id += 1
+
+        self._marker_pub.publish(ma)
 
     @staticmethod
     def _transform_to_matrix(transform) -> np.ndarray:
