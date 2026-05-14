@@ -626,6 +626,7 @@ class DrawerDetectionNode(Node):
         }
 
         self._pending_items_scan = drawer_id
+        self._pending_items_scan_time = time.time()
         self._detection_mode = "detecting"
 
         gripper = entry.get("gripper_pos")
@@ -875,9 +876,11 @@ class DrawerDetectionNode(Node):
         self._pair_handles_to_gripper_pos_after_opening_drawer(projected_handles, unpaired_handles, depth, camera_pose, camera_K)
 
         if self._pending_items_scan:
-            scan_id = self._pending_items_scan
-            self._pending_items_scan = None
-            self._scan_drawer_items(scan_id, all_detections, rgb, depth, camera_pose, camera_K)
+            elapsed = time.time() - self._pending_items_scan_time
+            if elapsed >= 5.0:
+                scan_id = self._pending_items_scan
+                self._pending_items_scan = None
+                self._scan_drawer_items(scan_id, all_detections, rgb, depth, camera_pose, camera_K)
 
         # Update distances to robot
         self._update_distances()
