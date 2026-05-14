@@ -705,7 +705,7 @@ class DrawerDetectionNode(Node):
             candidates = reachable if reachable else self.drawers
 
             candidates.sort(
-                key=lambda d: (-d.ranking, d.distance_to_robot)
+                key=lambda d: (-d.ranking, -d.confidence, d.distance_to_robot)
             )
             chosen = candidates[0]
             self.chosen_drawer_id = chosen.drawer_id
