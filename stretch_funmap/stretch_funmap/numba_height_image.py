@@ -370,9 +370,9 @@ def numba_max_height_and_rgb_images_int(points_to_image_mat, rgb_points,
     n_points = rgb_points.shape[0]    
     for i in range(n_points):
         p = rgb_points[i]
-        x_p = p['x']
-        y_p = p['y']
-        z_p = p['z']
+        x_p = float(p['x'])
+        y_p = float(p['y'])
+        z_p = float(p['z'])
         
         x = (r00 * x_p) + (r01 * y_p) + (r02 * z_p) + t0
         y = (r10 * x_p) + (r11 * y_p) + (r12 * z_p) + t1
@@ -441,9 +441,9 @@ def numba_max_height_and_rgb_and_camera_depth_images_int(points_to_image_mat, rg
     n_points = rgb_points.shape[0]    
     for i in range(n_points):
         p = rgb_points[i]
-        x_p = p['x']
-        y_p = p['y']
-        z_p = p['z']
+        x_p = float(p['x'])
+        y_p = float(p['y'])
+        z_p = float(p['z'])
         
         x = (r00 * x_p) + (r01 * y_p) + (r02 * z_p) + t0
         y = (r10 * x_p) + (r11 * y_p) + (r12 * z_p) + t1
