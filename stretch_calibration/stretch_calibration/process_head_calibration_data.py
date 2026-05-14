@@ -239,6 +239,14 @@ class HeadCalibrator:
     def check_fit_error(self, fit_error):
         fit_error_threshold = 0.05
         fit_warning_threshold = 0.03
+        # Newer cma versions return best_parameters_error as a tuple like
+        # ('fbest', value, 'evals', n, ...); extract the first numeric element.
+        if isinstance(fit_error, (tuple, list)):
+            numeric = next((v for v in fit_error if isinstance(v, (int, float))), None)
+            if numeric is None:
+                self.node.get_logger().warn('check_fit_error: could not extract scalar from {0}; skipping'.format(fit_error))
+                return
+            fit_error = float(numeric)
         if fit_error > fit_error_threshold:
             self.node.get_logger().error('The fit error is very high: {0} > {1} (fit_error > fit_error_threshold)'.format(fit_error, fit_error_threshold))
         elif fit_error > fit_warning_threshold:
@@ -864,7 +872,11 @@ class ProcessHeadCalibrationDataNode(Node):
                 filename = self.opt_results_file_to_load
                 print('Loading CMA-ES result from a YAML file named ' + filename)
             fid = open(filename, 'r')
-            cma_result = yaml.load(fid, Loader=yaml.SafeLoader)
+            # cma_result = yaml.load(fid, Loader=yaml.SafeLoader)
+            # SafeLoader rejects cma.utilities.utils.DictClass2 and numpy ndarray
+            # tags that newer cma versions embed in the saved options/result;
+            # use UnsafeLoader since these YAMLs are locally produced, not external.
+            cma_result = yaml.load(fid, Loader=yaml.UnsafeLoader)
             fid.close()
 
             show_data_used_during_optimization = True
@@ -955,6 +967,11 @@ class ProcessHeadCalibrationDataNode(Node):
             # Convert from Numpy arrays to human-readable lists
             no_numpy_cma_result = []
             for entry in es.result:
+                # Newer cma versions wrap each result element as a (name, value)
+                # named tuple (e.g. ('xbest', array), ('fbest', 0.026)). Unwrap
+                # to get the actual value before tolist conversion.
+                if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[0], str):
+                    entry = entry[1]
                 if "tolist" in dir(entry):
                     entry = entry.tolist()
                 no_numpy_cma_result.append(entry)
