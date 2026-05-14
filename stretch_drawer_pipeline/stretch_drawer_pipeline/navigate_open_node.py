@@ -386,32 +386,17 @@ class NavigateOpenNode(Node):
         thread.start()
 
     def _close_drawer_pipeline(self, data: dict):
-        """Close a drawer by pushing it back the same distance it was pulled."""
+        """Close a drawer by pushing it back. Gripper is already at the handle."""
         drawer_id = data.get("drawer_id", "?")
         pull_distance = data.get("pull_distance", 0.0)
-        handle_pos_d = data.get("opened_handle")
-        orientation = data.get("handle_orientation", "horizontal")
 
-        if not handle_pos_d or pull_distance <= 0:
+        if pull_distance <= 0:
             self.get_logger().warn(
-                f"Cannot close drawer {drawer_id}: "
-                f"handle={handle_pos_d}, pull_distance={pull_distance}"
+                f"Cannot close drawer {drawer_id}: pull_distance={pull_distance}"
             )
             return
 
-        handle_pos = np.array([handle_pos_d["x"], handle_pos_d["y"], handle_pos_d["z"]])
-
         try:
-            if not self._switch_to_position_mode():
-                self.get_logger().error("Cannot switch to position mode for close")
-                return
-            time.sleep(0.5)
-
-            self._open_gripper()
-            time.sleep(0.5)
-            self._orient_gripper_toward(handle_pos, orientation)
-            self._extend_to_point(handle_pos)
-
             self._close_gripper()
             time.sleep(1.0)
 
