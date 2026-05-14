@@ -36,3 +36,7 @@ log/
 
 # VSCode
 .vscode/
+
+#ROS tf files
+frames*
+stretchframes*
