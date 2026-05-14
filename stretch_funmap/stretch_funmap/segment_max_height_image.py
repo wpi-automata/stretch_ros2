@@ -997,10 +997,14 @@ def compute_floor_mask(max_height_im):
     segments_image, segment_info, height_to_segment_id = segment(image, m_per_unit, zero_height, segmentation_scale, verbose=False)
     floor_id, floor_mask = find_floor(segment_info, segments_image, verbose=False)
 
+    if floor_mask is None:
+        print('compute_floor_mask: no floor found, returning empty mask')
+        return np.zeros(image.shape, dtype=np.uint8)
+
     # Remove small obstacles from the floor mask, including
     # regions that are too far below the floor.
-    use_mean = False 
-    if use_mean: 
+    use_mean = False
+    if use_mean:
         mean_floor_height_pix = np.mean(max_height_im.image[floor_mask > 0])
         mean_floor_height_m = m_per_unit * mean_floor_height_pix
         print('mean_floor_height_m =', mean_floor_height_m)
