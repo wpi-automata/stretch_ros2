@@ -1099,6 +1099,13 @@ class DrawerDetectionNode(Node):
         bbox_min = all_pts.min(axis=0) - 0.03
         bbox_max = all_pts.max(axis=0) + 0.03
 
+        self.get_logger().info(
+            f"Items scan volume: normal=({normal[0]:.3f},{normal[1]:.3f},{normal[2]:.3f}), "
+            f"pull_dist={pull_distance:.3f}, "
+            f"bbox_min=({bbox_min[0]:.3f},{bbox_min[1]:.3f},{bbox_min[2]:.3f}), "
+            f"bbox_max=({bbox_max[0]:.3f},{bbox_max[1]:.3f},{bbox_max[2]:.3f})"
+        )
+
         items = []
         for det in all_detections:
             if det.object_type in self._drawer_classes or det.object_type in self._handle_classes:
@@ -1106,7 +1113,13 @@ class DrawerDetectionNode(Node):
             world_pos = self._project_to_world(det.bbox, depth, camera_pose, camera_K)
             if world_pos is None:
                 continue
-            if np.all(world_pos >= bbox_min) and np.all(world_pos <= bbox_max):
+            inside = np.all(world_pos >= bbox_min) and np.all(world_pos <= bbox_max)
+            self.get_logger().info(
+                f"  item candidate: {det.object_type} ({det.score:.2f}) at "
+                f"({world_pos[0]:.3f},{world_pos[1]:.3f},{world_pos[2]:.3f}) "
+                f"{'INSIDE' if inside else 'outside'}"
+            )
+            if inside:
                 items.append({
                     "label": det.object_type,
                     "confidence": float(det.score),

@@ -798,7 +798,7 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        fingertip_length = 0.06
+        fingertip_length = 0.08 #0.06m but some extra
         target_extension = max(0.0, min(dist - gripper_offset - fingertip_length, 0.52))
         self.get_logger().info(
             f"Extending to handle: dist={dist:.3f}m, "
