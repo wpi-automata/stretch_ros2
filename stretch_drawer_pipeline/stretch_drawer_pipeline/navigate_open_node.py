@@ -821,7 +821,8 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        calc_ext = dist - gripper_offset
+        grasp_pullback = 0.05
+        calc_ext = dist - gripper_offset - grasp_pullback
         self.get_logger().info(
             f"Extend calc: mast=({mast_pose[0]:.3f},{mast_pose[1]:.3f}), "
             f"gripper=({gripper_pos[0]:.3f},{gripper_pos[1]:.3f}), "
