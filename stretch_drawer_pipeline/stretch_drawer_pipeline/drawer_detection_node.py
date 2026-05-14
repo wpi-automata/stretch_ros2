@@ -1059,6 +1059,9 @@ class DrawerDetectionNode(Node):
         convex hull, and checks which detection bboxes are fully contained
         within it. No depth needed for the containment check.
         """
+        self.get_logger().info(
+            f"Items scan starting for {drawer_id}, image={rgb.shape[1]}x{rgb.shape[0]}"
+        )
         interacted = self.interacted_drawers.get(drawer_id)
         if not interacted:
             self.drawer_items[drawer_id] = []
@@ -1100,12 +1103,46 @@ class DrawerDetectionNode(Node):
         extruded_pts = pts + normal * pull_distance
         all_corners_3d = np.vstack([pts, extruded_pts])
 
+        self.get_logger().info(
+            f"Items scan 3D corners (closed): "
+            + ", ".join(f"({p[0]:.3f},{p[1]:.3f},{p[2]:.3f})" for p in pts)
+        )
+        self.get_logger().info(
+            f"Items scan 3D corners (extruded): "
+            + ", ".join(f"({p[0]:.3f},{p[1]:.3f},{p[2]:.3f})" for p in extruded_pts)
+        )
+        self.get_logger().info(
+            f"Items scan normal=({normal[0]:.3f},{normal[1]:.3f},{normal[2]:.3f}), "
+            f"pull_dist={pull_distance:.3f}"
+        )
+        self.get_logger().info(
+            f"Items scan camera_pos=({camera_pose[0,3]:.3f},{camera_pose[1,3]:.3f},{camera_pose[2,3]:.3f})"
+        )
+        if ch:
+            handle_px = self._world_to_pixels(handle_pos.reshape(1, 3), camera_pose, camera_K)
+            if handle_px is not None:
+                self.get_logger().info(
+                    f"Items scan handle projects to pixel ({handle_px[0,0]:.0f},{handle_px[0,1]:.0f})"
+                )
+            else:
+                self.get_logger().info("Items scan handle behind camera")
+
         volume_pixels = self._world_to_pixels(all_corners_3d, camera_pose, camera_K)
         if volume_pixels is None:
+            self.get_logger().info("Items scan: _world_to_pixels returned None (points behind camera)")
             self.drawer_items[drawer_id] = []
             if not self.keep_drawers_open:
                 self._send_close_drawer_command(drawer_id)
             return
+
+        self.get_logger().info(
+            f"Items scan projected pixels (closed): "
+            + ", ".join(f"({volume_pixels[i,0]:.0f},{volume_pixels[i,1]:.0f})" for i in range(4))
+        )
+        self.get_logger().info(
+            f"Items scan projected pixels (extruded): "
+            + ", ".join(f"({volume_pixels[i,0]:.0f},{volume_pixels[i,1]:.0f})" for i in range(4, 8))
+        )
 
         hull = cv2.convexHull(volume_pixels.astype(np.float32))
 
@@ -1114,6 +1151,22 @@ class DrawerDetectionNode(Node):
             f"hull has {len(hull)} pts, "
             f"normal=({normal[0]:.3f},{normal[1]:.3f},{normal[2]:.3f})"
         )
+
+        for det in all_detections:
+            if det.object_type in self._drawer_classes:
+                world_pos = self._project_to_world(det.bbox, depth, camera_pose, camera_K)
+                if world_pos is not None:
+                    rt_px = self._world_to_pixels(world_pos.reshape(1, 3), camera_pose, camera_K)
+                    if rt_px is not None:
+                        cx_det = (det.bbox[0] + det.bbox[2]) / 2
+                        cy_det = (det.bbox[1] + det.bbox[3]) / 2
+                        self.get_logger().info(
+                            f"Round-trip test '{det.object_type}': "
+                            f"original=({cx_det:.0f},{cy_det:.0f}) → "
+                            f"world=({world_pos[0]:.3f},{world_pos[1]:.3f},{world_pos[2]:.3f}) → "
+                            f"pixel=({rt_px[0,0]:.0f},{rt_px[0,1]:.0f})"
+                        )
+                break
 
         items = []
         for det in all_detections:

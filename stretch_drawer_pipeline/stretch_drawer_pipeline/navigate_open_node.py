@@ -411,9 +411,9 @@ class NavigateOpenNode(Node):
         if items:
             labels = [i["label"] for i in items]
             unique = list(dict.fromkeys(labels))
-            self._speak(f"I found {', '.join(unique)} in the drawer")
+            self._speak(f"I found {', '.join(unique)} in the drawer. Closing the drawer now.")
         else:
-            self._speak("The drawer is empty")
+            self._speak("The drawer is empty. Closing the drawer now.")
 
         if not handle_pos_d or pull_distance <= 0:
             self.get_logger().warn(
@@ -448,8 +448,10 @@ class NavigateOpenNode(Node):
             self._retract_arm()
 
             self.get_logger().info(f"Drawer {drawer_id} closed successfully")
+            self._speak("Done. The drawer is closed.")
         except Exception as e:
             self.get_logger().error(f"Close drawer failed: {e}")
+            self._speak("I had trouble closing the drawer.")
         finally:
             self._switch_to_navigation_mode()
 
@@ -821,7 +823,7 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        grasp_pullback = 0.05
+        grasp_pullback = 0.1
         calc_ext = dist - gripper_offset - grasp_pullback
         self.get_logger().info(
             f"Extend calc: mast=({mast_pose[0]:.3f},{mast_pose[1]:.3f}), "
