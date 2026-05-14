@@ -406,7 +406,6 @@ class NavigateOpenNode(Node):
         drawer_id = data.get("drawer_id", "?")
         pull_distance = data.get("pull_distance", 0.0)
         handle_pos_d = data.get("opened_handle")
-        orientation = data.get("handle_orientation", "horizontal")
         items = data.get("items", [])
 
         if items:
@@ -431,9 +430,6 @@ class NavigateOpenNode(Node):
                 return
             time.sleep(0.5)
 
-            self._open_gripper()
-            time.sleep(0.5)
-            self._orient_gripper_toward(handle_pos, orientation)
             self._extend_to_point(handle_pos)
 
             self._close_gripper()
