@@ -297,13 +297,10 @@ class NavigateOpenNode(Node):
             # Record opened handle position (gripper is at the handle)
             opened_handle_pos = self._get_gripper_world_pos()
 
-            # Step 11: Release
+            # Step 11: Release (arm stays at handle for close)
             self._set_state(OpenState.RELEASING)
             self._open_gripper()
             time.sleep(0.5)
-
-            # Retract arm
-            self._retract_arm()
 
             # Step 12: Look at the opened drawer
             self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
@@ -429,8 +426,6 @@ class NavigateOpenNode(Node):
                 self.get_logger().error("Cannot switch to position mode for close")
                 return
             time.sleep(0.5)
-
-            self._extend_to_point(handle_pos)
 
             self._close_gripper()
             time.sleep(1.0)
@@ -734,7 +729,8 @@ class NavigateOpenNode(Node):
         real robot publishes wrist_extension directly.
         """
         if self.current_joint_state is None:
-            return 0.3
+            self.get_logger().warn("No joint_state received yet, assuming extension=0")
+            return 0.0
 
         names = list(self.current_joint_state.name)
         positions = list(self.current_joint_state.position)
@@ -751,7 +747,8 @@ class NavigateOpenNode(Node):
         if total > 0:
             return total
 
-        return 0.3
+        self.get_logger().warn("wrist_extension not found in joint_state, assuming 0")
+        return 0.0
 
     def _retract_arm(self):
         """Fully retract the arm after releasing."""
@@ -787,11 +784,12 @@ class NavigateOpenNode(Node):
         self._send_joint_command("joint_wrist_roll", roll)
         time.sleep(1.0)
 
-    def _extend_to_point(self, target_world: np.ndarray):
-        """Extend arm so the gripper tip reaches target_world.
+    def _extend_to_point(self, target_world: np.ndarray, pullback: float = 0.03):
+        """Extend arm so the gripper reaches target_world.
 
         Computes the required extension from the robot base to the
         target point and also sets the lift to match the target Z.
+        pullback: how far short of the target to stop (meters).
         """
         # Set lift to target Z with gripper offset compensation
         gripper_z = self._get_gripper_z()
@@ -823,8 +821,7 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        grasp_pullback = 0.1
-        calc_ext = dist - gripper_offset - grasp_pullback
+        calc_ext = dist - gripper_offset - pullback
         self.get_logger().info(
             f"Extend calc: mast=({mast_pose[0]:.3f},{mast_pose[1]:.3f}), "
             f"gripper=({gripper_pos[0]:.3f},{gripper_pos[1]:.3f}), "
