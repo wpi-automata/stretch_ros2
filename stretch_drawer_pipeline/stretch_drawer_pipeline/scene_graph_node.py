@@ -116,7 +116,7 @@ class SceneGraphNode(Node):
             MarkerArray, "/scene_graph/markers", 10
         )
 
-        # Image transport
+        # Image transport: rosbridge WebSocket (real) or DDS (sim)
         self._robot_ip = self.get_parameter("robot_ip").value
         if self._robot_ip:
             self._setup_rosbridge_images()
@@ -124,6 +124,7 @@ class SceneGraphNode(Node):
             self._setup_dds_images()
 
         # Subscribe to exploration status
+        # DDS always (works in sim); rosbridge added in _setup_rosbridge_images
         self.create_subscription(
             String, "/exploration_status",
             self._exploration_status_callback, 10,
@@ -209,9 +210,15 @@ class SceneGraphNode(Node):
             "sensor_msgs/msg/CameraInfo",
         )
 
+        self._exploration_status_topic = roslibpy.Topic(
+            self._ros_client, "/exploration_status",
+            "std_msgs/msg/String",
+        )
+
         self._rgb_topic.subscribe(self._rgb_ws_callback)
         self._depth_topic.subscribe(self._depth_ws_callback)
         self._camera_info_topic.subscribe(self._camera_info_ws_callback)
+        self._exploration_status_topic.subscribe(self._exploration_status_ws_callback)
 
         # TF: rely on Node 2 republishing TF locally from rosbridge.
         # We just need a TF listener on the local ROS2 network.
@@ -283,13 +290,17 @@ class SceneGraphNode(Node):
         try:
             raw = base64.b64decode(msg["data"])
             arr = np.frombuffer(raw, dtype=np.uint8)
-            depth = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-            if depth is not None:
-                if not self.use_sim:
-                    depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
-                self.latest_depth = depth.astype(np.float32)
-                if self.latest_depth.max() > 100:
-                    self.latest_depth /= 1000.0
+            # compressedDepth has a 12-byte header before the PNG data
+            depth = cv2.imdecode(arr[12:], cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                depth = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                return
+            if not self.use_sim:
+                depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
+            self.latest_depth = depth.astype(np.float32)
+            if self.latest_depth.max() > 100:
+                self.latest_depth /= 1000.0
         except Exception as e:
             self.get_logger().warn(f"WS depth error: {e}", throttle_duration_sec=5.0)
 
@@ -312,7 +323,13 @@ class SceneGraphNode(Node):
     # ── Exploration status ───────────────────────────────────────────
 
     def _exploration_status_callback(self, msg: String):
-        if msg.data == "paused_for_detection":
+        self._handle_exploration_status(msg.data)
+
+    def _exploration_status_ws_callback(self, msg):
+        self._handle_exploration_status(msg.get("data", ""))
+
+    def _handle_exploration_status(self, status: str):
+        if status == "paused_for_detection":
             if not self._detecting:
                 self._detecting = True
                 threading.Thread(
@@ -408,8 +425,18 @@ class SceneGraphNode(Node):
         if not self._ensure_models_loaded():
             return
 
+        # Wait up to 3s for images to arrive
+        import time as _time
+        for _ in range(30):
+            if self.latest_rgb is not None and self.latest_depth is not None:
+                break
+            _time.sleep(0.1)
+
         if self.latest_rgb is None or self.latest_depth is None:
-            self.get_logger().debug("No camera data yet — skipping frame")
+            self.get_logger().warn(
+                f"No camera data (rgb={'yes' if self.latest_rgb is not None else 'NO'}, "
+                f"depth={'yes' if self.latest_depth is not None else 'NO'}) — skipping"
+            )
             return
 
         camera_frame = "camera_color_optical_frame"
