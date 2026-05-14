@@ -689,9 +689,8 @@ class NavigateOpenNode(Node):
         self._send_joint_command("wrist_extension", target, duration_sec=4)
         time.sleep(1.0)
         wrist_pulled = start_extension - target
-        fingertip_length = 0.08
-        pulled = wrist_pulled + fingertip_length
-        self.get_logger().info(f"Pulled {pulled:.3f}m (wrist {wrist_pulled:.3f} + fingertip {fingertip_length})")
+        pulled = wrist_pulled
+        self.get_logger().info(f"Pulled {pulled:.3f}m (wrist {wrist_pulled:.3f})")
         return wrist_pulled > 0.05, pulled
 
     def _pull_drawer_real(self) -> tuple[bool, float]:
@@ -699,7 +698,6 @@ class NavigateOpenNode(Node):
         start_extension = self._get_current_extension()
         target_extension = max(0.0, start_extension - self.max_pull_distance)
         current = start_extension
-        fingertip_length = 0.08
 
         while current > target_extension and not self.stop_requested:
             current -= self.pull_speed
@@ -710,16 +708,16 @@ class NavigateOpenNode(Node):
             effort = abs(self.current_effort.get("wrist_extension", 0.0))
             if effort > self.pull_force_threshold:
                 wrist_pulled = start_extension - current
-                pulled_distance = wrist_pulled + fingertip_length
+                pulled_distance = wrist_pulled
                 self.get_logger().info(
                     f"Pull force threshold reached: {effort:.1f}N > {self.pull_force_threshold}N, "
-                    f"pulled {pulled_distance:.3f}m (wrist {wrist_pulled:.3f} + fingertip {fingertip_length})"
+                    f"pulled {pulled_distance:.3f}m (wrist {wrist_pulled:.3f})"
                 )
                 return True, pulled_distance
 
         wrist_pulled = start_extension - current
-        pulled_distance = wrist_pulled + fingertip_length
-        self.get_logger().info(f"Pulled {pulled_distance:.3f}m (wrist {wrist_pulled:.3f} + fingertip {fingertip_length})")
+        pulled_distance = wrist_pulled
+        self.get_logger().info(f"Pulled {pulled_distance:.3f}m (wrist {wrist_pulled:.3f})")
         return wrist_pulled > 0.05, pulled_distance
 
     def _get_current_extension(self) -> float:
@@ -784,7 +782,7 @@ class NavigateOpenNode(Node):
         self._send_joint_command("joint_wrist_roll", roll)
         time.sleep(1.0)
 
-    def _extend_to_point(self, target_world: np.ndarray, pullback: float = 0.03):
+    def _extend_to_point(self, target_world: np.ndarray, pullback: float = 0.00):
         """Extend arm so the gripper reaches target_world.
 
         Computes the required extension from the robot base to the
