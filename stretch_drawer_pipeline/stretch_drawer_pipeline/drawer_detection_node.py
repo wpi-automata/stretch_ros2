@@ -117,6 +117,7 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("remote_camera_info_topic", "/camera/color/camera_info")
         self.declare_parameter("throttle_rate_ms", 2000)
         self.declare_parameter("keep_drawers_open", True)
+        self.declare_parameter("gnn_match_threshold", 0.5)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -129,6 +130,7 @@ class DrawerDetectionNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.detection_rate = self.get_parameter("detection_rate_hz").value
         self.keep_drawers_open = self.get_parameter("keep_drawers_open").value
+        self.gnn_match_threshold = self.get_parameter("gnn_match_threshold").value
 
         params = {p.name: p.value for p in self.get_parameters(
             [d.name for d in self._parameters.values()]
@@ -239,6 +241,21 @@ class DrawerDetectionNode(Node):
             self.choose_drawer_callback,
             callback_group=self.cb_group,
         )
+
+        # GNN ranking service (called by scene_graph_node)
+        try:
+            from stretch_drawer_pipeline.srv import SetRankings
+            self.create_service(
+                SetRankings, "/detection/set_rankings",
+                self._set_rankings_callback,
+                callback_group=self.cb_group,
+            )
+            self.get_logger().info("SetRankings service registered")
+        except ImportError:
+            self.get_logger().warn(
+                "SetRankings srv not built yet — "
+                "run colcon build to enable GNN ranking"
+            )
 
         # Detection timer
         period = 1.0 / self.detection_rate
@@ -590,7 +607,7 @@ class DrawerDetectionNode(Node):
         self.camera_K = K
 
     def exploration_status_callback(self, msg: String):
-        self.exploring = msg.data in ("rotating", "planning", "navigating")
+        self.exploring = msg.data == "paused_for_detection"
 
     def _opened_drawers_json_callback(self, msg: String):
         """Handle opened drawer notification from Node 3.
@@ -653,8 +670,9 @@ class DrawerDetectionNode(Node):
             # return None
 
     def trigger_detection_callback(self, request, response):
-        """Manually trigger a detection pass."""
+        """Trigger one detection pass, then disable continuous detection."""
         count = self._run_detection()
+        self.exploring = False
         response.success = True
         response.message = f"Detected {count} total drawers"
         return response
@@ -885,9 +903,8 @@ class DrawerDetectionNode(Node):
         # Update distances to robot
         self._update_distances()
 
-        # Optionally rank via LOCUS GNN
-        if self.rank_via_locus:
-            self._rank_via_locus_stub()
+        # GNN rankings are applied externally via /detection/set_rankings
+        # (called by scene_graph_node after exploration completes)
 
         self._save_debug_image(rgb, all_detections, drawer_bboxes)
 
@@ -1632,36 +1649,102 @@ class DrawerDetectionNode(Node):
                     dy = d.handle_center_world[1] - robot_y
                     d.distance_to_robot = math.sqrt(dx * dx + dy * dy)
 
-    # ─── LOCUS GNN ranking stub ───────────────────────────────────────
+    # ─── GNN ranking integration ────────────────────────────────────
 
-    def _rank_via_locus_stub(self):
-        """Stub for calling the GNN node ranking logic.
+    def _set_rankings_callback(self, request, response):
+        """Receive GNN rankings from scene_graph_node and apply to drawers."""
+        try:
+            rankings = json.loads(request.rankings_json)
+        except json.JSONDecodeError as e:
+            response.success = False
+            response.message = f"Bad JSON: {e}"
+            return response
 
-        When implemented, this should call into
-        semantic-object-container-room/gnn/ with the following data:
-          - All drawer world positions (handle_center_world)
-          - CLIP embeddings of each drawer crop
-          - Scene graph context (room type, nearby objects)
-          - Spatial relationships between containers
-          - Room layout / voxel occupancy context
+        n_matched = self._apply_gnn_rankings(rankings)
+        response.success = True
+        response.message = (
+            f"Applied {n_matched} matches from {len(rankings)} GNN containers "
+            f"to {len(self.drawers)} drawers"
+        )
+        return response
 
-        The GNN would return a ranking score for each drawer based on
-        how likely it is to contain the target object.
+    def _apply_gnn_rankings(self, gnn_rankings: list) -> int:
+        """Match GNN container rankings to detected drawers by spatial proximity.
+
+        One GNN container can match multiple drawers (e.g. a dresser with
+        several drawer faces). Each drawer matches at most one GNN container
+        (the closest within threshold).
         """
-        # TODO: Implement GNN ranking via semantic-object-container-room
-        # Required data for container node ranking:
-        #   1. drawer CLIP embedding (from annotated_image crop)
-        #   2. drawer world position (handle_center_world)
-        #   3. nearby object types and positions (scene graph nodes)
-        #   4. room type string
-        #   5. spatial edges (distance-based) between all containers
-        #   6. text embedding of target query object
-        #
-        # Call: from realrobot.inference import score_containers
-        #       scores = score_containers(graph, query_embedding, model)
-        #       for drawer, score in zip(self.drawers, scores):
-        #           drawer.ranking = score
-        pass
+        threshold = self.gnn_match_threshold
+        n_matched = 0
+
+        with self.drawers_lock:
+            for drawer in self.drawers:
+                if drawer.handle_center_world is None:
+                    continue
+
+                drawer_pos = np.array(drawer.handle_center_world)
+                best_dist = float("inf")
+                best_score = 0.0
+                best_id = None
+
+                for r in gnn_rankings:
+                    ctype = r.get("container_type", "")
+                    if ctype and ctype not in self._drawer_classes:
+                        continue
+
+                    pos = r.get("position_3d")
+                    if pos is None:
+                        continue
+
+                    gnn_pos = np.array(pos[:3])
+                    dist = np.linalg.norm(gnn_pos - drawer_pos)
+                    if dist < threshold and dist < best_dist:
+                        best_dist = dist
+                        best_score = r.get("score", 0.0)
+                        best_id = r.get("instance_id", "?")
+
+                if best_id is not None:
+                    drawer.ranking = best_score
+                    n_matched += 1
+                    self.get_logger().info(
+                        f"Drawer {drawer.drawer_id} ← GNN {best_id} "
+                        f"(score={best_score:.3f}, dist={best_dist:.2f}m)"
+                    )
+
+            unmatched_drawers = [
+                d.drawer_id for d in self.drawers
+                if d.handle_center_world is not None and d.ranking == 0.0
+            ]
+            if unmatched_drawers:
+                self.get_logger().info(
+                    f"Unmatched drawers (ranking=0): {unmatched_drawers}"
+                )
+
+        matched_gnn_types = set()
+        for r in gnn_rankings:
+            pos = r.get("position_3d")
+            if pos is None:
+                continue
+            gnn_pos = np.array(pos[:3])
+            for d in self.drawers:
+                if d.handle_center_world is None:
+                    continue
+                if np.linalg.norm(np.array(d.handle_center_world) - gnn_pos) < threshold:
+                    matched_gnn_types.add(r.get("instance_id", "?"))
+                    break
+
+        unmatched_gnn = [
+            f"{r.get('container_type')}({r.get('instance_id','?')})"
+            for r in gnn_rankings
+            if r.get("instance_id", "?") not in matched_gnn_types
+        ]
+        if unmatched_gnn:
+            self.get_logger().info(
+                f"Unmatched GNN containers: {unmatched_gnn}"
+            )
+
+        return n_matched
 
     def _save_projection_debug(self, rgb, depth, drawer_bbox, handle_bbox):
         debug_dir = Path("/tmp/detic_debug")

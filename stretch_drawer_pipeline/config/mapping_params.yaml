@@ -6,3 +6,18 @@ mapping_node:
 
     # Environment
     use_sim: false
+
+exploration_node:
+  ros__parameters:
+    exploration_mode: "funmap"      # funmap | occupancy_grid | simple_explorer
+    exploration_timeout_s: 300.0
+    max_scan_drive_cycles: 20
+    use_sim: false
+
+    # simple_explorer mode
+    robot_ip: ""
+    n_positions: 4
+
+    # Scene graph context
+    room_type: "kitchen"
+    query: ""

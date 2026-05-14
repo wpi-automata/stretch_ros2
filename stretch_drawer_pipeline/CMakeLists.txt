@@ -12,6 +12,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DrawerList.msg"
   "srv/NavigateToDrawer.srv"
   "srv/TriggerDetection.srv"
+  "srv/SetRankings.srv"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 
@@ -20,6 +21,8 @@ install(PROGRAMS
   stretch_drawer_pipeline/mapping_node.py
   stretch_drawer_pipeline/drawer_detection_node.py
   stretch_drawer_pipeline/navigate_open_node.py
+  stretch_drawer_pipeline/exploration_node.py
+  stretch_drawer_pipeline/scene_graph_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

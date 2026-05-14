@@ -1,0 +1,6 @@
+# Push GNN container rankings to the detection node.
+# rankings_json: JSON array of {container_type, instance_id, score, position_3d}
+string rankings_json
+---
+bool success
+string message

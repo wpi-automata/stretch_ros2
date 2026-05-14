@@ -38,6 +38,7 @@ import threading
 import time
 from enum import Enum
 
+import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -45,7 +46,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Image as RosImage
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from control_msgs.action import FollowJointTrajectory
@@ -168,6 +169,13 @@ class NavigateOpenNode(Node):
             self._close_drawer_callback, 10
         )
 
+        # Camera image for open-verification
+        self.latest_rgb = None
+        self.create_subscription(
+            RosImage, "/camera/color/image_raw",
+            self._rgb_callback, 1,
+        )
+
         # Status timer
         self.create_timer(0.5, self.publish_status)
 
@@ -179,6 +187,13 @@ class NavigateOpenNode(Node):
 
     def _drawer_detections_callback(self, msg: String):
         pass
+
+    def _rgb_callback(self, msg: RosImage):
+        if msg.encoding == "rgb8":
+            self.latest_rgb = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        elif msg.encoding == "bgr8":
+            bgr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+            self.latest_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def _mode_callback(self, msg: String):
         if self._driver_mode != msg.data:
@@ -277,41 +292,60 @@ class NavigateOpenNode(Node):
                 self._set_state(OpenState.FAILED)
                 return
 
-            # Step 3: Open gripper, orient toward handle
-            self._open_gripper()
-            time.sleep(0.5)
-            self._orient_gripper_toward(handle_pos, orientation)
-
-            # Step 4: Extend arm to handle location
-            self._set_state(OpenState.GRASPING)
-            self._extend_to_point(handle_pos)
-
-            # Step 9: Close gripper
-            self._close_gripper()
+            # Capture image before any grasp attempt
+            self._look_at_drawer(handle_pos, corners)
             time.sleep(1.0)
+            initial_image = self._capture_drawer_image()
 
-            # Step 10: Pull drawer open
-            self._set_state(OpenState.PULLING)
-            pull_success, pull_distance = self._pull_drawer()
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                self.get_logger().info(f"Open attempt {attempt}/{max_attempts}")
 
-            # Record opened handle position (gripper is at the handle)
-            opened_handle_pos = self._get_gripper_world_pos()
+                # Open gripper, orient toward handle
+                self._open_gripper()
+                time.sleep(0.5)
+                self._orient_gripper_toward(handle_pos, orientation)
 
-            # Step 11: Release (arm stays at handle for close)
-            self._set_state(OpenState.RELEASING)
-            self._open_gripper()
-            time.sleep(0.5)
+                # Extend arm to handle location
+                self._set_state(OpenState.GRASPING)
+                self._extend_to_point(handle_pos)
 
-            # Step 12: Look at the opened drawer
-            self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
+                # Close gripper
+                self._close_gripper()
+                time.sleep(1.0)
 
-            if pull_success:
-                self._record_opened_drawer(drawer, handle_pos, opened_handle_pos, pull_distance)
-                self._set_state(OpenState.COMPLETE)
-                self.get_logger().info("Drawer opened successfully!")
+                # Pull drawer open
+                self._set_state(OpenState.PULLING)
+                pull_success, pull_distance = self._pull_drawer()
+
+                # Record opened handle position (gripper is at the handle)
+                opened_handle_pos = self._get_gripper_world_pos()
+
+                # Release (arm stays at handle for close)
+                self._set_state(OpenState.RELEASING)
+                self._open_gripper()
+                time.sleep(0.5)
+
+                # Look at the drawer and capture after image
+                self._look_at_drawer(handle_pos, corners)
+                time.sleep(1.0)
+                final_image = self._capture_drawer_image()
+
+                if self._drawer_changed(initial_image, final_image):
+                    self.get_logger().info(f"Drawer visually confirmed open on attempt {attempt}")
+                    self._record_opened_drawer(drawer, handle_pos, opened_handle_pos, pull_distance)
+                    self._set_state(OpenState.COMPLETE)
+                    self.get_logger().info("Drawer opened successfully!")
+                    break
+                else:
+                    self.get_logger().warn(
+                        f"Attempt {attempt}: drawer does not appear to have opened"
+                    )
+                    self._retract_arm()
             else:
+                self._speak("Unable to open drawer after three attempts.")
                 self._set_state(OpenState.FAILED)
-                self.get_logger().warn("Pull did not reach force threshold")
+                self.get_logger().error("Failed to open drawer after 3 attempts")
 
         except Exception as e:
             self.get_logger().error(f"Pipeline failed: {e}")
@@ -449,6 +483,37 @@ class NavigateOpenNode(Node):
             self._speak("I had trouble closing the drawer.")
         finally:
             self._switch_to_navigation_mode()
+
+    def _capture_drawer_image(self):
+        """Capture current camera frame."""
+        if self.latest_rgb is None:
+            self.get_logger().warn("No camera image available for drawer verification")
+            return None
+        return self.latest_rgb.copy()
+
+    def _drawer_changed(self, before, after):
+        """Return True if the drawer visually changed (opened).
+
+        Computes histogram correlation on HSV images. If similarity
+        is >= 0.90 the drawer looks the same (not opened).
+        """
+        if before is None or after is None:
+            return True
+        if before.shape[0] == 0 or after.shape[0] == 0:
+            return True
+
+        before_hsv = cv2.cvtColor(before, cv2.COLOR_RGB2HSV)
+        after_hsv = cv2.cvtColor(after, cv2.COLOR_RGB2HSV)
+
+        hist_before = cv2.calcHist([before_hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
+        hist_after = cv2.calcHist([after_hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
+
+        cv2.normalize(hist_before, hist_before)
+        cv2.normalize(hist_after, hist_after)
+
+        similarity = cv2.compareHist(hist_before, hist_after, cv2.HISTCMP_CORREL)
+        self.get_logger().info(f"Drawer open verification: similarity={similarity:.3f}")
+        return similarity < 0.90
 
     # ─── Navigation ───────────────────────────────────────────────────
 

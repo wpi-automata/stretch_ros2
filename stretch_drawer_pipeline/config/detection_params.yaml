@@ -18,8 +18,8 @@ drawer_detection_node:
     # Test mode: robot does a spiral pattern instead of relying on mapping node
     test_mode: false
 
-    # LOCUS GNN ranking (stub — not yet implemented)
-    rank_via_LOCUS: false
+    # GNN ranking match threshold (meters) for spatial matching
+    gnn_match_threshold: 0.5
 
     # Environment
     use_sim: false

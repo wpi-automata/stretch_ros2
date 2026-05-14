@@ -1,8 +1,8 @@
-# Node 2: Drawer Detection
+# Node 2: Drawer Detection (`drawer_detection_node.py`)
 
 ## Overview
 
-Continuously detects drawers in camera frames using Detic, localizes handles, projects to world coordinates, and maintains a de-duplicated global list. Drawers are visualized in RViz with reachability coloring.
+Detects drawers in camera frames using Detic, localizes handles, projects to world coordinates, and maintains a de-duplicated global list. Receives GNN rankings from Node 4 and applies them to drawers via spatial proximity matching.
 
 ## Parameters
 
@@ -10,76 +10,82 @@ Continuously detects drawers in camera frames using Detic, localizes handles, pr
 |-----------|---------|-------------|
 | `detection_confidence` | `0.5` | Min Detic score for drawer class |
 | `enable_dedup` | `true` | Enable de-duplication of nearby detections |
-| `dedup_distance_m` | `0.1` | Distance (m) to merge detections (when dedup enabled) |
+| `dedup_distance_m` | `0.1` | Distance (m) to merge detections |
 | `max_reach_height` | `1.4` | Max gripper Z (m above floor) |
 | `min_reach_height` | `0.1` | Min gripper Z (m above floor) |
 | `max_reach_distance` | `0.6` | Max arm extension (m) |
 | `detection_rate_hz` | `2.0` | How often to run detection |
 | `test_mode` | `false` | Process all frames (don't wait for exploration) |
-| `rank_via_LOCUS` | `false` | Enable GNN ranking stub |
+| `gnn_match_threshold` | `0.5` | Max distance (m) to match GNN container to drawer |
 | `use_sim` | `false` | Simulation mode |
 
 ## Detection Pipeline
 
-1. **Single-pass Detic detection**: Detic 21K vocabulary detects both drawer-class and handle-class objects in one pass on the full image
-2. **Handle-to-drawer association**: Each handle is matched to a drawer by checking if the handle bbox center falls within a drawer bbox; the highest-confidence match wins
-3. **Grasp point**: The center of the handle's bounding box
-4. **World Projection**: Handle center pixel → depth → camera-to-map TF → world XYZ; drawer corners also projected to world for visualization
-5. **Orientation**: Handle bbox aspect ratio determines horizontal vs vertical
-6. **Reachability**: Z-height check against Stretch3 workspace limits
-7. **De-duplication** (optional, off by default): New detection within `dedup_distance_m` of existing → merge (weighted average position). Enable with `enable_dedup: true`
+1. **Detic detection**: Single pass detects drawer-class and handle-class objects
+2. **Handle-to-drawer association**: Handle bbox center within drawer bbox
+3. **World projection**: Handle center pixel → depth → camera-to-odom TF → world XYZ
+4. **Orientation**: Handle bbox aspect ratio → horizontal or vertical
+5. **Reachability**: Z-height check against Stretch3 workspace limits
+6. **De-duplication**: New detection within `dedup_distance_m` of existing → merge
+
+## Detection Gating
+
+Detection does NOT run continuously. It is gated by the exploration node:
+
+- **`paused_for_detection`** state → `exploring=True` (timer can detect)
+- All other states → `exploring=False` (timer skips)
+- `/detection/trigger` service → runs one pass, then sets `exploring=False`
+- `test_mode=true` → bypasses gating, detects every frame
+
+This ensures detection only runs when the robot is stationary and the camera is stable.
+
+## GNN Ranking Integration
+
+Node 4 (scene_graph_node) pushes rankings via `/detection/set_rankings`. The matching algorithm:
+
+1. For each GNN container whose `container_type` is in the drawer class set:
+2. Find all Node 2 drawers within `gnn_match_threshold` (default 0.5m)
+3. Each drawer matches the closest GNN container within threshold
+4. One GNN container can match multiple drawers (e.g. dresser with several drawers)
+5. Unmatched drawers keep `ranking = 0.0`
+
+Drawer selection (`/detection/choose_drawer`) sorts by:
+```
+(-ranking, -confidence, distance_to_robot)
+```
 
 ## Output Format
 
 Each drawer contains:
 - `drawer_id`: Unique string identifier
-- `annotated_image`: RGB with bbox overlays
-- `handle_center_world`: {x, y, z} in map frame
-- `handle_grasp_world`: {x, y, z} grasp point (center of handle bbox)
-- `drawer_corners_world`: 4 corner points [{x, y, z}, ...] of the drawer bbox in world frame
+- `handle_center_world`: {x, y, z} in odom frame
+- `handle_grasp_world`: {x, y, z} grasp point
+- `drawer_corners_world`: 4 corner points for 3D visualization
 - `reachable`: boolean
 - `handle_orientation`: "horizontal" or "vertical"
-- `ranking`: float (0.0 if TBD)
+- `ranking`: float (GNN score, 0.0 if unmatched)
+- `confidence`: float (Detic detection score)
 - `distance_to_robot`: float meters
 
-## LOCUS GNN Ranking (Stub)
+## Sim vs Real
 
-When `--rank_via_LOCUS` is set, the node calls a stub that documents what data would be needed for the GNN ranking:
-- Drawer CLIP embeddings
-- Drawer world positions
-- Nearby object types/positions
-- Room type
-- Spatial edges between containers
-- Target query embedding
+| Aspect | Simulation | Real Robot |
+|--------|-----------|------------|
+| Image transport | DDS (raw topics) | rosbridge WebSocket (compressed) |
+| Image rotation | None (1280x720) | 90 CW → 720x1280 |
+| Camera K | Original D435i intrinsics | Rotated intrinsics (fx/fy swapped, cx/cy adjusted) |
+| TF source | Local TF buffer (DDS) | Rosbridge relay → local republish |
+| Runs on | Same machine as sim | GPU workstation (automata-3) |
 
-## RViz Visualization
+## Services
 
-- Green cube: Reachable drawer, sized to the drawer's world-frame bounding box
-- Red cube: Unreachable drawer, sized to the drawer's world-frame bounding box
-- Blue sphere: Handle grasp point (center of handle bbox)
-- White text labels: ID, reachability, orientation, distance
+| Service | Type | Description |
+|---------|------|-------------|
+| `/detection/trigger` | Trigger | Run one detection pass, then stop |
+| `/detection/get_drawers` | Trigger | Get drawer list as JSON |
+| `/detection/choose_drawer` | Trigger | Select best drawer by ranking |
+| `/detection/set_rankings` | SetRankings | Receive GNN rankings from Node 4 |
 
 ## Debug
 
-### Debug images
-
-Each detection pass saves an annotated image to `/tmp/detic_debug/`. The image shows:
-- All Detic detections in gray with class name and score labels
-- Matched drawer bounding boxes in blue
-- Matched handle bounding boxes in green
-- Red dot at the handle grasp point (center of handle bbox)
-
-This is useful for seeing what Detic is classifying objects as and whether handles are being matched to the correct drawers.
-
-### Verbose logging
-
-To see per-detection class names, scores, and bounding boxes in the console, launch with DEBUG log level:
-
-```bash
-ros2 launch stretch_drawer_pipeline test_navigate.launch.py use_sim:=true --log-level drawer_detection_node:=debug
-```
-
-At the default log level, the node prints:
-- A summary of each detection pass (total detections, drawer count, handle count)
-- Warnings when no handle is found inside a drawer bbox (fallback to center)
-- Info when a handle is successfully matched to a drawer
+Debug images are saved to `/tmp/detic_debug/` on each detection pass. All GNN matching decisions are logged with drawer IDs, GNN container IDs, distances, and scores.

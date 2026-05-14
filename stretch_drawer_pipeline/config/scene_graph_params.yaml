@@ -1,0 +1,9 @@
+scene_graph_node:
+  ros__parameters:
+    room_type: "kitchen"
+    query: "fork"
+    checkpoint: ""              # GNN checkpoint path (empty = default)
+    device: "cuda"
+    edge_cutoff: 0.9
+    det_min_score: 0.7
+    use_sim: false

@@ -1,134 +1,151 @@
 # Testing
 
-Each node can be tested independently. This document describes the test procedures.
+Each node can be tested independently. This document covers both simulation and real robot testing.
 
-## Prerequisites (Simulation)
+## Prerequisites
 
-All test launch files require the MuJoCo sim driver to be running **first** in a separate terminal:
+### Simulation
+
+All test launch files require the MuJoCo sim driver running first:
 
 ```bash
-ros2 launch stretch_simulation stretch_mujoco_driver.launch.py use_cameras:=true use_rviz:=false mode:=navigation
+ros2 launch stretch_simulation stretch_mujoco_driver.launch.py \
+  use_cameras:=true use_rviz:=false mode:=navigation
 ```
 
-Wait for the sim to finish loading before launching any test below.
+Always pass `use_sim:=true` when running against MuJoCo.
 
-All pipeline launch files accept `use_sim:=true` which enables both `use_sim` (sim-specific behavior) and `use_sim_time` (ROS sim clock). Always pass `use_sim:=true` when running against the MuJoCo sim. Omit it or set `use_sim:=false` for real hardware.
+### Real Robot
 
-If you need to kill stale processes between runs:
+Ensure the Stretch driver and rosbridge are running on the robot:
+```bash
+# On robot:
+ros2 launch stretch_core stretch_driver.launch.py
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+```
+
+For simple_explorer mode, also start the ZMQ server:
+```bash
+python -m stretch.app.zmq_server
+```
+
+### Cleanup
+
 ```bash
 ~/ament_ws/scripts/kill_ros.sh
 ```
 
 ---
 
-## Node 1: Mapping and Exploration
+## Node 1: Exploration
 
-**Goal**: Verify the robot can autonomously map a room until no frontiers remain.
+**Goal**: Verify the robot explores and pauses for detection at each scan point.
 
-### Launch
+### Simulation (funmap mode)
 ```bash
-ros2 launch stretch_drawer_pipeline test_mapping.launch.py use_sim:=true
+ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py use_sim:=true
+ros2 service call /mapping/start std_srvs/srv/Trigger
+ros2 topic echo /exploration_status
 ```
 
-### Procedure
-1. Start the mapping service:
-   ```bash
-   ros2 service call /mapping/start std_srvs/srv/Trigger
-   ```
-2. Open RViz and add:
-   - `/map` (OccupancyGrid display)
-   - `/voxel_markers` (MarkerArray)
-   - TF display
-3. Observe the robot rotating and navigating to frontiers
-4. Monitor status:
-   ```bash
-   ros2 topic echo /exploration_status
-   ```
-5. The node reports `complete` when no more frontiers exist
+### Real Robot (simple_explorer mode)
+```bash
+ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py \
+  exploration_mode:=simple_explorer
+ros2 service call /mapping/start std_srvs/srv/Trigger
+```
 
 ### Success Criteria
-- Occupancy grid fills in over time
-- Robot visits multiple positions in the room
-- Exploration terminates when the room is fully covered
-- No collisions during exploration
-
-### Testing frontier_method parameter
-```bash
-# Test with voxel-based frontiers
-ros2 launch stretch_drawer_pipeline test_mapping.launch.py frontier_method:=voxel
-```
+- Status cycles through: `scanning` → `paused_for_detection` → `driving` → repeat
+- Robot visits multiple positions
+- Ends with `complete`
+- Node 2 logs one detection pass per `paused_for_detection` event
 
 ---
 
 ## Node 2: Drawer Detection
 
-**Goal**: Verify drawers are detected and displayed correctly in RViz.
+**Goal**: Verify drawers are detected and markers appear in RViz.
 
-### Launch (Test Mode)
+### Launch (test mode — detects every frame, no exploration needed)
 ```bash
+# Sim:
 ros2 launch stretch_drawer_pipeline test_detection.launch.py use_sim:=true
+# Real:
+ros2 launch stretch_drawer_pipeline test_detection.launch.py
 ```
 
-In test mode, the detection node processes every incoming frame (no need for the mapping node to be running). The user drives the robot manually.
-
 ### Procedure
-1. Open RViz and add:
-   - `/drawer_markers` (MarkerArray)
-   - `/camera/color/image_raw` (Image display)
-2. Drive the robot around using RViz "2D Goal Pose" or teleop:
-   ```bash
-   ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/stretch/cmd_vel
-   ```
-3. As drawers come into view, green/red markers appear in RViz
-4. Verify detected drawers:
+1. Open RViz, add `/drawer_markers` (MarkerArray)
+2. Drive robot to face drawers
+3. Check detections:
    ```bash
    ros2 service call /detection/get_drawers std_srvs/srv/Trigger
    ```
 
 ### Success Criteria
-- Drawers visible in the camera produce markers in RViz
-- Green markers = reachable, Red markers = unreachable (too high/low)
-- No duplicate markers for the same physical drawer
-- Handle orientation (H/V) labels are correct
+- Green markers = reachable, red = unreachable
+- No duplicates for the same physical drawer
+- Handle orientation labels correct
 
 ---
 
-## Node 3: Navigate and Open (Quick Test)
+## Node 4: Scene Graph
 
-**Goal**: Verify the robot can navigate to a detected drawer and open it.
+**Goal**: Verify scene detections accumulate and GNN scoring works.
+
+### Standalone test
+```bash
+# Launch scene graph node alone (needs camera topics):
+ros2 run stretch_drawer_pipeline scene_graph_node.py \
+  --ros-args -p use_sim:=true -p room_type:=kitchen -p query:=fork
+```
+
+### With exploration
+```bash
+ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py use_sim:=true
+ros2 service call /mapping/start std_srvs/srv/Trigger
+# Wait for exploration to complete, then check rankings:
+ros2 service call /scene_graph/get_rankings std_srvs/srv/Trigger
+```
+
+### Manual scoring trigger
+```bash
+ros2 service call /scene_graph/score_now std_srvs/srv/Trigger
+```
+
+### Success Criteria
+- Node logs detection counts per frame ("Frame N: X dets, Y added")
+- `build_and_rank` returns success with top-ranked container
+- `/detection/set_rankings` is called and Node 2 logs match results
+
+---
+
+## Node 3: Navigate and Open
+
+**Goal**: Verify the robot navigates to a drawer and opens it.
 
 ### Launch
 ```bash
 ros2 launch stretch_drawer_pipeline test_navigate.launch.py use_sim:=true
 ```
 
-This launches both the detection node (test mode) and the navigate node.
-
 ### Procedure
-1. Drive the robot around the room using RViz goal poses
-2. Wait until drawer markers appear (detection node is running)
-3. Trigger navigation:
+1. Drive robot near drawers, wait for drawer markers
+2. Trigger:
    ```bash
    ros2 service call /navigate_open/execute std_srvs/srv/Trigger
    ```
-4. Monitor:
+3. Monitor:
    ```bash
    ros2 topic echo /navigate_open/status
    ```
-5. Observe in RViz:
-   - Pink marker appears on the target drawer
-   - Green path line shows planned route
-   - Robot navigates, aligns, extends arm, grasps, pulls
 
 ### Success Criteria
-- Robot navigates to within 1m of the drawer
-- Robot rotates to face the drawer with its arm side
-- Arm extends and makes contact with the handle
-- Gripper closes on the handle
-- Robot pulls back and drawer opens
-- Robot releases and retracts arm
+- Robot navigates to drawer, aligns, extends arm, grasps, pulls
+- Sim: fixed distance pull. Real: force-feedback pull
 
-### Monitoring Force Feedback
+### Force feedback (real robot)
 ```bash
 ros2 topic echo /joint_states --field effort
 ```
@@ -137,15 +154,38 @@ ros2 topic echo /joint_states --field effort
 
 ## Full Integration Test
 
-Run all three nodes together:
+### Simulation
 ```bash
-ros2 launch stretch_drawer_pipeline pipeline_sim.launch.py
-ros2 service call /mapping/start std_srvs/srv/Trigger
-```
+ros2 launch stretch_simulation stretch_mujoco_driver.launch.py \
+  use_cameras:=true use_rviz:=false mode:=navigation
 
-Wait for mapping to complete, then:
-```bash
+ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py use_sim:=true
+ros2 service call /mapping/start std_srvs/srv/Trigger
+
+# Wait for exploration to complete, then:
 ros2 service call /navigate_open/execute std_srvs/srv/Trigger
 ```
 
-Or trigger manually during exploration for faster iteration.
+### Real Robot
+```bash
+# On robot:
+ros2 launch stretch_core stretch_driver.launch.py
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+
+# On automata-3:
+ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py
+ros2 service call /mapping/start std_srvs/srv/Trigger
+
+# Wait for exploration, then:
+ros2 service call /detection/choose_drawer std_srvs/srv/Trigger
+ros2 service call /navigate_open/execute std_srvs/srv/Trigger
+```
+
+### What to Watch
+
+1. **Exploration**: `/exploration_status` transitions (idle → scanning → paused → driving → complete)
+2. **Detection**: Node 2 logs "Detection pass: N new" at each pause point
+3. **Scene Graph**: Node 4 logs "Frame N: X dets, Y added" at each pause point
+4. **GNN Scoring**: Node 4 logs "Top ranked: ContainerType (score=X.XXX)"
+5. **Ranking Match**: Node 2 logs "Drawer ABC ← GNN XYZ (score=..., dist=...)"
+6. **Navigation**: `/navigate_open/status` transitions through the state machine
