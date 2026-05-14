@@ -335,8 +335,18 @@ class SceneGraphNode(Node):
                 threading.Thread(
                     target=self._process_current_frame, daemon=True
                 ).start()
+        elif status == "complete":
+            self._detecting = False
+            self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
+            threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
         else:
             self._detecting = False
+
+    def _auto_build_and_rank(self):
+        """Auto-triggered when exploration completes. Runs GNN and pushes rankings."""
+        ranking = self._run_scoring()
+        if ranking:
+            self._push_rankings_to_node2(ranking)
 
     # ── Lazy model loading ───────────────────────────────────────────
 
