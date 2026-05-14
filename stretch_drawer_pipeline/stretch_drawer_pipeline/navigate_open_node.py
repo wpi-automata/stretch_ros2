@@ -782,12 +782,12 @@ class NavigateOpenNode(Node):
         self._send_joint_command("joint_wrist_roll", roll)
         time.sleep(1.0)
 
-    def _extend_to_point(self, target_world: np.ndarray, pullback: float = 0.00):
+    def _extend_to_point(self, target_world: np.ndarray, forward_push: float = 0.03):
         """Extend arm so the gripper reaches target_world.
 
         Computes the required extension from the robot base to the
         target point and also sets the lift to match the target Z.
-        pullback: how far short of the target to stop (meters).
+        forward_push: how much further the target to stop (meters).
         """
         # Set lift to target Z with gripper offset compensation
         gripper_z = self._get_gripper_z()
@@ -819,7 +819,7 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        calc_ext = dist - gripper_offset - pullback
+        calc_ext = dist - gripper_offset + forward_push
         self.get_logger().info(
             f"Extend calc: mast=({mast_pose[0]:.3f},{mast_pose[1]:.3f}), "
             f"gripper=({gripper_pos[0]:.3f},{gripper_pos[1]:.3f}), "
