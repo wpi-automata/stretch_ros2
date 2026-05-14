@@ -84,6 +84,8 @@ class ExplorationNode(Node):
         self.mapping_complete = False
         self.stop_requested = False
         self.exploration_thread = None
+        self._detection_available = False
+        self._scene_graph_available = False
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -193,6 +195,20 @@ class ExplorationNode(Node):
         mode = self.exploration_mode
         self.get_logger().info(f"Exploration loop started (mode={mode})")
 
+        self._detection_available = self.detection_trigger_client.wait_for_service(
+            timeout_sec=5.0
+        )
+        if self._detection_available:
+            self.get_logger().info("/detection/trigger available")
+        else:
+            self.get_logger().warn(
+                "/detection/trigger not available — will explore without detection"
+            )
+
+        self._scene_graph_available = self.scene_graph_client.wait_for_service(
+            timeout_sec=2.0
+        )
+
         if mode == "funmap":
             self._run_funmap_loop()
         elif mode == "occupancy_grid":
@@ -208,8 +224,8 @@ class ExplorationNode(Node):
 
     def _on_exploration_complete(self):
         """Called when any exploration mode finishes."""
-        self.get_logger().info("Exploration finished — requesting scene graph build")
-        if self.scene_graph_client.wait_for_service(timeout_sec=5.0):
+        if self._scene_graph_available:
+            self.get_logger().info("Exploration finished — requesting scene graph build")
             result = self._call_trigger_service(self.scene_graph_client)
             if result and result.success:
                 self.get_logger().info(f"Scene graph built: {result.message}")
@@ -217,9 +233,7 @@ class ExplorationNode(Node):
                 msg = result.message if result else "service call failed"
                 self.get_logger().warn(f"Scene graph build returned: {msg}")
         else:
-            self.get_logger().warn(
-                "/scene_graph/build_and_rank not available — skipping GNN ranking"
-            )
+            self.get_logger().info("Exploration finished (no scene graph node running)")
 
         self._set_state(ExplorationState.COMPLETE)
         self.mapping_complete = True
@@ -230,8 +244,7 @@ class ExplorationNode(Node):
         """Pause, trigger one detection pass on Node 2, then return."""
         self._set_state(ExplorationState.PAUSED_FOR_DETECTION)
 
-        if not self.detection_trigger_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn("/detection/trigger not available — skipping")
+        if not self._detection_available:
             return
 
         result = self._call_trigger_service(self.detection_trigger_client)
