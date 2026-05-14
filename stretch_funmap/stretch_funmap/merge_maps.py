@@ -52,6 +52,9 @@ def register_images(max_height_image_to_warp, max_height_image_target, image_to_
     
     # Estimate the upper bound with the image to warp, since it will usually be a smaller local scan.
     match_score_upper_bound = np.sum(image_to_warp)
+    if match_score_upper_bound == 0:
+        print('WARNING: image_to_warp is all zeros — head scan produced an empty height image')
+        match_score_upper_bound = 1.0
 
     image_to_warp_center = np.array(image_to_warp_center)
 
