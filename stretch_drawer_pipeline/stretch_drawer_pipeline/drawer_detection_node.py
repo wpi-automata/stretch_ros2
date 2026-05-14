@@ -877,7 +877,7 @@ class DrawerDetectionNode(Node):
         if self._pending_items_scan:
             scan_id = self._pending_items_scan
             self._pending_items_scan = None
-            self._scan_drawer_items(scan_id, all_detections, depth, camera_pose, camera_K)
+            self._scan_drawer_items(scan_id, all_detections, rgb, depth, camera_pose, camera_K)
 
         # Update distances to robot
         self._update_distances()
@@ -1052,7 +1052,7 @@ class DrawerDetectionNode(Node):
             f"{len(self.drawers)} closed | {len(self.interacted_drawers)} opened."
         )
 
-    def _scan_drawer_items(self, drawer_id, all_detections, depth, camera_pose, camera_K):
+    def _scan_drawer_items(self, drawer_id, all_detections, rgb, depth, camera_pose, camera_K):
         """Detect objects inside an opened drawer using 3D volume check.
 
         Uses the stored closed drawer bbox (4 corners) extruded outward
@@ -1106,12 +1106,32 @@ class DrawerDetectionNode(Node):
             f"bbox_max=({bbox_max[0]:.3f},{bbox_max[1]:.3f},{bbox_max[2]:.3f})"
         )
 
+        # Save raw data for offline debugging
+        debug_dir = Path("/tmp/detic_debug")
+        debug_dir.mkdir(exist_ok=True)
+        stamp = int(time.time() * 1000) % 1000000
+        np.savez(
+            str(debug_dir / f"items_raw_{drawer_id}_{stamp}.npz"),
+            depth=depth, camera_pose=camera_pose, camera_K=camera_K,
+            bbox_min=bbox_min, bbox_max=bbox_max,
+            closed_corners=pts, normal=normal, pull_distance=pull_distance,
+        )
+        cv2.imwrite(
+            str(debug_dir / f"items_rgb_{drawer_id}_{stamp}.jpg"),
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+        )
+
         items = []
+        depth_m = self._depth_to_meters(depth)
         for det in all_detections:
             if det.object_type in self._drawer_classes or det.object_type in self._handle_classes:
                 continue
-            world_pos = self._project_to_world(det.bbox, depth, camera_pose, camera_K)
+            world_pos = self._project_to_world_wide(det.bbox, depth_m, camera_pose, camera_K)
             if world_pos is None:
+                self.get_logger().info(
+                    f"  item skipped (no depth): {det.object_type} ({det.score:.2f}) "
+                    f"bbox={det.bbox}"
+                )
                 continue
             inside = np.all(world_pos >= bbox_min) and np.all(world_pos <= bbox_max)
             self.get_logger().info(
@@ -1135,6 +1155,7 @@ class DrawerDetectionNode(Node):
             f"Drawer items: id: {drawer_id} items: ({len(items)}): "
             f"{[i['label'] for i in items]}"
         )
+        self._save_items_scan_debug(rgb, depth, all_detections, bbox_min, bbox_max, items, drawer_id)
 
         if not self.keep_drawers_open:
             self._send_close_drawer_command(drawer_id)
@@ -1333,6 +1354,55 @@ class DrawerDetectionNode(Node):
         v = max(0, min(v, h - 1))
 
         region = depth_m[max(0, v-3):v+3, max(0, u-3):u+3]
+        valid = region[region > 0.1]
+        if len(valid) == 0:
+            return None
+
+        d = float(np.median(valid))
+        if d > max_depth:
+            return None
+
+        fx, fy = camera_K[0, 0], camera_K[1, 1]
+        cx, cy = camera_K[0, 2], camera_K[1, 2]
+
+        x_cam = (u - cx) / fx * d
+        y_cam = (v - cy) / fy * d
+        z_cam = d
+
+        if not self.use_sim:
+            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
+        else:
+            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        p_world = camera_pose @ p_cam
+        return p_world[:3]
+
+    def _project_to_world_wide(
+        self, bbox, depth_m, camera_pose, camera_K, max_depth=5.0, radius=15
+    ):
+        """Like _project_to_world but with wider depth sampling for small objects.
+
+        Accepts depth already in meters. Uses a larger sampling radius to
+        borrow depth from surrounding pixels (e.g. the drawer bottom around
+        a small object).
+        """
+        if self.use_sim:
+            try:
+                from realrobot.stretch.projection import project_bbox_to_world_se3
+                return project_bbox_to_world_se3(
+                    bbox, depth_m, camera_pose, camera_K, max_depth=max_depth
+                )
+            except ImportError:
+                pass
+
+        x0, y0, x1, y1 = bbox
+        h, w = depth_m.shape[:2]
+
+        u = int((x0 + x1) / 2)
+        v = int((y0 + y1) / 2)
+        u = max(0, min(u, w - 1))
+        v = max(0, min(v, h - 1))
+
+        region = depth_m[max(0, v - radius):v + radius, max(0, u - radius):u + radius]
         valid = region[region > 0.1]
         if len(valid) == 0:
             return None
@@ -1615,6 +1685,62 @@ class DrawerDetectionNode(Node):
         path = debug_dir / f"detic_{stamp}.jpg"
         cv2.imwrite(str(path), cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
         self.get_logger().info(f"Debug image saved: {path}")
+
+    def _save_items_scan_debug(self, rgb, depth, all_detections, bbox_min, bbox_max, items, drawer_id):
+        """Save RGB + depth debug images for items scan to /tmp/detic_debug/."""
+        debug_dir = Path("/tmp/detic_debug")
+        debug_dir.mkdir(exist_ok=True)
+        stamp = int(time.time() * 1000) % 1000000
+
+        # --- RGB image with detections and volume projection ---
+        debug_rgb = rgb.copy()
+
+        for det in all_detections:
+            x0, y0, x1, y1 = det.bbox
+            is_drawer = det.object_type in self._drawer_classes
+            is_handle = det.object_type in self._handle_classes
+            is_item = any(
+                i["label"] == det.object_type
+                and abs(i["bbox_world"]["x"] - 0) > -1
+                for i in items
+            )
+            if is_drawer or is_handle:
+                color = (100, 100, 100)
+            elif is_item:
+                color = (0, 255, 0)
+            else:
+                color = (200, 200, 0)
+            cv2.rectangle(debug_rgb, (x0, y0), (x1, y1), color, 2)
+            label = f"{det.object_type} {det.score:.2f}"
+            cv2.putText(debug_rgb, label, (x0, max(y0 - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+        rgb_path = debug_dir / f"items_scan_{drawer_id}_{stamp}.jpg"
+        cv2.imwrite(str(rgb_path), cv2.cvtColor(debug_rgb, cv2.COLOR_RGB2BGR))
+
+        # --- Depth image with colormap ---
+        depth_m = self._depth_to_meters(depth)
+        depth_valid = depth_m.copy()
+        depth_valid[depth_valid <= 0] = np.nan
+        d_min = np.nanmin(depth_valid) if np.any(~np.isnan(depth_valid)) else 0.0
+        d_max = np.nanmax(depth_valid) if np.any(~np.isnan(depth_valid)) else 1.0
+        depth_norm = np.clip((depth_m - d_min) / max(d_max - d_min, 1e-3), 0, 1)
+        depth_u8 = (depth_norm * 255).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
+        depth_color[depth_m <= 0] = 0
+
+        for det in all_detections:
+            x0, y0, x1, y1 = det.bbox
+            cv2.rectangle(depth_color, (x0, y0), (x1, y1), (255, 255, 255), 1)
+            cv2.putText(depth_color, det.object_type, (x0, max(y0 - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+        depth_path = debug_dir / f"items_depth_{drawer_id}_{stamp}.jpg"
+        cv2.imwrite(str(depth_path), depth_color)
+
+        self.get_logger().info(
+            f"Items scan debug saved: {rgb_path} and {depth_path}"
+        )
 
     def publish_markers(self):
         """Publish drawer markers in RViz.

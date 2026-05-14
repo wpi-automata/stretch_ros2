@@ -194,7 +194,7 @@ class NavigateOpenNode(Node):
         self.current_joint_state = msg
         if not hasattr(self, '_js_logged'):
             self._js_logged = True
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"joint_states source: names={list(msg.name)}, "
                 f"effort_len={len(msg.effort)}, "
                 f"has_nonzero_effort={any(abs(e) > 0.01 for e in msg.effort)}"
@@ -205,12 +205,12 @@ class NavigateOpenNode(Node):
             arm_efforts = {n: e for n, e in zip(msg.name, msg.effort)
                           if n.startswith("joint_arm_l")}
             if any(abs(e) > 1.0 for e in arm_efforts.values()):
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"Arm effort spike: {arm_efforts}",
                     throttle_duration_sec=2.0,
                 )
         else:
-            self.get_logger().warn(
+            self.get_logger().debug(
                 "joint_states has EMPTY effort array!",
                 throttle_duration_sec=10.0,
             )
@@ -799,7 +799,9 @@ class NavigateOpenNode(Node):
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
         fingertip_length = 0.08 #0.06m but some extra
-        target_extension = max(0.0, min(dist - gripper_offset - fingertip_length, 0.52))
+        calc_ext = dist - gripper_offset - fingertip_length
+        self.get_logger().info(f"DESIRED EXTENSION: {(calc_ext):.3f}")
+        target_extension = max(0.0, min(calc_ext, 0.52))
         self.get_logger().info(
             f"Extending to handle: dist={dist:.3f}m, "
             f"gripper_offset={gripper_offset:.3f}m, "
