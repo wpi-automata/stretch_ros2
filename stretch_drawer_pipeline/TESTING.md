@@ -24,10 +24,7 @@ ros2 launch stretch_core stretch_driver.launch.py
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 ```
 
-For simple_explorer mode, also start the ZMQ server:
-```bash
-python -m stretch.app.zmq_server
-```
+Simple exploration mode requires only the stretch driver (no additional services).
 
 ### Cleanup
 
@@ -48,10 +45,10 @@ ros2 service call /mapping/start std_srvs/srv/Trigger
 ros2 topic echo /exploration_status
 ```
 
-### Real Robot (simple_explorer mode)
+### Real Robot (simple mode)
 ```bash
 ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py \
-  exploration_mode:=simple_explorer
+  exploration_mode:=simple
 ros2 service call /mapping/start std_srvs/srv/Trigger
 ```
 

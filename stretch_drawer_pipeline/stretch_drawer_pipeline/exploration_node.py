@@ -6,9 +6,9 @@ Three exploration modes controlled by the ``exploration_mode`` parameter:
   1. **funmap** — scan-drive loop via stretch_funmap services (default).
      After each head scan the robot pauses so Node 2 can detect drawers.
   2. **occupancy_grid** — stub for future occupancy-grid frontier planner.
-  3. **simple_explorer** — lightweight structured coverage imported from
-     ``semantic-object-container-room/realrobot/stretch/explore_simple.py``.
-     At every head-sweep angle the robot pauses for detection.
+  3. **simple** — lightweight structured coverage using ROS2 joint commands.
+     Rotates 360 at each position with head sweeps, pausing for detection
+     at every head angle. Moves to new positions via base translate/rotate.
 
 All modes publish ``/exploration_status`` and call ``/detection/trigger``
 at each pause point so Node 2 runs exactly one detection pass then stops.
@@ -19,22 +19,33 @@ Services (same API as the old mapping_node):
   - /mapping/is_complete (Trigger) query status
 """
 
-import sys
+import math
 import threading
 import time
 from enum import Enum
-from pathlib import Path
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
+from builtin_interfaces.msg import Duration
+from control_msgs.action import FollowJointTrajectory
+from rclpy.action import ActionClient
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from trajectory_msgs.msg import JointTrajectoryPoint
+import tf2_ros
 
-_SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "semantic-object-container-room"
-if str(_SEMANTIC_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SEMANTIC_ROOT))
+# Head sweep angles (pan, tilt) — same as explore_simple.py
+HEAD_SWEEP_ANGLES = [
+    (pan, tilt)
+    for pan in [-1.2, -0.6, 0.0, 0.6]
+    for tilt in [-0.6, -0.3]
+]
+
+MOVE_DISTANCE = 0.8
+HEAD_SETTLE = 0.4
 
 
 class ExplorationState(Enum):
@@ -55,8 +66,8 @@ class ExplorationNode(Node):
         self.declare_parameter("exploration_timeout_s", 300.0)
         self.declare_parameter("max_scan_drive_cycles", 20)
         self.declare_parameter("use_sim", False)
-        self.declare_parameter("robot_ip", "")
         self.declare_parameter("n_positions", 4)
+        self.declare_parameter("move_distance", MOVE_DISTANCE)
         self.declare_parameter("room_type", "kitchen")
         self.declare_parameter("query", "")
 
@@ -64,8 +75,8 @@ class ExplorationNode(Node):
         self.exploration_timeout = self.get_parameter("exploration_timeout_s").value
         self.max_cycles = self.get_parameter("max_scan_drive_cycles").value
         self.use_sim = self.get_parameter("use_sim").value
-        self.robot_ip = self.get_parameter("robot_ip").value
         self.n_positions = self.get_parameter("n_positions").value
+        self.move_distance = self.get_parameter("move_distance").value
         self.room_type = self.get_parameter("room_type").value
         self.query = self.get_parameter("query").value
 
@@ -76,7 +87,25 @@ class ExplorationNode(Node):
 
         self.cb_group = ReentrantCallbackGroup()
 
-        # Funmap service clients (used by funmap mode)
+        # TF (for simple mode base pose)
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=30))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # FollowJointTrajectory action (for simple mode)
+        self.trajectory_client = ActionClient(
+            self, FollowJointTrajectory,
+            "/stretch_controller/follow_joint_trajectory",
+        )
+
+        # Mode switching (simple mode needs position mode)
+        self.position_mode_client = self.create_client(
+            Trigger, "/switch_to_position_mode", callback_group=self.cb_group
+        )
+        self.navigation_mode_client = self.create_client(
+            Trigger, "/switch_to_navigation_mode", callback_group=self.cb_group
+        )
+
+        # Funmap service clients (funmap mode only)
         self.head_scan_client = self.create_client(
             Trigger, "/funmap/trigger_head_scan", callback_group=self.cb_group
         )
@@ -168,8 +197,8 @@ class ExplorationNode(Node):
             self._run_funmap_loop()
         elif mode == "occupancy_grid":
             self._run_occupancy_grid_loop()
-        elif mode == "simple_explorer":
-            self._run_simple_explorer_loop()
+        elif mode == "simple":
+            self._run_simple_loop()
         else:
             self.get_logger().error(f"Unknown exploration_mode: {mode}")
             self._set_state(ExplorationState.IDLE)
@@ -181,7 +210,7 @@ class ExplorationNode(Node):
         """Called when any exploration mode finishes."""
         self.get_logger().info("Exploration finished — requesting scene graph build")
         if self.scene_graph_client.wait_for_service(timeout_sec=5.0):
-            result = self._call_trigger(self.scene_graph_client)
+            result = self._call_trigger_service(self.scene_graph_client)
             if result and result.success:
                 self.get_logger().info(f"Scene graph built: {result.message}")
             else:
@@ -205,7 +234,7 @@ class ExplorationNode(Node):
             self.get_logger().warn("/detection/trigger not available — skipping")
             return
 
-        result = self._call_trigger(self.detection_trigger_client)
+        result = self._call_trigger_service(self.detection_trigger_client)
         if result:
             self.get_logger().debug(f"Detection trigger: {result.message}")
 
@@ -237,9 +266,8 @@ class ExplorationNode(Node):
             cycle += 1
             self.get_logger().info(f"Cycle {cycle}: triggering head scan")
 
-            # Head scan
             self._set_state(ExplorationState.SCANNING)
-            scan_result = self._call_trigger(self.head_scan_client)
+            scan_result = self._call_trigger_service(self.head_scan_client)
             if scan_result is None:
                 self.get_logger().warn("Head scan service call failed")
                 break
@@ -247,15 +275,13 @@ class ExplorationNode(Node):
             if self.stop_requested:
                 break
 
-            # Pause for detection after scan
             self._pause_for_detection()
 
             if self.stop_requested:
                 break
 
-            # Drive to next scan location
             self._set_state(ExplorationState.DRIVING)
-            drive_result = self._call_trigger(self.drive_to_scan_client)
+            drive_result = self._call_trigger_service(self.drive_to_scan_client)
             if drive_result is None:
                 self.get_logger().warn("Drive to scan service call failed")
                 break
@@ -279,70 +305,253 @@ class ExplorationNode(Node):
             "will use area-coverage threshold when implemented"
         )
 
-    # ── Mode 3: simple explorer ──────────────────────────────────────
+    # ── Mode 3: simple ───────────────────────────────────────────────
 
-    def _run_simple_explorer_loop(self):
-        if not self.robot_ip:
-            self.get_logger().error(
-                "simple_explorer mode requires 'robot_ip' parameter"
-            )
-            return
+    def _run_simple_loop(self):
+        """Structured room coverage using ROS2 joint commands.
 
+        Same pattern as explore_simple.py but using FollowJointTrajectory
+        and TF directly instead of ZMQ.
+
+        1. Switch to position mode
+        2. Rotate 360 at start (4 x 90), head sweep + detect at each
+        3. Move to new positions, rotate 360 + sweep at each
+        """
         self.get_logger().info(
-            f"Connecting to robot at {self.robot_ip} for simple_explorer…"
+            f"Simple exploration: {self.n_positions} positions, "
+            f"{self.move_distance}m per step"
         )
 
-        try:
-            from stretch.agent.zmq_client import HomeRobotZmqClient
-        except ImportError:
-            self.get_logger().error(
-                "stretch_ai not installed — cannot use simple_explorer mode"
-            )
+        if not self._switch_to_position_mode():
+            self.get_logger().error("Cannot switch to position mode — aborting")
             return
 
-        from realrobot.stretch.explore_simple import SimpleExplorer
+        time.sleep(1.0)
+        positions_visited = []
 
-        robot = HomeRobotZmqClient(
-            robot_ip=self.robot_ip,
-            recv_port=4401,
-            send_port=4402,
-            recv_state_port=4403,
-            recv_servo_port=4404,
+        pose = self._get_base_pose()
+        if pose:
+            positions_visited.append(pose[:2])
+            self.get_logger().info(f"Start: ({pose[0]:.2f}, {pose[1]:.2f})")
+
+        # Phase 1: 360 rotation at start with head sweep + detect
+        self.get_logger().info("Phase 1: Initial 360 sweep")
+        self._rotate_and_sweep()
+
+        # Phase 2: Move to new positions
+        direction_offsets = [0, math.pi / 2, -math.pi / 2, math.pi * 0.75]
+
+        for pos_i in range(self.n_positions):
+            if self.stop_requested:
+                break
+
+            self.get_logger().info(f"Position {pos_i + 1}/{self.n_positions}")
+            self._set_state(ExplorationState.DRIVING)
+
+            moved = False
+            for offset in direction_offsets:
+                if self.stop_requested:
+                    break
+                if self._try_move(self.move_distance, offset):
+                    moved = True
+                    break
+
+            if not moved:
+                for offset in direction_offsets:
+                    if self.stop_requested:
+                        break
+                    if self._try_move(self.move_distance * 0.5, offset):
+                        moved = True
+                        break
+
+            if not moved:
+                self.get_logger().warn("Stuck — skipping this position")
+                continue
+
+            pose = self._get_base_pose()
+            if pose:
+                positions_visited.append(pose[:2])
+                self.get_logger().info(f"At ({pose[0]:.2f}, {pose[1]:.2f})")
+
+            self._rotate_and_sweep()
+
+        self._switch_to_navigation_mode()
+        self.get_logger().info(
+            f"Simple exploration done. Visited {len(positions_visited)} positions."
         )
-        robot.start()
-        self.get_logger().info("ZMQ client connected")
 
-        def on_position():
+    def _rotate_and_sweep(self):
+        """Rotate 360 in 4 steps, running head sweep + detect at each."""
+        for i in range(4):
             if self.stop_requested:
                 return
+            if i > 0:
+                self._set_state(ExplorationState.DRIVING)
+                self._rotate_base(math.pi / 2)
+                time.sleep(0.5)
+            self._set_state(ExplorationState.SCANNING)
+            self._head_sweep()
+
+    def _head_sweep(self):
+        """Pan-tilt sweep at current position, pausing for detection at each angle."""
+        for pan, tilt in HEAD_SWEEP_ANGLES:
+            if self.stop_requested:
+                return
+            self._send_joint_command("joint_head_pan", pan, duration_sec=1)
+            self._send_joint_command("joint_head_tilt", tilt, duration_sec=1)
+            time.sleep(HEAD_SETTLE)
             self._pause_for_detection()
 
-        explorer = SimpleExplorer(
-            robot,
-            on_position_callback=on_position,
-            verbose=True,
-        )
+    def _try_move(self, distance: float, angle_offset: float = 0.0) -> bool:
+        """Try to move forward by distance at current heading + offset.
 
-        self.get_logger().info(
-            f"Starting simple exploration ({self.n_positions} positions)"
-        )
-        self._set_state(ExplorationState.SCANNING)
+        Returns True if the robot actually moved.
+        """
+        pose_before = self._get_base_pose()
+        if pose_before is None:
+            return False
 
+        if abs(angle_offset) > 0.05:
+            self._rotate_base(angle_offset)
+            time.sleep(0.5)
+
+        self.get_logger().info(f"Translating {distance:.2f}m")
+        self._send_joint_command(
+            "translate_mobile_base", distance, duration_sec=max(3, int(distance / 0.2))
+        )
+        time.sleep(1.0)
+
+        pose_after = self._get_base_pose()
+        if pose_after is None:
+            return False
+
+        dist_moved = math.sqrt(
+            (pose_after[0] - pose_before[0]) ** 2 +
+            (pose_after[1] - pose_before[1]) ** 2
+        )
+        if dist_moved < 0.1:
+            self.get_logger().info(f"Barely moved ({dist_moved:.2f}m) — likely blocked")
+            return False
+
+        self.get_logger().info(f"Moved {dist_moved:.2f}m")
+        return True
+
+    def _rotate_base(self, angle_rad: float):
+        """Rotate the base by angle_rad using stall detection."""
+        start_yaw = self._get_robot_yaw()
+        if start_yaw is None:
+            return
+        desired_yaw = start_yaw + angle_rad
+
+        stall_timeout = 5.0
+        last_yaw = start_yaw
+        last_progress_time = time.time()
+
+        while not self.stop_requested:
+            current_yaw = self._get_robot_yaw()
+            if current_yaw is None:
+                time.sleep(0.2)
+                continue
+
+            remaining = (desired_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(remaining) < 0.05:
+                return
+
+            yaw_change = abs((current_yaw - last_yaw + math.pi) % (2 * math.pi) - math.pi)
+            if yaw_change > 0.01:
+                last_progress_time = time.time()
+                last_yaw = current_yaw
+            elif time.time() - last_progress_time > stall_timeout:
+                self.get_logger().warn(
+                    f"Rotation stalled with {math.degrees(remaining):.1f} deg remaining"
+                )
+                return
+
+            duration_sec = max(2, int(abs(remaining) / 0.3))
+            self._send_joint_command(
+                "rotate_mobile_base", remaining, duration_sec=duration_sec
+            )
+            time.sleep(1.0)
+
+    # ── ROS2 low-level helpers ───────────────────────────────────────
+
+    def _get_base_pose(self):
+        """Get (x, y, theta) from TF odom → base_link."""
         try:
-            explorer.explore(n_positions=self.n_positions)
+            transform = self.tf_buffer.lookup_transform(
+                "odom", "base_link",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0),
+            )
+            t = transform.transform.translation
+            from tf_transformations import euler_from_quaternion
+            q = transform.transform.rotation
+            _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+            return (t.x, t.y, yaw)
         except Exception as e:
-            self.get_logger().error(f"SimpleExplorer error: {e}")
-        finally:
-            try:
-                robot.stop()
-            except Exception:
-                pass
+            self.get_logger().warn(f"TF lookup failed: {e}")
+            return None
 
-        self.get_logger().info("Simple exploration done")
+    def _get_robot_yaw(self):
+        pose = self._get_base_pose()
+        return pose[2] if pose else None
 
-    # ── Helpers ───────────────────────────────────────────────────────
+    def _send_joint_command(self, joint_name: str, position: float, duration_sec: int = 1):
+        """Send a joint command via FollowJointTrajectory action."""
+        if not self.trajectory_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("FollowJointTrajectory action server not available")
+            return False
 
-    def _call_trigger(self, client):
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = [joint_name]
+        point = JointTrajectoryPoint()
+        point.positions = [position]
+        point.time_from_start = Duration(sec=duration_sec, nanosec=0)
+        goal.trajectory.points = [point]
+
+        future = self.trajectory_client.send_goal_async(goal)
+        timeout = time.time() + 5.0
+        while not future.done() and time.time() < timeout:
+            time.sleep(0.05)
+        if not future.done() or future.result() is None:
+            self.get_logger().warn(f"Joint goal send failed: {joint_name}")
+            return False
+
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn(f"Joint command rejected: {joint_name}={position:.3f}")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        timeout = time.time() + duration_sec + 10
+        while not result_future.done() and time.time() < timeout:
+            time.sleep(0.05)
+
+        if not result_future.done():
+            self.get_logger().warn(f"Joint command timed out: {joint_name}")
+            return False
+
+        return goal_handle.status == 4  # SUCCEEDED
+
+    def _switch_to_position_mode(self) -> bool:
+        if not self.position_mode_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error("Position mode service not available")
+            return False
+        result = self._call_trigger_service(self.position_mode_client)
+        if result and result.success:
+            self.get_logger().info("Switched to position mode")
+            return True
+        self.get_logger().error("Position mode switch failed")
+        return False
+
+    def _switch_to_navigation_mode(self):
+        if not self.navigation_mode_client.wait_for_service(timeout_sec=5.0):
+            return
+        result = self._call_trigger_service(self.navigation_mode_client)
+        if result:
+            self.get_logger().info("Switched to navigation mode")
+
+    def _call_trigger_service(self, client):
         """Synchronously call a Trigger service. Returns response or None."""
         request = Trigger.Request()
         future = client.call_async(request)

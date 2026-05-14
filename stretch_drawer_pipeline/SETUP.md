@@ -38,11 +38,7 @@ For Detic detection (Node 2 and Node 4):
 pip install detectron2
 ```
 
-For simple_explorer mode (Node 1):
-```bash
-# stretch_ai provides HomeRobotZmqClient for ZMQ robot control
-pip install stretch-ai
-```
+Simple exploration mode (Node 1) has no additional Python dependencies beyond the ROS2 packages listed above.
 
 ## Building
 
@@ -99,24 +95,19 @@ The real robot uses a split architecture:
 
 ### On automata-3:
 
-1. Set the `robot_ip` parameter in config or launch args
+1. Set the `robot_ip` parameter in config or launch args (needed by Node 2 and Node 4 for rosbridge)
 2. Launch the pipeline:
    ```bash
    ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py
    ```
 
-### For simple_explorer mode:
+### For simple exploration mode:
 
-The robot also needs the stretch_ros2_bridge ZMQ server running:
-```bash
-# On the robot:
-python -m stretch.app.zmq_server
-```
+No additional setup needed — simple mode uses ROS2 FollowJointTrajectory directly via the stretch driver.
 
-Then launch with:
 ```bash
 ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py \
-  exploration_mode:=simple_explorer
+  exploration_mode:=simple
 ```
 
 ## Verifying Installation

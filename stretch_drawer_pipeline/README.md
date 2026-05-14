@@ -12,7 +12,7 @@ A four-node ROS2 pipeline for Stretch3 that explores a room, detects drawers, ra
 └──────────────────┘     └──────────────────────┘     └────────────────────┘
   - funmap (default)       - Detic drawer+handle       - Path planning
   - occupancy grid (TBD)   - Handle localization       - Force-based grasp
-  - simple_explorer        - World projection          - Pull open
+  - simple (ROS2 direct)   - World projection          - Pull open
   - /exploration_status    - De-duplication             - Pressure feedback
         │                         ▲
         │                         │ /detection/set_rankings
@@ -35,7 +35,7 @@ Multi-mode exploration with pause-for-detection synchronization. At each pause p
 
 - **funmap**: scan-drive loop via stretch_funmap services (default)
 - **occupancy_grid**: stub for future occupancy-grid frontier planner
-- **simple_explorer**: lightweight structured coverage from `semantic-object-container-room`
+- **simple**: lightweight structured coverage using direct ROS2 joint commands (no external dependencies)
 
 ### 2. Drawer Detection (`drawer_detection_node.py`)
 
@@ -83,14 +83,14 @@ ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py
 ros2 service call /mapping/start std_srvs/srv/Trigger
 ```
 
-### Using simple_explorer mode (real robot only)
+### Using simple mode
 
 ```bash
 ros2 launch stretch_drawer_pipeline pipeline_with_gnn.launch.py \
-  exploration_mode:=simple_explorer
+  exploration_mode:=simple
 ```
 
-This requires `robot_ip` set in `mapping_params.yaml` and a running stretch_ros2_bridge server on the robot for ZMQ communication.
+This mode uses direct ROS2 FollowJointTrajectory commands and only requires the stretch driver to be running.
 
 ## Sim vs Real Differences
 
@@ -169,7 +169,7 @@ The Stretch driver has two control modes:
 | **Navigation** (default) | `/switch_to_navigation_mode` | `cmd_vel` velocity commands |
 | **Position** | `/switch_to_position_mode` | `translate_mobile_base`, `rotate_mobile_base` via FollowJointTrajectory |
 
-Node 1 runs in navigation mode. Node 3 switches to position mode for drawer manipulation and back to navigation mode in a `finally` block.
+Node 1 (simple mode) switches to position mode for exploration. Node 1 (funmap mode) runs in navigation mode. Node 3 switches to position mode for drawer manipulation and back to navigation mode in a `finally` block.
 
 ## See Also
 

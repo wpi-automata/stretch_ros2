@@ -3,7 +3,7 @@
 Supports both simulation (use_sim:=true) and real robot (default).
 
 Nodes launched:
-  1. exploration_node — multi-mode exploration (funmap / occupancy_grid / simple_explorer)
+  1. exploration_node — multi-mode exploration (funmap / occupancy_grid / simple)
   2. drawer_detection_node — Detic drawer+handle detection
   3. scene_graph_node — Detic all-class detection, VoxelGraphBuilder, GNN scoring
   4. navigate_open_node — navigate to and open chosen drawer
@@ -106,7 +106,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "exploration_mode", default_value="funmap",
-            description="Exploration mode: funmap, occupancy_grid, or simple_explorer",
+            description="Exploration mode: funmap, occupancy_grid, or simple",
         ),
         DeclareLaunchArgument(
             "rviz", default_value="true",
