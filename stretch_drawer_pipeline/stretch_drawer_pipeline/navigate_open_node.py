@@ -386,17 +386,32 @@ class NavigateOpenNode(Node):
         thread.start()
 
     def _close_drawer_pipeline(self, data: dict):
-        """Close a drawer by pushing it back. Gripper is already at the handle."""
+        """Close a drawer: extend to opened handle, grab, push back, release."""
         drawer_id = data.get("drawer_id", "?")
         pull_distance = data.get("pull_distance", 0.0)
+        handle_pos_d = data.get("opened_handle")
+        orientation = data.get("handle_orientation", "horizontal")
 
-        if pull_distance <= 0:
+        if not handle_pos_d or pull_distance <= 0:
             self.get_logger().warn(
-                f"Cannot close drawer {drawer_id}: pull_distance={pull_distance}"
+                f"Cannot close drawer {drawer_id}: "
+                f"handle={handle_pos_d}, pull_distance={pull_distance}"
             )
             return
 
+        handle_pos = np.array([handle_pos_d["x"], handle_pos_d["y"], handle_pos_d["z"]])
+
         try:
+            if not self._switch_to_position_mode():
+                self.get_logger().error("Cannot switch to position mode for close")
+                return
+            time.sleep(0.5)
+
+            self._open_gripper()
+            time.sleep(0.5)
+            self._orient_gripper_toward(handle_pos, orientation)
+            self._extend_to_point(handle_pos)
+
             self._close_gripper()
             time.sleep(1.0)
 
@@ -722,10 +737,10 @@ class NavigateOpenNode(Node):
         time.sleep(2.0)
 
     def _get_gripper_world_pos(self):
-        """Get the gripper tip position in odom frame via TF."""
+        """Get the grasp center position in odom frame via TF."""
         try:
             transform = self.tf_buffer.lookup_transform(
-                "odom", "link_gripper_finger_left",
+                "odom", "link_grasp_center",
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
@@ -786,9 +801,15 @@ class NavigateOpenNode(Node):
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        fingertip_length = 0.08 #0.06m but some extra
-        calc_ext = dist - gripper_offset - fingertip_length
-        self.get_logger().info(f"DESIRED EXTENSION: {(calc_ext):.3f}")
+        calc_ext = dist - gripper_offset
+        self.get_logger().info(
+            f"Extend calc: mast=({mast_pose[0]:.3f},{mast_pose[1]:.3f}), "
+            f"gripper=({gripper_pos[0]:.3f},{gripper_pos[1]:.3f}), "
+            f"target=({target_world[0]:.3f},{target_world[1]:.3f}), "
+            f"cur_ext={current_ext:.3f}, grip_reach={gripper_reach:.3f}, "
+            f"grip_offset={gripper_offset:.3f}, dist={dist:.3f}, "
+            f"calc_ext={calc_ext:.3f}"
+        ) if gripper_pos is not None else None
         target_extension = max(0.0, min(calc_ext, 0.52))
         self.get_logger().info(
             f"Extending to handle: dist={dist:.3f}m, "
@@ -956,10 +977,10 @@ class NavigateOpenNode(Node):
             time.sleep(1.0)
 
     def _get_gripper_z(self):
-        """Get the gripper tip Z position in odom frame via TF."""
+        """Get the grasp center Z position in odom frame via TF."""
         try:
             transform = self.tf_buffer.lookup_transform(
-                "odom", "link_gripper_finger_left",
+                "odom", "link_grasp_center",
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
