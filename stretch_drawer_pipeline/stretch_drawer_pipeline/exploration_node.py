@@ -68,6 +68,7 @@ class ExplorationNode(Node):
         self.declare_parameter("use_sim", False)
         self.declare_parameter("n_positions", 4)
         self.declare_parameter("move_distance", MOVE_DISTANCE)
+        self.declare_parameter("head_settle_s", 2.0)
         self.declare_parameter("room_type", "kitchen")
         self.declare_parameter("query", "")
 
@@ -77,6 +78,7 @@ class ExplorationNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.n_positions = self.get_parameter("n_positions").value
         self.move_distance = self.get_parameter("move_distance").value
+        self.head_settle_s = self.get_parameter("head_settle_s").value
         self.room_type = self.get_parameter("room_type").value
         self.query = self.get_parameter("query").value
 
@@ -412,7 +414,7 @@ class ExplorationNode(Node):
                 return
             self._send_joint_command("joint_head_pan", pan, duration_sec=1)
             self._send_joint_command("joint_head_tilt", tilt, duration_sec=1)
-            time.sleep(HEAD_SETTLE)
+            time.sleep(self.head_settle_s)
             self._pause_for_detection()
 
     def _try_move(self, distance: float, angle_offset: float = 0.0) -> bool:

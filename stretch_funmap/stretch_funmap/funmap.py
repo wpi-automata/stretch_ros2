@@ -1289,7 +1289,7 @@ class FunmapNode(hm.HelloNode):
         self.merged_map = None
         self.localized = False
 
-        if self.map_filename != '':
+        if self.map_filename is not None and self.map_filename != '':
             self.merged_map = ma.HeadScan.from_file(self.map_filename)
             self.localized = False
 

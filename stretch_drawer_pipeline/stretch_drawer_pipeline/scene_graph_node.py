@@ -39,7 +39,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 import tf2_ros
 
-_SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "semantic-object-container-room"
+_SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent / "semantic-object-container-room"
 if str(_SEMANTIC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SEMANTIC_ROOT))
 
