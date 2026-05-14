@@ -393,9 +393,9 @@ def numba_max_height_and_rgb_images_int(points_to_image_mat, rgb_points,
             current_z_val = height_image[y_index, x_index]
             if z_val > current_z_val:
                 height_image[y_index, x_index] = z_val
-                r = p['r']
-                g = p['g']
-                b = p['b']
+                r = p['r'][0]
+                g = p['g'][0]
+                b = p['b'][0]
                 rgb_sum = r + g + b
                 # If [r, g, b] = [0, 0, 0], color information for the
                 # point is assumed not to exist and the color of the
@@ -409,10 +409,12 @@ def numba_max_height_and_rgb_images_int(points_to_image_mat, rgb_points,
                 # narrower field of view of the D435i's RGB camera. In
                 # these cases the points have [r,g,b] = [0,0,0].
                 if rgb_sum != 0:
-                    rgb_image[y_index, x_index] = [p['b'], p['g'], p['r']]
+                    rgb_image[y_index, x_index, 0] = b
+                    rgb_image[y_index, x_index, 1] = g
+                    rgb_image[y_index, x_index, 2] = r
 
 
-                    
+
 @njit(fastmath=True)
 def numba_max_height_and_rgb_and_camera_depth_images_int(points_to_image_mat, rgb_points,
                                                          height_image, rgb_image, camera_depth_image,
@@ -480,9 +482,9 @@ def numba_max_height_and_rgb_and_camera_depth_images_int(points_to_image_mat, rg
                     camera_depth = 0
                 camera_depth_image[y_index, x_index] = camera_depth
 
-                r = p['r']
-                g = p['g']
-                b = p['b']
+                r = p['r'][0]
+                g = p['g'][0]
+                b = p['b'][0]
                 rgb_sum = r + g + b
                 # If [r, g, b] = [0, 0, 0], color information for the
                 # point is assumed not to exist and the color of the
@@ -496,7 +498,9 @@ def numba_max_height_and_rgb_and_camera_depth_images_int(points_to_image_mat, rg
                 # narrower field of view of the D435i's RGB camera. In
                 # these cases the points have [r,g,b] = [0,0,0].
                 if rgb_sum != 0:
-                    rgb_image[y_index, x_index] = [p['b'], p['g'], p['r']]
+                    rgb_image[y_index, x_index, 0] = b
+                    rgb_image[y_index, x_index, 1] = g
+                    rgb_image[y_index, x_index, 2] = r
                 
              
 @njit(fastmath=True)
