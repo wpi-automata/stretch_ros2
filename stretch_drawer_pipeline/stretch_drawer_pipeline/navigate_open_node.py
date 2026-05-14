@@ -83,7 +83,6 @@ class NavigateOpenNode(Node):
         self.declare_parameter("use_sim", False)
         self.declare_parameter("arm_extension_speed", 0.01)
         self.declare_parameter("max_pull_distance", 0.4)
-        self.declare_parameter("keep_drawers_open", True)
 
         self.approach_distance = self.get_parameter("approach_distance").value
         self.grasp_force_threshold = self.get_parameter("grasp_force_threshold").value
@@ -93,7 +92,6 @@ class NavigateOpenNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.arm_extension_speed = self.get_parameter("arm_extension_speed").value
         self.max_pull_distance = self.get_parameter("max_pull_distance").value
-        self.keep_drawers_open = self.get_parameter("keep_drawers_open").value
 
         # State
         self.state = OpenState.IDLE
@@ -673,15 +671,18 @@ class NavigateOpenNode(Node):
         )
         self._send_joint_command("wrist_extension", target, duration_sec=4)
         time.sleep(1.0)
-        pulled = start_extension - target
-        self.get_logger().info(f"Pulled {pulled:.3f}m")
-        return pulled > 0.05, pulled
+        wrist_pulled = start_extension - target
+        fingertip_length = 0.08
+        pulled = wrist_pulled + fingertip_length
+        self.get_logger().info(f"Pulled {pulled:.3f}m (wrist {wrist_pulled:.3f} + fingertip {fingertip_length})")
+        return wrist_pulled > 0.05, pulled
 
     def _pull_drawer_real(self) -> tuple[bool, float]:
         """Real robot: retract incrementally with force threshold check."""
         start_extension = self._get_current_extension()
         target_extension = max(0.0, start_extension - self.max_pull_distance)
         current = start_extension
+        fingertip_length = 0.08
 
         while current > target_extension and not self.stop_requested:
             current -= self.pull_speed
@@ -691,16 +692,18 @@ class NavigateOpenNode(Node):
 
             effort = abs(self.current_effort.get("wrist_extension", 0.0))
             if effort > self.pull_force_threshold:
-                pulled_distance = start_extension - current
+                wrist_pulled = start_extension - current
+                pulled_distance = wrist_pulled + fingertip_length
                 self.get_logger().info(
                     f"Pull force threshold reached: {effort:.1f}N > {self.pull_force_threshold}N, "
-                    f"pulled {pulled_distance:.3f}m"
+                    f"pulled {pulled_distance:.3f}m (wrist {wrist_pulled:.3f} + fingertip {fingertip_length})"
                 )
                 return True, pulled_distance
 
-        pulled_distance = start_extension - current
-        self.get_logger().info(f"Pulled {pulled_distance:.3f}m")
-        return pulled_distance > 0.05, pulled_distance
+        wrist_pulled = start_extension - current
+        pulled_distance = wrist_pulled + fingertip_length
+        self.get_logger().info(f"Pulled {pulled_distance:.3f}m (wrist {wrist_pulled:.3f} + fingertip {fingertip_length})")
+        return wrist_pulled > 0.05, pulled_distance
 
     def _get_current_extension(self) -> float:
         """Read current arm extension from joint_states.

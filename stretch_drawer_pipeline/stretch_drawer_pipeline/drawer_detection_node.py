@@ -1053,13 +1053,17 @@ class DrawerDetectionNode(Node):
         )
 
     def _scan_drawer_items(self, drawer_id, all_detections, rgb, depth, camera_pose, camera_K):
-        """Detect objects inside an opened drawer using 3D volume check.
+        """Detect objects inside an opened drawer using 2D projection.
 
-        Uses the stored closed drawer bbox (4 corners) extruded outward
-        along the face normal by pull_distance to define the drawer volume.
+        Projects the 3D drawer volume corners into the image, builds a
+        convex hull, and checks which detection bboxes are fully contained
+        within it. No depth needed for the containment check.
         """
         interacted = self.interacted_drawers.get(drawer_id)
         if not interacted:
+            self.drawer_items[drawer_id] = []
+            if not self.keep_drawers_open:
+                self._send_close_drawer_command(drawer_id)
             return
 
         closed_corners = interacted.get("closed_corners")
@@ -1069,23 +1073,23 @@ class DrawerDetectionNode(Node):
                 f"No closed corners or pull_distance for drawer {drawer_id}, skipping items scan"
             )
             self.drawer_items[drawer_id] = []
+            if not self.keep_drawers_open:
+                self._send_close_drawer_command(drawer_id)
             return
 
         pts = np.array([[c["x"], c["y"], c["z"]] for c in closed_corners])
 
-        # Compute face normal from corners (outward = toward robot)
         v1 = pts[1] - pts[0]
         v2 = pts[3] - pts[0]
         normal = np.cross(v1, v2)
         norm_len = np.linalg.norm(normal)
         if norm_len < 1e-6:
             self.drawer_items[drawer_id] = []
+            if not self.keep_drawers_open:
+                self._send_close_drawer_command(drawer_id)
             return
         normal = normal / norm_len
 
-        # Normal should point outward (toward robot/camera).
-        # Use closed_handle to determine direction: handle is on the
-        # front face, so normal should point from face toward handle.
         ch = interacted.get("closed_handle")
         if ch:
             handle_pos = np.array([ch["x"], ch["y"], ch["z"]])
@@ -1093,69 +1097,52 @@ class DrawerDetectionNode(Node):
             if np.dot(normal, handle_pos - face_center) < 0:
                 normal = -normal
 
-        # The drawer volume: closed face extruded outward by pull_distance
         extruded_pts = pts + normal * pull_distance
-        all_pts = np.vstack([pts, extruded_pts])
-        bbox_min = all_pts.min(axis=0) - 0.03
-        bbox_max = all_pts.max(axis=0) + 0.03
+        all_corners_3d = np.vstack([pts, extruded_pts])
+
+        volume_pixels = self._world_to_pixels(all_corners_3d, camera_pose, camera_K)
+        if volume_pixels is None:
+            self.drawer_items[drawer_id] = []
+            if not self.keep_drawers_open:
+                self._send_close_drawer_command(drawer_id)
+            return
+
+        hull = cv2.convexHull(volume_pixels.astype(np.float32))
 
         self.get_logger().info(
-            f"Items scan volume: normal=({normal[0]:.3f},{normal[1]:.3f},{normal[2]:.3f}), "
-            f"pull_dist={pull_distance:.3f}, "
-            f"bbox_min=({bbox_min[0]:.3f},{bbox_min[1]:.3f},{bbox_min[2]:.3f}), "
-            f"bbox_max=({bbox_max[0]:.3f},{bbox_max[1]:.3f},{bbox_max[2]:.3f})"
-        )
-
-        # Save raw data for offline debugging
-        debug_dir = Path("/tmp/detic_debug")
-        debug_dir.mkdir(exist_ok=True)
-        stamp = int(time.time() * 1000) % 1000000
-        np.savez(
-            str(debug_dir / f"items_raw_{drawer_id}_{stamp}.npz"),
-            depth=depth, camera_pose=camera_pose, camera_K=camera_K,
-            bbox_min=bbox_min, bbox_max=bbox_max,
-            closed_corners=pts, normal=normal, pull_distance=pull_distance,
-        )
-        cv2.imwrite(
-            str(debug_dir / f"items_rgb_{drawer_id}_{stamp}.jpg"),
-            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            f"Items scan 2D: pull_dist={pull_distance:.3f}, "
+            f"hull has {len(hull)} pts, "
+            f"normal=({normal[0]:.3f},{normal[1]:.3f},{normal[2]:.3f})"
         )
 
         items = []
-        depth_m = self._depth_to_meters(depth)
         for det in all_detections:
             if det.object_type in self._drawer_classes or det.object_type in self._handle_classes:
                 continue
-            world_pos = self._project_to_world_wide(det.bbox, depth_m, camera_pose, camera_K)
-            if world_pos is None:
-                self.get_logger().info(
-                    f"  item skipped (no depth): {det.object_type} ({det.score:.2f}) "
-                    f"bbox={det.bbox}"
-                )
-                continue
-            inside = np.all(world_pos >= bbox_min) and np.all(world_pos <= bbox_max)
-            self.get_logger().info(
-                f"  item candidate: {det.object_type} ({det.score:.2f}) at "
-                f"({world_pos[0]:.3f},{world_pos[1]:.3f},{world_pos[2]:.3f}) "
-                f"{'INSIDE' if inside else 'outside'}"
+            x0, y0, x1, y1 = det.bbox
+
+            bbox_inside = all(
+                cv2.pointPolygonTest(hull, (float(px), float(py)), False) >= 0
+                for px, py in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
             )
-            if inside:
-                items.append({
-                    "label": det.object_type,
-                    "confidence": float(det.score),
-                    "bbox_world": {
-                        "x": float(world_pos[0]),
-                        "y": float(world_pos[1]),
-                        "z": float(world_pos[2]),
-                    },
-                })
+            if not bbox_inside:
+                continue
+
+            self.get_logger().info(
+                f"  item: {det.object_type} ({det.score:.2f}) bbox={det.bbox}"
+            )
+            items.append({
+                "label": det.object_type,
+                "confidence": float(det.score),
+                "bbox": list(det.bbox),
+            })
 
         self.drawer_items[drawer_id] = items
         self.get_logger().info(
-            f"Drawer items: id: {drawer_id} items: ({len(items)}): "
+            f"Drawer items: id: {drawer_id} items ({len(items)}): "
             f"{[i['label'] for i in items]}"
         )
-        self._save_items_scan_debug(rgb, depth, all_detections, bbox_min, bbox_max, items, drawer_id)
+        self._save_items_scan_debug_2d(rgb, all_detections, hull, items, drawer_id)
 
         if not self.keep_drawers_open:
             self._send_close_drawer_command(drawer_id)
@@ -1425,6 +1412,30 @@ class DrawerDetectionNode(Node):
         p_world = camera_pose @ p_cam
         return p_world[:3]
 
+    def _world_to_pixels(
+        self, pts_world: np.ndarray, camera_pose: np.ndarray, camera_K: np.ndarray
+    ) -> np.ndarray | None:
+        """Project Nx3 world points to Nx2 pixel coordinates."""
+        cam_from_world = np.linalg.inv(camera_pose)
+        ones = np.ones((pts_world.shape[0], 1))
+        pts_cam = (cam_from_world @ np.hstack([pts_world, ones]).T).T[:, :3]
+
+        X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
+        if np.any(Z <= 0):
+            return None
+
+        fx, fy = camera_K[0, 0], camera_K[1, 1]
+        cx, cy = camera_K[0, 2], camera_K[1, 2]
+
+        if not self.use_sim:
+            u = fx * (-Y) / Z + cx
+            v = fy * X / Z + cy
+        else:
+            u = fx * X / Z + cx
+            v = fy * Y / Z + cy
+
+        return np.stack([u, v], axis=1)
+
     def _project_drawer_corners(
         self, drawer_bbox: list, depth: np.ndarray,
         camera_pose: np.ndarray, camera_K: np.ndarray,
@@ -1686,61 +1697,33 @@ class DrawerDetectionNode(Node):
         cv2.imwrite(str(path), cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
         self.get_logger().info(f"Debug image saved: {path}")
 
-    def _save_items_scan_debug(self, rgb, depth, all_detections, bbox_min, bbox_max, items, drawer_id):
-        """Save RGB + depth debug images for items scan to /tmp/detic_debug/."""
+    def _save_items_scan_debug_2d(self, rgb, all_detections, hull, items, drawer_id):
+        """Save debug image showing 2D convex hull and detection containment."""
         debug_dir = Path("/tmp/detic_debug")
         debug_dir.mkdir(exist_ok=True)
         stamp = int(time.time() * 1000) % 1000000
 
-        # --- RGB image with detections and volume projection ---
-        debug_rgb = rgb.copy()
+        debug_img = rgb.copy()
+        item_bboxes = {tuple(i["bbox"]) for i in items}
+
+        cv2.polylines(debug_img, [hull.astype(np.int32)], True, (0, 255, 255), 2)
 
         for det in all_detections:
             x0, y0, x1, y1 = det.bbox
-            is_drawer = det.object_type in self._drawer_classes
-            is_handle = det.object_type in self._handle_classes
-            is_item = any(
-                i["label"] == det.object_type
-                and abs(i["bbox_world"]["x"] - 0) > -1
-                for i in items
-            )
-            if is_drawer or is_handle:
+            if det.object_type in self._drawer_classes or det.object_type in self._handle_classes:
                 color = (100, 100, 100)
-            elif is_item:
+            elif tuple(det.bbox) in item_bboxes:
                 color = (0, 255, 0)
             else:
                 color = (200, 200, 0)
-            cv2.rectangle(debug_rgb, (x0, y0), (x1, y1), color, 2)
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), color, 2)
             label = f"{det.object_type} {det.score:.2f}"
-            cv2.putText(debug_rgb, label, (x0, max(y0 - 4, 10)),
+            cv2.putText(debug_img, label, (x0, max(y0 - 4, 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        rgb_path = debug_dir / f"items_scan_{drawer_id}_{stamp}.jpg"
-        cv2.imwrite(str(rgb_path), cv2.cvtColor(debug_rgb, cv2.COLOR_RGB2BGR))
-
-        # --- Depth image with colormap ---
-        depth_m = self._depth_to_meters(depth)
-        depth_valid = depth_m.copy()
-        depth_valid[depth_valid <= 0] = np.nan
-        d_min = np.nanmin(depth_valid) if np.any(~np.isnan(depth_valid)) else 0.0
-        d_max = np.nanmax(depth_valid) if np.any(~np.isnan(depth_valid)) else 1.0
-        depth_norm = np.clip((depth_m - d_min) / max(d_max - d_min, 1e-3), 0, 1)
-        depth_u8 = (depth_norm * 255).astype(np.uint8)
-        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
-        depth_color[depth_m <= 0] = 0
-
-        for det in all_detections:
-            x0, y0, x1, y1 = det.bbox
-            cv2.rectangle(depth_color, (x0, y0), (x1, y1), (255, 255, 255), 1)
-            cv2.putText(depth_color, det.object_type, (x0, max(y0 - 4, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-
-        depth_path = debug_dir / f"items_depth_{drawer_id}_{stamp}.jpg"
-        cv2.imwrite(str(depth_path), depth_color)
-
-        self.get_logger().info(
-            f"Items scan debug saved: {rgb_path} and {depth_path}"
-        )
+        path = debug_dir / f"items_2d_{drawer_id}_{stamp}.jpg"
+        cv2.imwrite(str(path), cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
+        self.get_logger().info(f"Items scan 2D debug saved: {path}")
 
     def publish_markers(self):
         """Publish drawer markers in RViz.
