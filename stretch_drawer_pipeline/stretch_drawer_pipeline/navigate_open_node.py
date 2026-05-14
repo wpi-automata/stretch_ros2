@@ -387,10 +387,17 @@ class NavigateOpenNode(Node):
 
     def _speak(self, text: str):
         """Speak text using espeak (non-blocking)."""
+        self.get_logger().info(f"Speaking: {text}")
         try:
             import subprocess
-            subprocess.Popen(["espeak", "-s", "140", text],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            result = subprocess.run(
+                ["espeak", "-s", "140", text],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                self.get_logger().warn(f"espeak failed: {result.stderr}")
+        except FileNotFoundError:
+            self.get_logger().warn("espeak not installed — install with: sudo apt install espeak")
         except Exception as e:
             self.get_logger().warn(f"Speech failed: {e}")
 
