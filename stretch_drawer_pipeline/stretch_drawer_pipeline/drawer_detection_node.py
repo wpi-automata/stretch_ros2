@@ -607,7 +607,11 @@ class DrawerDetectionNode(Node):
         self.camera_K = K
 
     def exploration_status_callback(self, msg: String):
-        self.exploring = msg.data == "paused_for_detection"
+        if msg.data == "paused_for_detection" and not self.exploring:
+            self.exploring = True
+            self._single_shot_pending = True
+        elif msg.data != "paused_for_detection":
+            self.exploring = False
 
     def _opened_drawers_json_callback(self, msg: String):
         """Handle opened drawer notification from Node 3.
@@ -808,7 +812,11 @@ class DrawerDetectionNode(Node):
     # ─── Detection logic ──────────────────────────────────────────────
 
     def detection_tick(self):
-        """Periodic detection pass gated by detection mode."""
+        """Periodic detection pass gated by detection mode.
+
+        In exploration mode, runs exactly one detection per paused_for_detection
+        window then stops until the next pause.
+        """
         if self._detection_mode == "stopped":
             return
         if not self.exploring and not self.test_mode and self._detection_mode != "detecting":
@@ -821,7 +829,11 @@ class DrawerDetectionNode(Node):
                 throttle_duration_sec=5.0,
             )
             return
+        if self.exploring and not getattr(self, '_single_shot_pending', True):
+            return
         self._run_detection()
+        if self.exploring:
+            self._single_shot_pending = False
 
     def _run_detection(self) -> int:
         """Run Detic detection on current frame, find drawers and handles."""
