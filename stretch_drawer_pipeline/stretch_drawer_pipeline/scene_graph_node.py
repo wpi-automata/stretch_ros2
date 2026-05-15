@@ -85,6 +85,8 @@ class SceneGraphNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.camera_K = None
+        self._rgb_stamp = 0.0
+        self._depth_stamp = 0.0
         self._detecting = False
 
         # TF
@@ -238,6 +240,7 @@ class SceneGraphNode(Node):
             if not self.use_sim:
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_rgb = arr
+            self._rgb_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"RGB decode error: {e}", throttle_duration_sec=5.0)
 
@@ -250,6 +253,7 @@ class SceneGraphNode(Node):
             self.latest_depth = depth.astype(np.float32)
             if self.latest_depth.max() > 100:
                 self.latest_depth /= 1000.0
+            self._depth_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"Depth decode error: {e}", throttle_duration_sec=5.0)
 
@@ -281,6 +285,7 @@ class SceneGraphNode(Node):
                 if not self.use_sim:
                     arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
                 self.latest_rgb = arr
+                self._rgb_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"WS RGB error: {e}", throttle_duration_sec=5.0)
 
@@ -301,6 +306,7 @@ class SceneGraphNode(Node):
             self.latest_depth = depth.astype(np.float32)
             if self.latest_depth.max() > 100:
                 self.latest_depth /= 1000.0
+            self._depth_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"WS depth error: {e}", throttle_duration_sec=5.0)
 
@@ -332,6 +338,9 @@ class SceneGraphNode(Node):
         if status == "paused_for_detection":
             if not self._detecting:
                 self._detecting = True
+                self._pause_stamp = time.monotonic()
+                self.latest_rgb = None
+                self.latest_depth = None
                 threading.Thread(
                     target=self._process_current_frame, daemon=True
                 ).start()
@@ -435,26 +444,29 @@ class SceneGraphNode(Node):
         if not self._ensure_models_loaded():
             return
 
-        # Wait up to 3s for images to arrive
-        import time as _time
-        for _ in range(30):
-            if self.latest_rgb is not None and self.latest_depth is not None:
+        # Wait for fresh images received AFTER the pause signal
+        pause_t = getattr(self, '_pause_stamp', 0.0)
+        for _ in range(50):
+            rgb_fresh = self.latest_rgb is not None and self._rgb_stamp > pause_t
+            depth_fresh = self.latest_depth is not None and self._depth_stamp > pause_t
+            if rgb_fresh and depth_fresh:
                 break
-            _time.sleep(0.1)
+            time.sleep(0.1)
 
         if self.latest_rgb is None or self.latest_depth is None:
             self.get_logger().warn(
-                f"No camera data (rgb={'yes' if self.latest_rgb is not None else 'NO'}, "
+                f"No fresh camera data (rgb={'yes' if self.latest_rgb is not None else 'NO'}, "
                 f"depth={'yes' if self.latest_depth is not None else 'NO'}) — skipping"
             )
             return
 
+        # Use latest TF (head should be settled by now since images are fresh)
         camera_frame = "camera_color_optical_frame"
         try:
             transform = self.tf_buffer.lookup_transform(
                 "odom", camera_frame,
                 rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.5),
+                timeout=rclpy.duration.Duration(seconds=1.0),
             )
         except Exception as e:
             self.get_logger().warn(

@@ -164,6 +164,9 @@ class DrawerDetectionNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_rgb_stamp = None
+        self._rgb_mono_stamp = 0.0
+        self._depth_mono_stamp = 0.0
+        self._pause_stamp = 0.0
         # D435i intrinsics — fallback if camera_info topic is unavailable.
         # Original at 1280x720: fx=911.968, fy=911.456, cx=639.360, cy=375.114
         if self.use_sim:
@@ -420,6 +423,7 @@ class DrawerDetectionNode(Node):
                 throttle_duration_sec=5.0,
             )
             self._ws_rgb_count += 1
+            self._rgb_mono_stamp = time.monotonic()
         except Exception as e:
             print(f"[rosbridge] RGB decode FAILED: {e}", flush=True)
 
@@ -440,6 +444,7 @@ class DrawerDetectionNode(Node):
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = arr
             self._ws_depth_count += 1
+            self._depth_mono_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(
                 f"rosbridge depth decode failed: {e}",
@@ -578,12 +583,14 @@ class DrawerDetectionNode(Node):
             arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
         self.latest_rgb = arr
         self.latest_rgb_stamp = msg.header.stamp
+        self._rgb_mono_stamp = time.monotonic()
 
     def _depth_dds_callback(self, msg: RosImage):
         arr = self.bridge.imgmsg_to_cv2(msg, "passthrough")
         if not self.use_sim:
             arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
         self.latest_depth = arr
+        self._depth_mono_stamp = time.monotonic()
 
     def _camera_info_dds_callback(self, msg: CameraInfo):
         k = msg.k
@@ -610,6 +617,9 @@ class DrawerDetectionNode(Node):
         if msg.data == "paused_for_detection" and not self.exploring:
             self.exploring = True
             self._single_shot_pending = True
+            self._pause_stamp = time.monotonic()
+            self.latest_rgb = None
+            self.latest_depth = None
         elif msg.data != "paused_for_detection":
             self.exploring = False
 
