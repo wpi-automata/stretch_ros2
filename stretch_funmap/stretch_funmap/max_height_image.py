@@ -496,7 +496,9 @@ class MaxHeightImage:
 
         
     def from_rgb_points(self, points_to_voi_mat, rgb_points):
-        
+        if rgb_points.ndim > 1:
+            rgb_points = rgb_points.reshape(-1, 1)
+
         points_to_image_mat = points_to_voi_mat
         points_to_image_mat[:3,3] = points_to_image_mat[:3,3] - self.image_origin
         

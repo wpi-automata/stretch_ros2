@@ -37,11 +37,11 @@ from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 import tf2_ros
 
-# Head sweep angles (pan, tilt) — same as explore_simple.py
+# Head sweep angles (pan, tilt) for detection — covers floor to upper cabinets
 HEAD_SWEEP_ANGLES = [
     (pan, tilt)
     for pan in [-1.2, -0.6, 0.0, 0.6]
-    for tilt in [-0.6, -0.3]
+    for tilt in [-0.6, -0.3, 0.0, 0.3]
 ]
 
 MOVE_DISTANCE = 0.8
@@ -71,6 +71,7 @@ class ExplorationNode(Node):
         self.declare_parameter("head_settle_s", 2.0)
         self.declare_parameter("room_type", "kitchen")
         self.declare_parameter("query", "")
+        self.declare_parameter("detection_wait_s", 15.0)
 
         self.exploration_mode = self.get_parameter("exploration_mode").value
         self.exploration_timeout = self.get_parameter("exploration_timeout_s").value
@@ -81,6 +82,7 @@ class ExplorationNode(Node):
         self.head_settle_s = self.get_parameter("head_settle_s").value
         self.room_type = self.get_parameter("room_type").value
         self.query = self.get_parameter("query").value
+        self._detection_wait_s = self.get_parameter("detection_wait_s").value
 
         self.state = ExplorationState.IDLE
         self.mapping_complete = False
@@ -201,10 +203,10 @@ class ExplorationNode(Node):
             timeout_sec=5.0
         )
         if self._detection_available:
-            self.get_logger().info("/detection/trigger available")
+            self.get_logger().info("/detection/trigger available (DDS)")
         else:
             self.get_logger().warn(
-                "/detection/trigger not available — will explore without detection"
+                "/detection/trigger not available on DDS — will use sleep fallback"
             )
 
         self._scene_graph_available = self.scene_graph_client.wait_for_service(
@@ -246,12 +248,14 @@ class ExplorationNode(Node):
         """Pause, trigger one detection pass on Node 2, then return."""
         self._set_state(ExplorationState.PAUSED_FOR_DETECTION)
 
-        if not self._detection_available:
+        if self._detection_available:
+            result = self._call_trigger_service(self.detection_trigger_client)
+            if result:
+                self.get_logger().debug(f"Detection trigger: {result.message}")
             return
 
-        result = self._call_trigger_service(self.detection_trigger_client)
-        if result:
-            self.get_logger().debug(f"Detection trigger: {result.message}")
+        self.get_logger().debug(f"Sleeping {self._detection_wait_s:.0f}s for detection")
+        time.sleep(self._detection_wait_s)
 
     # ── Mode 1: funmap ───────────────────────────────────────────────
 
@@ -290,7 +294,8 @@ class ExplorationNode(Node):
             if self.stop_requested:
                 break
 
-            self._pause_for_detection()
+            self.get_logger().info("Detection sweep (looking for drawers/cabinets)")
+            self._head_sweep()
 
             if self.stop_requested:
                 break
@@ -353,9 +358,7 @@ class ExplorationNode(Node):
         self.get_logger().info("Phase 1: Initial 360 sweep")
         self._rotate_and_sweep()
 
-        # Phase 2: Move to new positions
-        direction_offsets = [0, math.pi / 2, -math.pi / 2, math.pi * 0.75]
-
+        # Phase 2: Move in a square pattern — turn 90° then move forward each step
         for pos_i in range(self.n_positions):
             if self.stop_requested:
                 break
@@ -363,22 +366,12 @@ class ExplorationNode(Node):
             self.get_logger().info(f"Position {pos_i + 1}/{self.n_positions}")
             self._set_state(ExplorationState.DRIVING)
 
-            moved = False
-            for offset in direction_offsets:
-                if self.stop_requested:
-                    break
-                if self._try_move(self.move_distance, offset):
-                    moved = True
-                    break
+            self._rotate_base(math.pi / 2)
+            time.sleep(0.5)
 
+            moved = self._try_move(self.move_distance)
             if not moved:
-                for offset in direction_offsets:
-                    if self.stop_requested:
-                        break
-                    if self._try_move(self.move_distance * 0.5, offset):
-                        moved = True
-                        break
-
+                moved = self._try_move(self.move_distance * 0.5)
             if not moved:
                 self.get_logger().warn("Stuck — skipping this position")
                 continue
@@ -406,6 +399,10 @@ class ExplorationNode(Node):
                 time.sleep(0.5)
             self._set_state(ExplorationState.SCANNING)
             self._head_sweep()
+        # Complete the 360 so heading is restored
+        if not self.stop_requested:
+            self._rotate_base(math.pi / 2)
+            time.sleep(0.5)
 
     def _head_sweep(self):
         """Pan-tilt sweep at current position, pausing for detection at each angle."""

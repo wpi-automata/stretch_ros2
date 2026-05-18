@@ -22,6 +22,7 @@ def generate_launch_description():
     config_dir = os.path.join(pkg_dir, "config")
 
     exploration_mode = LaunchConfiguration("exploration_mode", default="simple")
+    n_positions = LaunchConfiguration("n_positions", default="4")
 
     funmap_node = Node(
         package="stretch_funmap",
@@ -41,7 +42,7 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "mapping_params.yaml"),
-            {"exploration_mode": exploration_mode, "use_sim": False},
+            {"exploration_mode": exploration_mode, "use_sim": False, "n_positions": n_positions},
         ],
     )
 
@@ -60,6 +61,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "exploration_mode", default_value="simple",
             description="Exploration mode: funmap, occupancy_grid, or simple",
+        ),
+        DeclareLaunchArgument(
+            "n_positions", default_value="4",
+            description="Number of positions for simple exploration (1 for quick test)",
         ),
         funmap_node,
         exploration_node,

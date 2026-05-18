@@ -46,7 +46,38 @@ _SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent / "semantic-objec
 if str(_SEMANTIC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SEMANTIC_ROOT))
 
-MAX_PROJECTION_DEPTH = 6.0
+MAX_PROJECTION_DEPTH = 5.0
+MIN_PROJECTION_DEPTH = 0.1
+TF_READY_THRESHOLD = 5
+
+
+def _bbox_iou(a, b):
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    inter = max(0, x1 - x0) * max(0, y1 - y0)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _cross_class_nms(detections, iou_threshold=0.3):
+    """Suppress overlapping bboxes across all classes, keeping higher confidence."""
+    if not detections:
+        return detections
+    sorted_dets = sorted(detections, key=lambda d: d.score, reverse=True)
+    keep = []
+    for det in sorted_dets:
+        suppressed = False
+        for kept in keep:
+            if _bbox_iou(det.bbox, kept.bbox) > iou_threshold:
+                suppressed = True
+                break
+        if not suppressed:
+            keep.append(det)
+    return keep
 
 
 class SceneGraphNode(Node):
@@ -91,6 +122,8 @@ class SceneGraphNode(Node):
 
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=30))
+        self._tf_ready = False
+        self._tf_consecutive_ok = 0
 
         # Lazy-loaded models
         self._models_loaded = False
@@ -318,7 +351,7 @@ class SceneGraphNode(Node):
             if K[0, 0] > 0:
                 if not self.use_sim:
                     fx, fy = K[1, 1], K[0, 0]
-                    cx = (K.shape[0] - 1) - K[1, 2] if K.shape[0] > 3 else 719 - K[1, 2]
+                    cx = 719 - K[1, 2]
                     cy = K[0, 2]
                     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 self.camera_K = K
@@ -338,6 +371,7 @@ class SceneGraphNode(Node):
         if status == "paused_for_detection":
             if not self._detecting:
                 self._detecting = True
+                self._exploration_complete_handled = False
                 self._pause_stamp = time.monotonic()
                 self.latest_rgb = None
                 self.latest_depth = None
@@ -346,8 +380,10 @@ class SceneGraphNode(Node):
                 ).start()
         elif status == "complete":
             self._detecting = False
-            self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
-            threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
+            if not getattr(self, '_exploration_complete_handled', False):
+                self._exploration_complete_handled = True
+                self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
+                threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
         else:
             self._detecting = False
 
@@ -460,7 +496,8 @@ class SceneGraphNode(Node):
             )
             return
 
-        # Use latest TF (head should be settled by now since images are fresh)
+        # Use latest TF — head is paused during detection so latest is correct.
+        # Stamped lookups fail because TF arrives via rosbridge with delay.
         camera_frame = "camera_color_optical_frame"
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -469,12 +506,37 @@ class SceneGraphNode(Node):
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )
         except Exception as e:
+            self._tf_consecutive_ok = 0
             self.get_logger().warn(
                 f"TF lookup failed: {e}", throttle_duration_sec=5.0
             )
             return
 
         camera_pose = self._transform_to_matrix(transform)
+        t = transform.transform.translation
+        tf_stamp = transform.header.stamp
+        now_sec = time.time()
+        tf_age = now_sec - (tf_stamp.sec + tf_stamp.nanosec / 1e9)
+        self.get_logger().info(
+            f"Camera pose in odom: ({t.x:.3f}, {t.y:.3f}, {t.z:.3f})"
+            f"  tf_stamp={tf_stamp.sec}.{tf_stamp.nanosec:09d}  age={tf_age:.1f}s"
+        )
+
+        if tf_age > 3.0:
+            self.get_logger().warn(
+                f"TF too stale ({tf_age:.1f}s) — skipping frame"
+            )
+            return
+
+        if not self._tf_ready:
+            self._tf_consecutive_ok += 1
+            if self._tf_consecutive_ok < TF_READY_THRESHOLD:
+                self.get_logger().info(
+                    f"TF warming up: {self._tf_consecutive_ok}/{TF_READY_THRESHOLD}"
+                )
+                return
+            self._tf_ready = True
+            self.get_logger().info("TF ready")
 
         if self.camera_K is None:
             self.get_logger().debug("No camera_K yet")
@@ -490,6 +552,7 @@ class SceneGraphNode(Node):
         dets = self._detector.detect(rgb, return_crops=True)
         dets = [d for d in dets if d.score >= self.det_min_score]
         dets = nms_by_type(dets)
+        dets = _cross_class_nms(dets, iou_threshold=0.3)
 
         if dets:
             self._ensure_type_text_embeddings(
@@ -503,9 +566,15 @@ class SceneGraphNode(Node):
             world_pos = project_bbox_to_world_se3(
                 det.bbox, depth, camera_pose, camera_K,
                 max_depth=MAX_PROJECTION_DEPTH,
+                image_rotated_cw90=not self.use_sim,
             )
             if world_pos is None:
                 continue
+
+            self.get_logger().info(
+                f"  {det.object_type} @ ({world_pos[0]:.3f}, {world_pos[1]:.3f}, {world_pos[2]:.3f})"
+                f"  bbox={det.bbox}  score={det.score:.2f}"
+            )
 
             clip_emb = None
             if det.crop is not None:
