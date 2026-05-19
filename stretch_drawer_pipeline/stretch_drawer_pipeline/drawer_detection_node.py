@@ -150,14 +150,14 @@ class DrawerDetectionNode(Node):
         self.gripper_handle_locations = []
 
         self._drawer_classes = {
-            "Drawer", "Cabinet", "Chest", "FilingCabinet",
-            "Dresser", "NightStand", "SideTable",
-            "Armoire", "Buffet", "CedarChest", "ChestOfDrawers",
+            "Drawer", "Cabinet", "Chest",
+            "NightStand", "SideTable",
+            "Buffet", "CedarChest",
             "ChinaCabinet", "Credenza", "Cupboard", "AiringCupboard",
             "HopeChest", "Hutch", "Locker", "Footlocker",
             "MedicineChest", "Pantry", "Sideboard", "Wardrobe",
             "Cabinetwork",
-        }
+        } # "Armoire", "Dresser", "FilingCabinet", "ChestOfDrawers"
         self._handle_classes = {
             "Handle", "Knob", "Doorknob",
             "Pull", "Bellpull", "PullChain",
@@ -1553,38 +1553,70 @@ class DrawerDetectionNode(Node):
         self, drawer_bbox: list, depth: np.ndarray,
         camera_pose: np.ndarray, camera_K: np.ndarray,
     ):
-        """Project the 4 corners of a drawer bbox to world coordinates.
+        """Project a drawer bbox to an oriented 3D rectangle on the cabinet face.
 
-        Each corner is projected at its own depth sampled from a small
-        region around that corner pixel. This produces an accurate
-        rectangle even when the camera views the drawer at an angle.
+        Fits a plane to depth points within the bbox, then constructs a
+        properly oriented rectangle using the surface normal. This produces
+        stable boxes regardless of viewing angle.
         """
         depth_m = self._depth_to_meters(depth)
         x0, y0, x1, y1 = [int(c) for c in drawer_bbox]
         h, w = depth_m.shape[:2]
 
-        # Shrink bbox by 15% on each side to avoid sampling wall/background
         margin_x = int((x1 - x0) * 0.15)
         margin_y = int((y1 - y0) * 0.15)
-        x0 += margin_x
-        y0 += margin_y
-        x1 -= margin_x
-        y1 -= margin_y
+        x0s = x0 + margin_x
+        y0s = y0 + margin_y
+        x1s = x1 - margin_x
+        y1s = y1 - margin_y
 
-        corners_px = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-        corners_world = []
+        step_u = max(1, (x1s - x0s) // 8)
+        step_v = max(1, (y1s - y0s) // 8)
+        points = []
+        for uu in range(x0s, x1s + 1, step_u):
+            for vv in range(y0s, y1s + 1, step_v):
+                uc = max(0, min(uu, w - 1))
+                vc = max(0, min(vv, h - 1))
+                d = float(depth_m[vc, uc])
+                if d > 0.1:
+                    points.append(self._unproject_pixel(uc, vc, d, camera_pose, camera_K))
 
-        for u, v in corners_px:
-            uc = max(0, min(u, w - 1))
-            vc = max(0, min(v, h - 1))
+        if len(points) < 4:
+            return None
 
-            d = self._sample_depth_at(depth_m, uc, vc)
-            if d is None:
-                return None
+        points = np.array(points)
+        centroid = points.mean(axis=0)
 
-            corners_world.append(self._unproject_pixel(uc, vc, d, camera_pose, camera_K))
+        centered = points - centroid
+        _, _, Vt = np.linalg.svd(centered)
+        normal = Vt[-1]
 
-        return corners_world
+        camera_pos = camera_pose[:3, 3]
+        if np.dot(normal, camera_pos - centroid) < 0:
+            normal = -normal
+
+        world_up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(world_up, normal)
+        right_len = np.linalg.norm(right)
+        if right_len < 1e-6:
+            return None
+        right /= right_len
+        up = np.cross(normal, right)
+        up /= np.linalg.norm(up)
+
+        rights = centered @ right
+        ups = centered @ up
+        r_min, r_max = float(rights.min()), float(rights.max())
+        u_min, u_max = float(ups.min()), float(ups.max())
+
+        corners = [
+            centroid + r_min * right + u_max * up,
+            centroid + r_max * right + u_max * up,
+            centroid + r_max * right + u_min * up,
+            centroid + r_min * right + u_min * up,
+        ]
+
+        return corners
 
     @staticmethod
     def _sample_depth_at(depth: np.ndarray, u: int, v: int, radius: int = 5):
@@ -1641,7 +1673,20 @@ class DrawerDetectionNode(Node):
                     )
                 else:
                     centers_close = False
-                if handle_close and centers_close:
+                if not (handle_close or centers_close):
+                    if dist < self.dedup_distance * 2:
+                        c_dist = None
+                        if drawer_corners is not None and existing.drawer_corners_world is not None:
+                            c_dist = float(np.linalg.norm(
+                                np.array(drawer_corners).mean(axis=0) -
+                                np.array(existing.drawer_corners_world).mean(axis=0)
+                            ))
+                        self.get_logger().warn(
+                            f"Dedup NEAR-MISS: handle_dist={dist:.3f}m, "
+                            f"centers_dist={c_dist:.3f}m, "
+                            f"threshold={self.dedup_distance}m"
+                        )
+                if handle_close or centers_close:
                     existing.observations += 1
                     if confidence > existing.confidence:
                         existing.handle_center_world = world_pos
