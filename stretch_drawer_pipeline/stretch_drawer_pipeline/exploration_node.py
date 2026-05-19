@@ -72,6 +72,7 @@ class ExplorationNode(Node):
         self.declare_parameter("use_sim", False)
         self.declare_parameter("n_positions", 4)
         self.declare_parameter("move_distance", MOVE_DISTANCE)
+        self.declare_parameter("n_rotations", 4)
         self.declare_parameter("num_pan_angles", 8)
         self.declare_parameter("head_settle_s", 2.0)
         self.declare_parameter("room_type", "kitchen")
@@ -85,6 +86,7 @@ class ExplorationNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.n_positions = self.get_parameter("n_positions").value
         self.move_distance = self.get_parameter("move_distance").value
+        self.n_rotations = self.get_parameter("n_rotations").value
         self.num_pan_angles = self.get_parameter("num_pan_angles").value
         self.head_sweep_angles = [
             (pan, tilt)
@@ -428,19 +430,20 @@ class ExplorationNode(Node):
         )
 
     def _rotate_and_sweep(self):
-        """Rotate 360 in 4 steps, running head sweep + detect at each."""
-        for i in range(4):
+        """Rotate 360 in n_rotations steps, running head sweep + detect at each."""
+        rotation_angle = 2 * math.pi / self.n_rotations
+        for i in range(self.n_rotations):
             if self.stop_requested:
                 return
             if i > 0:
                 self._set_state(ExplorationState.DRIVING)
-                self._rotate_base(math.pi / 2)
+                self._rotate_base(rotation_angle)
                 time.sleep(0.5)
             self._set_state(ExplorationState.SCANNING)
             self._head_sweep()
         # Complete the 360 so heading is restored
-        if not self.stop_requested:
-            self._rotate_base(math.pi / 2)
+        if self.n_rotations > 1 and not self.stop_requested:
+            self._rotate_base(rotation_angle)
             time.sleep(0.5)
 
     def _head_sweep(self):
