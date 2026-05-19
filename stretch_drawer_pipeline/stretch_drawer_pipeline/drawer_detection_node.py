@@ -274,6 +274,7 @@ class DrawerDetectionNode(Node):
         self.detector = VisualDetector(
             device=self.device, score_threshold=self.detection_confidence
         )
+        self.detector._load_model()
         self.get_logger().info(f"Detic model loaded on {self.device}")
 
         self.create_service(
