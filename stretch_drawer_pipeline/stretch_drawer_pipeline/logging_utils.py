@@ -1,69 +1,69 @@
-"""Per-node file logging for the drawer pipeline."""
+"""Per-node file logging for the drawer pipeline.
 
+Redirects file descriptors 1 (stdout) and 2 (stderr) through a pipe so that
+a background thread can tee every byte to both the original terminal and a
+per-node log file.  This captures C-level rcutils output, Python print()
+calls, and third-party library output (e.g. Detic) without touching the
+ROS2 logger at all — no CallerId or filter conflicts.
+"""
+
+import os
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
-from rclpy.logging import LoggingSeverity
-
 _LOGS_DIR = Path(__file__).resolve().parent / "logs"
-
-_SEVERITY_NAMES = {
-    LoggingSeverity.DEBUG: "DEBUG",
-    LoggingSeverity.INFO:  "INFO",
-    LoggingSeverity.WARN:  "WARN",
-    LoggingSeverity.ERROR: "ERROR",
-    LoggingSeverity.FATAL: "FATAL",
-}
-
-
-class _TeeStream:
-    """Writes to both the original stream and a log file."""
-
-    def __init__(self, original, log_file):
-        self._original = original
-        self._log_file = log_file
-
-    def write(self, data):
-        self._original.write(data)
-        self._log_file.write(data)
-        self._log_file.flush()
-
-    def flush(self):
-        self._original.flush()
-        self._log_file.flush()
-
-    def fileno(self):
-        return self._original.fileno()
-
-    def isatty(self):
-        return self._original.isatty()
+_saved_streams = []
+_setup_done = False
 
 
 def setup_file_logging(node):
-    """Wrap *node*'s ROS2 logger to also write to a file, and tee stdout/stderr.
+    """Tee all stdout/stderr to ``logs/<node>_<timestamp>.log``.
 
     Call once, right after ``super().__init__(...)``.
     """
+    global _setup_done
+    if _setup_done:
+        return
+    _setup_done = True
+
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = _LOGS_DIR / f"{node.get_name()}_{stamp}.log"
-    log_file = open(log_path, "a")
 
-    logger = node.get_logger()
-    original_log = logger.log
+    sys.stdout.flush()
+    sys.stderr.flush()
 
-    def wrapped_log(message, severity, **kwargs):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        level = _SEVERITY_NAMES.get(severity, str(severity))
-        log_file.write(f"[{ts}] [{level}] {message}\n")
-        log_file.flush()
-        return original_log(message, severity, **kwargs)
+    # Prevent GC of old Python stream objects (would close the fds)
+    _saved_streams.extend([sys.stdout, sys.stderr])
 
-    logger.log = wrapped_log
+    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
 
-    sys.stdout = _TeeStream(sys.stdout, log_file)
-    sys.stderr = _TeeStream(sys.stderr, log_file)
+    # Save the original terminal fd
+    orig_fd = os.dup(1)
+
+    # Create pipe; redirect both stdout and stderr into its write end
+    pipe_r, pipe_w = os.pipe()
+    os.dup2(pipe_w, 1)
+    os.dup2(pipe_w, 2)
+    os.close(pipe_w)
+
+    def _tee():
+        try:
+            while True:
+                data = os.read(pipe_r, 8192)
+                if not data:
+                    break
+                os.write(orig_fd, data)
+                os.write(log_fd, data)
+        except OSError:
+            pass
+
+    threading.Thread(target=_tee, daemon=True).start()
+
+    sys.stdout = os.fdopen(1, "w", closefd=False, buffering=1)
+    sys.stderr = os.fdopen(2, "w", closefd=False, buffering=1)
 
     node.get_logger().info(f"Logging to {log_path}")
