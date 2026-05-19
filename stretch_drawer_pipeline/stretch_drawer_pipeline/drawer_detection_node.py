@@ -1434,7 +1434,7 @@ class DrawerDetectionNode(Node):
 
         drawer_dets = [d for d in detections
                        if d.object_type in self._drawer_classes and d.score >= self.detection_confidence]
-        drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.3)
+        drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.7)
 
         handle_dets = [d for d in detections if d.object_type in self._handle_classes]
         handle_dets = self._cross_class_nms(handle_dets, iou_threshold=0.3)
