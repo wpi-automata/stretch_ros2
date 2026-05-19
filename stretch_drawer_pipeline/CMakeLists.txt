@@ -10,6 +10,8 @@ find_package(sensor_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DrawerDetection.msg"
   "msg/DrawerList.msg"
+  "msg/DrawerCleanupEntry.msg"
+  "msg/DrawerCleanupList.msg"
   "srv/NavigateToDrawer.srv"
   "srv/TriggerDetection.srv"
   "srv/SetRankings.srv"

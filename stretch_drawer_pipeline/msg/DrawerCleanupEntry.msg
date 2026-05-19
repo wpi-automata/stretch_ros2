@@ -1,0 +1,3 @@
+geometry_msgs/Point handle_center
+geometry_msgs/Point drawer_center
+float64 dedup_distance

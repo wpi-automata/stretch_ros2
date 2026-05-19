@@ -34,14 +34,19 @@ Parameters:
 
 import json
 import math
+import sys
 import threading
 import time
 from enum import Enum
+from pathlib import Path as _Path
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
+
+sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from logging_utils import setup_file_logging
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -73,6 +78,7 @@ class NavigateOpenNode(Node):
 
     def __init__(self):
         super().__init__("navigate_open_node")
+        setup_file_logging(self)
 
         # Parameters
         self.declare_parameter("approach_distance", 0.45)

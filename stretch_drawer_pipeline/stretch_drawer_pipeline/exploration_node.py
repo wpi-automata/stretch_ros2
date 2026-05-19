@@ -20,14 +20,19 @@ Services (same API as the old mapping_node):
 """
 
 import math
+import sys
 import threading
 import time
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 import rclpy
 import roslibpy
 from rclpy.node import Node
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from logging_utils import setup_file_logging
 from rclpy.callback_groups import ReentrantCallbackGroup
 
 from builtin_interfaces.msg import Duration
@@ -59,6 +64,7 @@ class ExplorationNode(Node):
 
     def __init__(self):
         super().__init__("exploration_node")
+        setup_file_logging(self)
 
         self.declare_parameter("exploration_mode", "funmap")
         self.declare_parameter("exploration_timeout_s", 300.0)

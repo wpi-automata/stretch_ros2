@@ -81,11 +81,16 @@ def _cross_class_nms(detections, iou_threshold=0.3):
     return keep
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from logging_utils import setup_file_logging
+
+
 class SceneGraphNode(Node):
     """Builds a scene graph from Detic detections and runs GNN ranking."""
 
     def __init__(self):
         super().__init__("scene_graph_node")
+        setup_file_logging(self)
 
         self.declare_parameter("room_type", "kitchen")
         self.declare_parameter("query", "fork")
@@ -167,6 +172,12 @@ class SceneGraphNode(Node):
         self.create_subscription(
             String, "/exploration_status",
             self._exploration_status_callback, 10,
+        )
+
+        from stretch_drawer_pipeline.msg import DrawerCleanupList
+        self.create_subscription(
+            DrawerCleanupList, "/drawer_cleanup",
+            self._handle_cleanup_callback, 10,
         )
 
         # Service client to push rankings to Node 2
@@ -521,6 +532,45 @@ class SceneGraphNode(Node):
         ranking = self._run_scoring()
         if ranking:
             self._push_rankings_to_node2(ranking)
+
+    def _handle_cleanup_callback(self, msg):
+        if self._builder is None:
+            return
+        removed = 0
+        for entry in msg.drawers:
+            hc = np.array([entry.handle_center.x, entry.handle_center.y, entry.handle_center.z])
+            dc = np.array([entry.drawer_center.x, entry.drawer_center.y, entry.drawer_center.z])
+            dedup = entry.dedup_distance
+
+            has_drawer_match = False
+            for node in self._builder.nodes.values():
+                if node.node_type not in ("drawer", "Drawer"):
+                    continue
+                pos = np.array([node.position_3d["x"], node.position_3d["y"], node.position_3d["z"]])
+                if np.linalg.norm(pos - dc) < dedup:
+                    has_drawer_match = True
+                    break
+
+            if not has_drawer_match:
+                continue
+
+            to_remove = []
+            for iid, node in self._builder.nodes.items():
+                if node.node_type not in ("handle", "Handle"):
+                    continue
+                pos = np.array([node.position_3d["x"], node.position_3d["y"], node.position_3d["z"]])
+                if np.linalg.norm(pos - hc) < dedup:
+                    to_remove.append(iid)
+
+            for iid in to_remove:
+                self._builder.remove_node(iid)
+                removed += 1
+
+        if removed > 0:
+            self.get_logger().info(
+                f"Handle cleanup: removed {removed} handle node(s) from scene graph"
+            )
+            self._publish_markers()
 
     # ── Lazy model loading ───────────────────────────────────────────
 

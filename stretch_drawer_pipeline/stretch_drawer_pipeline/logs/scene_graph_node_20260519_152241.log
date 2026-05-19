@@ -1,0 +1,18 @@
+[2026-05-19 15:22:41.943] [INFO] Logging to /home/ros2_stretch/ament_ws/src/stretch_ros2/stretch_drawer_pipeline/stretch_drawer_pipeline/logs/scene_graph_node_20260519_152241.log
+[2026-05-19 15:22:41.996] [INFO] Image transport: DDS
+[2026-05-19 15:22:42.007] [INFO] Scene graph node starting (model loading deferred): room=kitchen, query=fork, device=cuda
+[2026-05-19 15:22:42.026] [INFO] TF ready
+[2026-05-19 15:22:42.066] [INFO] Camera K set from camera_info: fx=312.6
+[2026-05-19 15:22:42.108] [INFO] Loading models (Detic, CLIP, GNN)...
+/home/ros2_stretch/.local/lib/python3.10/site-packages/pandas/core/computation/expressions.py:21: UserWarning: Pandas requires version '2.8.4' or newer of 'numexpr' (version '2.8.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+/home/ros2_stretch/.local/lib/python3.10/site-packages/pandas/core/arrays/masked.py:61: UserWarning: Pandas requires version '1.3.6' or newer of 'bottleneck' (version '1.3.2' currently installed).
+  from pandas.core import (
+[2026-05-19 15:22:57.776] [INFO] Loading perception models…
+  [inference] Loaded: K=2, α=0.3, ec=0.9, c_dim=1573, scoring=cosine, clusters=8
+[2026-05-19 15:22:57.869] [INFO] GNN loaded: K=2, alpha=0.3, ec=0.9
+Resetting zs_weight /home/ros2_stretch/Detic/datasets/metadata/lvis-21k_clip_a+cname.npy
+DETIC 21K loaded: 20352 classes.
+[2026-05-19 15:23:24.255] [INFO] All models loaded
+[2026-05-19 15:23:24.256] [INFO] All models loaded on cuda
+[2026-05-19 15:23:24.259] [INFO] Scene graph node ready

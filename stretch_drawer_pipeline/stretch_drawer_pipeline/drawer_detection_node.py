@@ -73,6 +73,9 @@ _SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "semanti
 if str(_SEMANTIC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SEMANTIC_ROOT))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from logging_utils import setup_file_logging
+
 
 class DetectedDrawer:
     """Internal representation of a drawer detection."""
@@ -98,6 +101,7 @@ class DrawerDetectionNode(Node):
 
     def __init__(self):
         super().__init__("drawer_detection_node")
+        setup_file_logging(self)
 
         # Parameters
         self.declare_parameter("detection_confidence", 0.5)
@@ -207,6 +211,12 @@ class DrawerDetectionNode(Node):
         )
         self.close_drawer_pub = self.create_publisher(
             String, "/detection/close_drawer_json", 10
+        )
+
+        from stretch_drawer_pipeline.msg import DrawerCleanupList
+        self._cleanup_msg_type = DrawerCleanupList
+        self.drawer_cleanup_pub = self.create_publisher(
+            DrawerCleanupList, "/drawer_cleanup", 10
         )
 
         self.create_subscription(
@@ -639,6 +649,31 @@ class DrawerDetectionNode(Node):
         except Exception as e:
             self.get_logger().warn(f"rosbridge drawer publish failed: {e}", throttle_duration_sec=10.0)
 
+    def _publish_drawer_cleanup(self):
+        from stretch_drawer_pipeline.msg import DrawerCleanupEntry
+        msg = self._cleanup_msg_type()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "odom"
+        with self.drawers_lock:
+            for d in self.drawers:
+                entry = DrawerCleanupEntry()
+                entry.handle_center = Point(
+                    x=float(d.handle_center_world[0]),
+                    y=float(d.handle_center_world[1]),
+                    z=float(d.handle_center_world[2]),
+                )
+                corners = d.drawer_corners_world
+                cx = sum(c[0] for c in corners) / len(corners)
+                cy = sum(c[1] for c in corners) / len(corners)
+                cz = sum(c[2] for c in corners) / len(corners)
+                entry.drawer_center = Point(x=float(cx), y=float(cy), z=float(cz))
+                entry.dedup_distance = self.dedup_distance
+                msg.drawers.append(entry)
+        self.drawer_cleanup_pub.publish(msg)
+        self.get_logger().info(
+            f"Published drawer cleanup: {len(msg.drawers)} entries"
+        )
+
     # ─── Callbacks ────────────────────────────────────────────────────
 
     def _rgb_dds_callback(self, msg: RosImage):
@@ -1022,6 +1057,7 @@ class DrawerDetectionNode(Node):
         if new_detections > 0:
             self._save_debug_image(rgb, all_detections, drawer_bboxes)
             self._publish_drawers_via_rosbridge()
+            self._publish_drawer_cleanup()
 
         return len(self.drawers)
     
@@ -1460,8 +1496,8 @@ class DrawerDetectionNode(Node):
         inter = max(0, x1 - x0) * max(0, y1 - y0)
         area_a = (a[2] - a[0]) * (a[3] - a[1])
         area_b = (b[2] - b[0]) * (b[3] - b[1])
-        union = area_a + area_b - inter
-        return inter / union if union > 0 else 0.0
+        min_area = min(area_a, area_b)
+        return inter / min_area if min_area > 0 else 0.0
 
     @staticmethod
     def _match_handle_to_drawer(drawer_bbox, handle_dets):

@@ -1,0 +1,12 @@
+[2026-05-19 15:22:38.494] [INFO] Logging to /home/ros2_stretch/ament_ws/src/stretch_ros2/stretch_drawer_pipeline/stretch_drawer_pipeline/logs/drawer_detection_node_20260519_152238.log
+[2026-05-19 15:22:38.595] [INFO] Parameters: {'use_sim_time': False, 'detection_confidence': 0.5, 'enable_dedup': True, 'dedup_distance_m': 0.2, 'max_reach_height': 1.4, 'min_reach_height': 0.1, 'max_reach_distance': 0.6, 'test_mode': False, 'rank_via_LOCUS': False, 'use_sim': True, 'detection_rate_hz': 2.0, 'robot_ip': '', 'robot_port': 9090, 'remote_rgb_topic': '/camera/color/image_raw/compressed', 'remote_depth_topic': '/camera/aligned_depth_to_color/image_raw/compressedDepth', 'remote_camera_info_topic': '/camera/color/camera_info', 'throttle_rate_ms': 2000, 'keep_drawers_open': False, 'gnn_match_threshold': 0.5, 'device': 'cuda'}
+[2026-05-19 15:22:38.640] [INFO] Image transport: DDS subscriptions
+[2026-05-19 15:22:38.650] [INFO] SetRankings service registered
+[2026-05-19 15:22:42.414] [INFO] Drawer detection node starting (model loading deferred): confidence=0.5, test_mode=False, rank_via_LOCUS=False
+[2026-05-19 15:22:42.438] [INFO] TF ready
+[2026-05-19 15:22:42.516] [INFO] Loading Detic model...
+[2026-05-19 15:22:42.610] [INFO] Camera intrinsics from DDS: fx=312.6, fy=312.6, cx=119.0, cy=212.0
+Resetting zs_weight /home/ros2_stretch/Detic/datasets/metadata/lvis-21k_clip_a+cname.npy
+DETIC 21K loaded: 20352 classes.
+[2026-05-19 15:23:06.706] [INFO] Detic model loaded on cuda
+[2026-05-19 15:23:06.722] [INFO] Drawer detection node ready

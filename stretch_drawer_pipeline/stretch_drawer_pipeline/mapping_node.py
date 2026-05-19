@@ -18,13 +18,18 @@ The node provides:
   - /mapping/is_complete (std_srvs/Trigger): query if mapping finished
 """
 
+import sys
 import threading
 import time
 from enum import Enum
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from logging_utils import setup_file_logging
 
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -42,6 +47,7 @@ class MappingNode(Node):
 
     def __init__(self):
         super().__init__("mapping_node")
+        setup_file_logging(self)
 
         self.declare_parameter("exploration_timeout_s", 300.0)
         self.declare_parameter("max_scan_drive_cycles", 20)

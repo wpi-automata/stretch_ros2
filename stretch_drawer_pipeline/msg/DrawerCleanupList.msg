@@ -1,0 +1,2 @@
+std_msgs/Header header
+stretch_drawer_pipeline/DrawerCleanupEntry[] drawers
