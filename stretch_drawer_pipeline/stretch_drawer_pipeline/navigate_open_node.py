@@ -899,7 +899,15 @@ class NavigateOpenNode(Node):
 
         dx = target_world[0] - mast_pose[0]
         dy = target_world[1] - mast_pose[1]
-        dist = math.sqrt(dx * dx + dy * dy)
+        # Old: Euclidean distance — may need to revert for real robot
+        # dist = math.sqrt(dx * dx + dy * dy)
+        # New: project onto arm axis only (robot's left = yaw + pi/2) to fix ~5cm sim lateral error
+        yaw = self._get_robot_yaw()
+        if yaw is None:
+            dist = math.sqrt(dx * dx + dy * dy)
+        else:
+            arm_angle = yaw + math.pi / 2
+            dist = dx * math.cos(arm_angle) + dy * math.sin(arm_angle)
         calc_ext = dist - gripper_offset + forward_push
         self.get_logger().info(
             f"Extend calc: mast=({mast_pose[0]:.3f},{mast_pose[1]:.3f}), "
