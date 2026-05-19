@@ -172,21 +172,14 @@ class DrawerDetectionNode(Node):
         self._pause_stamp = 0.0
         # D435i intrinsics — fallback if camera_info topic is unavailable.
         # Original at 1280x720: fx=911.968, fy=911.456, cx=639.360, cy=375.114
-        if self.use_sim:
-            self.camera_K = np.array([
-                [911.968, 0.0,     639.360],
-                [0.0,     911.456, 375.114],
-                [0.0,     0.0,     1.0],
-            ])
-        else:
-            # After ROTATE_90_CLOCKWISE to 720x1280:
-            # new_fx=old_fy, new_fy=old_fx,
-            # new_cx=H-1-old_cy=719-375.114, new_cy=old_cx
-            self.camera_K = np.array([
-                [911.456, 0.0,     343.886],
-                [0.0,     911.968, 639.360],
-                [0.0,     0.0,     1.0],
-            ])
+        # After ROTATE_90_CLOCKWISE to 720x1280:
+        # new_fx=old_fy, new_fy=old_fx,
+        # new_cx=H-1-old_cy=719-375.114, new_cy=old_cx
+        self.camera_K = np.array([
+            [911.456, 0.0,     343.886],
+            [0.0,     911.968, 639.360],
+            [0.0,     0.0,     1.0],
+        ])
         self.detector = None
         self.exploring = False
 
@@ -455,8 +448,7 @@ class DrawerDetectionNode(Node):
             if arr is None:
                 return
             arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-            if not self.use_sim:
-                arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_rgb = arr
             stamp = msg_dict.get("header", {}).get("stamp", {})
             image_sec = stamp.get("sec", 0)
@@ -489,8 +481,7 @@ class DrawerDetectionNode(Node):
             if arr is None:
                 self.get_logger().warn("Failed to decode compressed depth")
                 return
-            if not self.use_sim:
-                arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = arr
             stamp = msg_dict.get("header", {}).get("stamp", {})
             depth_sec = stamp.get("sec", 0)
@@ -515,15 +506,12 @@ class DrawerDetectionNode(Node):
                     [k[3], k[4], k[5]],
                     [k[6], k[7], k[8]],
                 ])
-                if not self.use_sim:
-                    h = msg_dict.get("height", 720)
-                    self.camera_K = np.array([
-                        [raw_K[1, 1], 0.0,         h - 1 - raw_K[1, 2]],
-                        [0.0,         raw_K[0, 0],  raw_K[0, 2]],
-                        [0.0,         0.0,          1.0],
-                    ])
-                else:
-                    self.camera_K = raw_K
+                h = msg_dict.get("height", 720)
+                self.camera_K = np.array([
+                    [raw_K[1, 1], 0.0,         h - 1 - raw_K[1, 2]],
+                    [0.0,         raw_K[0, 0],  raw_K[0, 2]],
+                    [0.0,         0.0,          1.0],
+                ])
                 self.get_logger().info(
                     f"Camera intrinsics from rosbridge: "
                     f"fx={self.camera_K[0,0]:.1f}, fy={self.camera_K[1,1]:.1f}, "
@@ -655,16 +643,14 @@ class DrawerDetectionNode(Node):
 
     def _rgb_dds_callback(self, msg: RosImage):
         arr = self.bridge.imgmsg_to_cv2(msg, "rgb8")
-        if not self.use_sim:
-            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
         self.latest_rgb = arr
         self.latest_rgb_stamp = msg.header.stamp
         self._rgb_mono_stamp = time.monotonic()
 
     def _depth_dds_callback(self, msg: RosImage):
         arr = self.bridge.imgmsg_to_cv2(msg, "passthrough")
-        if not self.use_sim:
-            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
         self.latest_depth = arr
         self.latest_depth_stamp = msg.header.stamp
         self._depth_mono_stamp = time.monotonic()
@@ -676,11 +662,10 @@ class DrawerDetectionNode(Node):
         K = np.array([[k[0], k[1], k[2]],
                       [k[3], k[4], k[5]],
                       [k[6], k[7], k[8]]])
-        if not self.use_sim:
-            h = msg.height
-            K = np.array([[K[1, 1], 0.0,     h - 1 - K[1, 2]],
-                          [0.0,     K[0, 0], K[0, 2]],
-                          [0.0,     0.0,     1.0]])
+        h = msg.height
+        K = np.array([[K[1, 1], 0.0,     h - 1 - K[1, 2]],
+                      [0.0,     K[0, 0], K[0, 2]],
+                      [0.0,     0.0,     1.0]])
         if not hasattr(self, '_camera_info_logged'):
             self._camera_info_logged = True
             self.get_logger().info(
@@ -1437,7 +1422,7 @@ class DrawerDetectionNode(Node):
 
             paired_handle_indices.add(h_idx)
             self.get_logger().info(
-                f"Handle matched to drawer {drawer_bbox}: handle bbox={handle_bbox}"
+                f"Handle matched to drawer {drawer_bbox} (conf={det.score:.2f}): handle bbox={handle_bbox}"
             )
             results.append((drawer_bbox, handle_bbox, det.score))
 
@@ -1516,10 +1501,7 @@ class DrawerDetectionNode(Node):
         x_cam = (u - cx) / fx * d
         y_cam = (v - cy) / fy * d
         z_cam = d
-        if not self.use_sim:
-            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
-        else:
-            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
         p_world = camera_pose @ p_cam
         return p_world[:3]
 
@@ -1562,12 +1544,8 @@ class DrawerDetectionNode(Node):
         fx, fy = camera_K[0, 0], camera_K[1, 1]
         cx, cy = camera_K[0, 2], camera_K[1, 2]
 
-        if not self.use_sim:
-            u = fx * (-Y) / Z + cx
-            v = fy * X / Z + cy
-        else:
-            u = fx * X / Z + cx
-            v = fy * Y / Z + cy
+        u = fx * (-Y) / Z + cx
+        v = fy * X / Z + cy
 
         return np.stack([u, v], axis=1)
 
