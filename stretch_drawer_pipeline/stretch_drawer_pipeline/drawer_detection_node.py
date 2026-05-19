@@ -1064,7 +1064,7 @@ class DrawerDetectionNode(Node):
             self.get_logger().info(
                 f"Camera pose in odom: ({cam_xyz[0]:.3f}, {cam_xyz[1]:.3f}, {cam_xyz[2]:.3f})"
             )
-            world_pos = self._project_to_world(
+            world_pos = self._project_to_world_get_center(
                 handle_bbox, depth, camera_pose, camera_K
             )
             if world_pos is not None:
@@ -1124,7 +1124,7 @@ class DrawerDetectionNode(Node):
     def _pair_handles_to_gripper_pos_after_opening_drawer(self, projected_handles, unpaired_handles, depth, camera_pose, camera_K):
          # Project unpaired handles and add to projected list
         for handle_bbox in unpaired_handles:
-            world_pos = self._project_to_world(
+            world_pos = self._project_to_world_get_center(
                 handle_bbox, depth, camera_pose, camera_K
             )
             if world_pos is not None:
@@ -1294,7 +1294,7 @@ class DrawerDetectionNode(Node):
 
         for det in all_detections:
             if det.object_type in self._drawer_classes:
-                world_pos = self._project_to_world(det.bbox, depth, camera_pose, camera_K)
+                world_pos = self._project_to_world_get_center(det.bbox, depth, camera_pose, camera_K)
                 if world_pos is not None:
                     rt_px = self._world_to_pixels(world_pos.reshape(1, 3), camera_pose, camera_K)
                     if rt_px is not None:
@@ -1509,23 +1509,25 @@ class DrawerDetectionNode(Node):
             return depth.astype(np.float32) / 1000.0
         return depth.astype(np.float32)
 
-    def _project_to_world(
+    def _unproject_pixel(self, u, v, d, camera_pose, camera_K):
+        """Unproject a single pixel (u, v) at depth d to a 3D world point."""
+        fx, fy = camera_K[0, 0], camera_K[1, 1]
+        cx, cy = camera_K[0, 2], camera_K[1, 2]
+        x_cam = (u - cx) / fx * d
+        y_cam = (v - cy) / fy * d
+        z_cam = d
+        if not self.use_sim:
+            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
+        else:
+            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        p_world = camera_pose @ p_cam
+        return p_world[:3]
+
+    def _project_to_world_get_center(
         self, bbox, depth, camera_pose, camera_K, max_depth=5.0
     ):
         """Project bbox center to 3D world coordinates using depth."""
         depth_m = self._depth_to_meters(depth)
-
-        if self.use_sim:
-            try:
-                from realrobot.stretch.projection import project_bbox_to_world_se3
-                result = project_bbox_to_world_se3(
-                    bbox, depth_m,
-                    camera_pose, camera_K, max_depth=max_depth
-                )
-                return result
-            except ImportError:
-                pass
-
         x0, y0, x1, y1 = bbox
         h, w = depth_m.shape[:2]
 
@@ -1543,68 +1545,7 @@ class DrawerDetectionNode(Node):
         if d > max_depth:
             return None
 
-        fx, fy = camera_K[0, 0], camera_K[1, 1]
-        cx, cy = camera_K[0, 2], camera_K[1, 2]
-
-        x_cam = (u - cx) / fx * d
-        y_cam = (v - cy) / fy * d
-        z_cam = d
-
-        if not self.use_sim:
-            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
-        else:
-            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-        p_world = camera_pose @ p_cam
-        return p_world[:3]
-
-    def _project_to_world_wide(
-        self, bbox, depth_m, camera_pose, camera_K, max_depth=5.0, radius=15
-    ):
-        """Like _project_to_world but with wider depth sampling for small objects.
-
-        Accepts depth already in meters. Uses a larger sampling radius to
-        borrow depth from surrounding pixels (e.g. the drawer bottom around
-        a small object).
-        """
-        if self.use_sim:
-            try:
-                from realrobot.stretch.projection import project_bbox_to_world_se3
-                return project_bbox_to_world_se3(
-                    bbox, depth_m, camera_pose, camera_K, max_depth=max_depth
-                )
-            except ImportError:
-                pass
-
-        x0, y0, x1, y1 = bbox
-        h, w = depth_m.shape[:2]
-
-        u = int((x0 + x1) / 2)
-        v = int((y0 + y1) / 2)
-        u = max(0, min(u, w - 1))
-        v = max(0, min(v, h - 1))
-
-        region = depth_m[max(0, v - radius):v + radius, max(0, u - radius):u + radius]
-        valid = region[region > 0.1]
-        if len(valid) == 0:
-            return None
-
-        d = float(np.median(valid))
-        if d > max_depth:
-            return None
-
-        fx, fy = camera_K[0, 0], camera_K[1, 1]
-        cx, cy = camera_K[0, 2], camera_K[1, 2]
-
-        x_cam = (u - cx) / fx * d
-        y_cam = (v - cy) / fy * d
-        z_cam = d
-
-        if not self.use_sim:
-            p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
-        else:
-            p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-        p_world = camera_pose @ p_cam
-        return p_world[:3]
+        return self._unproject_pixel(u, v, d, camera_pose, camera_K)
 
     def _world_to_pixels(
         self, pts_world: np.ndarray, camera_pose: np.ndarray, camera_K: np.ndarray
@@ -1652,9 +1593,6 @@ class DrawerDetectionNode(Node):
         x1 -= margin_x
         y1 -= margin_y
 
-        fx, fy = camera_K[0, 0], camera_K[1, 1]
-        cx, cy = camera_K[0, 2], camera_K[1, 2]
-
         corners_px = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         corners_world = []
 
@@ -1666,15 +1604,7 @@ class DrawerDetectionNode(Node):
             if d is None:
                 return None
 
-            x_cam = (uc - cx) / fx * d
-            y_cam = (vc - cy) / fy * d
-            z_cam = d
-            if not self.use_sim:
-                p_cam = np.array([y_cam, -x_cam, z_cam, 1.0])
-            else:
-                p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-            p_world = camera_pose @ p_cam
-            corners_world.append(p_world[:3])
+            corners_world.append(self._unproject_pixel(uc, vc, d, camera_pose, camera_K))
 
         return corners_world
 
