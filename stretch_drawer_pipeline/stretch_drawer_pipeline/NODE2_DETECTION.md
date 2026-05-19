@@ -30,12 +30,13 @@ Detects drawers in camera frames using Detic, localizes handles, projects to wor
 
 ## Detection Gating
 
-Detection does NOT run continuously. It is gated by the exploration node:
+Detection does NOT run continuously. It is triggered exclusively by service call:
 
-- **`paused_for_detection`** state → `exploring=True` (timer can detect)
-- All other states → `exploring=False` (timer skips)
-- `/detection/trigger` service → runs one pass, then sets `exploring=False`
-- `test_mode=true` → bypasses gating, detects every frame
+- `/detection/trigger` service → runs one detection pass, then sets `exploring=False`
+- `test_mode=true` → bypasses gating, detects every frame via timer
+
+In **sim**: Node 1 calls `/detection/trigger` via DDS.
+On **real robot**: Node 1 calls it via rosbridge. Node 2 advertises the service through its roslibpy connection to the robot's rosbridge, so the service appears on the robot's ROS network.
 
 This ensures detection only runs when the robot is stationary and the camera is stable.
 

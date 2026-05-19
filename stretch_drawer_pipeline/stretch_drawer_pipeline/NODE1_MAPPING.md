@@ -28,10 +28,10 @@ Lightweight structured coverage using direct ROS2 joint commands (FollowJointTra
 
 1. Switches driver to position mode
 2. At each position: rotates 360 in 4 steps (90 each), performing a head sweep at each rotation step
-3. Head sweep: 8 angles (4 pan x 2 tilt), pauses for detection at each angle
+3. Head sweep: 16 angles (4 pan x 4 tilt), pauses for detection at each angle
 4. After each full rotation, moves forward (`move_distance` meters) with stall detection
 5. Repeats for `n_positions` positions total
-6. On completion: calls `/scene_graph/build_and_rank`, then sets COMPLETE
+6. On completion: sets COMPLETE (scene graph node auto-triggers GNN scoring via `/exploration_status` topic)
 
 Movement uses TF-based stall detection: if the robot moves less than 5cm during a translate command, it tries rotating 90 to find an alternate direction.
 
@@ -42,11 +42,12 @@ Movement uses TF-based stall detection: if the robot moves less than 5cm during 
 | `exploration_mode` | `"funmap"` | `funmap`, `occupancy_grid`, or `simple` |
 | `exploration_timeout_s` | `300.0` | Max exploration time (funmap mode) |
 | `max_scan_drive_cycles` | `20` | Max cycles (funmap mode) |
-| `use_sim` | `false` | Simulation mode |
+| `use_sim` | `false` | Simulation mode (DDS services for sim, rosbridge for real) |
 | `n_positions` | `4` | Positions to visit (simple mode) |
 | `move_distance` | `0.8` | Meters to move between positions (simple mode) |
 | `room_type` | `"kitchen"` | Scene context for GNN |
 | `query` | `""` | Target object for GNN ranking |
+| `rosbridge_port` | `9090` | Rosbridge WebSocket port (real robot only) |
 
 ## Exploration States
 
@@ -58,17 +59,17 @@ Movement uses TF-based stall detection: if the robot moves less than 5cm during 
 | `paused_for_detection` | Robot is still -- Node 2 should detect |
 | `complete` | Exploration finished |
 
-## Integration with Node 2
+## Integration with Node 2 and Node 4
 
-Detection is gated by state. Node 2 only detects when:
-1. The exploration status is `paused_for_detection`, OR
-2. `/detection/trigger` is called explicitly
+At each pause point, Node 1 calls two services and waits for both to respond before continuing:
 
-After each trigger call, Node 2 runs exactly one detection pass and sets `exploring=False`, so it does not detect while the robot is moving.
+1. `/detection/trigger` on Node 2 — runs one Detic detection pass (drawers + handles)
+2. `/scene_graph/process_frame` on Node 4 — runs one Detic pass (all objects), CLIP embeddings, 3D projection into scene graph
 
-## Integration with Node 4
+In **sim** (`use_sim=true`): both are DDS service calls (same machine).
+On the **real robot** (`use_sim=false`): both are rosbridge service calls. Node 1 connects to rosbridge on localhost, Nodes 2 and 4 on automata-3 advertise their services through rosbridge.
 
-When exploration completes, Node 1 calls `/scene_graph/build_and_rank` on Node 4, which:
+When exploration completes, Node 1 publishes `complete` on `/exploration_status`. Node 4 picks this up via topic subscription and auto-triggers GNN scoring:
 1. Clusters accumulated detections with DBSCAN
 2. Builds a HeteroData scene graph
 3. Runs the ContextGNN to score containers
@@ -92,6 +93,7 @@ When exploration completes, Node 1 calls `/scene_graph/build_and_rank` on Node 4
 
 | Aspect | Simulation | Real Robot |
 |--------|-----------|------------|
+| Service transport | DDS (same machine) | rosbridge WebSocket (robot ↔ automata-3) |
 | Funmap | Launched by pipeline | Pre-launched or launched by pipeline |
 | Simple mode | Works (MuJoCo FollowJointTrajectory) | Primary use case |
 | Runs on | Same machine as sim | On the robot (not automata-3) |

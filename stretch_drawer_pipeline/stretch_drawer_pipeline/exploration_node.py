@@ -26,6 +26,7 @@ from enum import Enum
 
 import numpy as np
 import rclpy
+import roslibpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
@@ -38,10 +39,11 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 import tf2_ros
 
 # Head sweep angles (pan, tilt) for detection — covers floor to upper cabinets
+# Tilt limited to -0.3 min to avoid seeing the gripper in frame
 HEAD_SWEEP_ANGLES = [
     (pan, tilt)
     for pan in [-1.2, -0.6, 0.0, 0.6]
-    for tilt in [-0.6, -0.3, 0.0, 0.3]
+    for tilt in [-0.5, -0.3, 0.0, 0.3]
 ]
 
 MOVE_DISTANCE = 0.8
@@ -71,7 +73,8 @@ class ExplorationNode(Node):
         self.declare_parameter("head_settle_s", 2.0)
         self.declare_parameter("room_type", "kitchen")
         self.declare_parameter("query", "")
-        self.declare_parameter("detection_wait_s", 15.0)
+
+        self.declare_parameter("rosbridge_port", 9090)
 
         self.exploration_mode = self.get_parameter("exploration_mode").value
         self.exploration_timeout = self.get_parameter("exploration_timeout_s").value
@@ -82,14 +85,14 @@ class ExplorationNode(Node):
         self.head_settle_s = self.get_parameter("head_settle_s").value
         self.room_type = self.get_parameter("room_type").value
         self.query = self.get_parameter("query").value
-        self._detection_wait_s = self.get_parameter("detection_wait_s").value
+
+        self._rosbridge_port = self.get_parameter("rosbridge_port").value
 
         self.state = ExplorationState.IDLE
         self.mapping_complete = False
         self.stop_requested = False
         self.exploration_thread = None
-        self._detection_available = False
-        self._scene_graph_available = False
+
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -119,15 +122,32 @@ class ExplorationNode(Node):
             Trigger, "/funmap/trigger_drive_to_scan", callback_group=self.cb_group
         )
 
-        # Detection trigger (all modes call this at pause points)
-        self.detection_trigger_client = self.create_client(
-            Trigger, "/detection/trigger", callback_group=self.cb_group
-        )
-
-        # Scene graph: tell Node 4 to build graph and run GNN
-        self.scene_graph_client = self.create_client(
-            Trigger, "/scene_graph/build_and_rank", callback_group=self.cb_group
-        )
+        # Detection & scene graph services — DDS for sim, rosbridge for real
+        self._ros_client = None
+        if self.use_sim:
+            self.detection_trigger_client = self.create_client(
+                Trigger, "/detection/trigger", callback_group=self.cb_group
+            )
+            self.scene_graph_frame_client = self.create_client(
+                Trigger, "/scene_graph/process_frame", callback_group=self.cb_group
+            )
+        else:
+            self._ros_client = roslibpy.Ros(
+                host="localhost", port=self._rosbridge_port
+            )
+            self._ros_client_thread = threading.Thread(
+                target=self._ros_client.run, daemon=True
+            )
+            self._ros_client_thread.start()
+            self._ws_detection_service = roslibpy.Service(
+                self._ros_client, "/detection/trigger", "std_srvs/srv/Trigger"
+            )
+            self._ws_scene_graph_frame_service = roslibpy.Service(
+                self._ros_client, "/scene_graph/process_frame", "std_srvs/srv/Trigger"
+            )
+            self.get_logger().info(
+                f"Rosbridge service clients on localhost:{self._rosbridge_port}"
+            )
 
         # Status publisher
         self.status_pub = self.create_publisher(String, "/exploration_status", 10)
@@ -196,22 +216,38 @@ class ExplorationNode(Node):
     # ── Exploration dispatch ─────────────────────────────────────────
 
     def _exploration_loop(self):
+        try:
+            self._exploration_loop_inner()
+        except Exception as e:
+            self.get_logger().error(f"Exploration thread crashed: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            self._set_state(ExplorationState.IDLE)
+
+    def _retract_arm(self):
+        """Fully retract the arm and point gripper down before exploring."""
+        self.get_logger().info("Retracting arm before exploration")
+        self._send_joint_command("wrist_extension", 0.0, duration_sec=4)
+        self._send_joint_command("joint_wrist_pitch", -1.57, duration_sec=2)
+        time.sleep(1.0)
+
+    def _exploration_loop_inner(self):
         mode = self.exploration_mode
         self.get_logger().info(f"Exploration loop started (mode={mode})")
 
-        self._detection_available = self.detection_trigger_client.wait_for_service(
-            timeout_sec=5.0
-        )
-        if self._detection_available:
-            self.get_logger().info("/detection/trigger available (DDS)")
-        else:
-            self.get_logger().warn(
-                "/detection/trigger not available on DDS — will use sleep fallback"
-            )
+        self._retract_arm()
 
-        self._scene_graph_available = self.scene_graph_client.wait_for_service(
-            timeout_sec=2.0
-        )
+        if self.use_sim:
+            if self.detection_trigger_client.wait_for_service(timeout_sec=5.0):
+                self.get_logger().info("/detection/trigger available (DDS)")
+            else:
+                self.get_logger().warn("/detection/trigger not available (DDS)")
+            if self.scene_graph_frame_client.wait_for_service(timeout_sec=5.0):
+                self.get_logger().info("/scene_graph/process_frame available (DDS)")
+            else:
+                self.get_logger().warn("/scene_graph/process_frame not available (DDS)")
+        else:
+            self.get_logger().info("Using rosbridge for detection and scene graph services")
 
         if mode == "funmap":
             self._run_funmap_loop()
@@ -227,35 +263,29 @@ class ExplorationNode(Node):
         self._on_exploration_complete()
 
     def _on_exploration_complete(self):
-        """Called when any exploration mode finishes."""
-        if self._scene_graph_available:
-            self.get_logger().info("Exploration finished — requesting scene graph build")
-            result = self._call_trigger_service(self.scene_graph_client)
-            if result and result.success:
-                self.get_logger().info(f"Scene graph built: {result.message}")
-            else:
-                msg = result.message if result else "service call failed"
-                self.get_logger().warn(f"Scene graph build returned: {msg}")
-        else:
-            self.get_logger().info("Exploration finished (no scene graph node running)")
+        """Called when any exploration mode finishes.
 
+        Sets state to COMPLETE, which publishes on /exploration_status.
+        The scene graph node picks up the "complete" status via that topic
+        and auto-triggers GNN scoring + ranking push.
+        """
+        self.get_logger().info("Exploration finished")
         self._set_state(ExplorationState.COMPLETE)
         self.mapping_complete = True
 
     # ── Pause-and-detect helper ──────────────────────────────────────
 
     def _pause_for_detection(self):
-        """Pause, trigger one detection pass on Node 2, then return."""
+        """Pause, trigger detection and scene graph frame processing, then return."""
         self._set_state(ExplorationState.PAUSED_FOR_DETECTION)
 
-        if self._detection_available:
-            result = self._call_trigger_service(self.detection_trigger_client)
-            if result:
-                self.get_logger().debug(f"Detection trigger: {result.message}")
-            return
+        det_result = self._call_service("/detection/trigger", timeout_sec=30.0)
+        if det_result:
+            self.get_logger().info(f"Detection: {det_result.get('message', '')}")
 
-        self.get_logger().debug(f"Sleeping {self._detection_wait_s:.0f}s for detection")
-        time.sleep(self._detection_wait_s)
+        sg_result = self._call_service("/scene_graph/process_frame", timeout_sec=30.0)
+        if sg_result:
+            self.get_logger().info(f"Scene graph: {sg_result.get('message', '')}")
 
     # ── Mode 1: funmap ───────────────────────────────────────────────
 
@@ -563,13 +593,118 @@ class ExplorationNode(Node):
         if result:
             self.get_logger().info("Switched to navigation mode")
 
-    def _call_trigger_service(self, client):
-        """Synchronously call a Trigger service. Returns response or None."""
+    # ── Dual-transport service call ────────────────────────────────────
+
+    _DDS_SERVICE_MAP = {
+        "/detection/trigger": "detection_trigger_client",
+        "/scene_graph/process_frame": "scene_graph_frame_client",
+    }
+
+    _WS_SERVICE_MAP = {
+        "/detection/trigger": "_ws_detection_service",
+        "/scene_graph/process_frame": "_ws_scene_graph_frame_service",
+    }
+
+    def _call_service(self, service_name, timeout_sec=30.0):
+        """Call a Trigger service via DDS (sim) or rosbridge (real).
+
+        Returns dict with 'success' and 'message' keys, or None on failure.
+        """
+        if self.use_sim:
+            return self._call_service_dds(service_name, timeout_sec)
+        return self._call_service_rosbridge(service_name, timeout_sec)
+
+    def _call_service_dds(self, service_name, timeout_sec):
+        attr = self._DDS_SERVICE_MAP.get(service_name)
+        if not attr:
+            self.get_logger().error(f"Unknown DDS service: {service_name}")
+            return None
+
+        client = getattr(self, attr, None)
+        if client is None:
+            return None
+
         request = Trigger.Request()
         future = client.call_async(request)
+        deadline = time.time() + timeout_sec
 
         while not future.done():
             if self.stop_requested:
+                return None
+            if time.time() > deadline:
+                self.get_logger().warn(
+                    f"{service_name} timed out after {timeout_sec:.0f}s"
+                )
+                future.cancel()
+                return None
+            time.sleep(0.1)
+
+        try:
+            result = future.result()
+            return {"success": result.success, "message": result.message}
+        except Exception as e:
+            self.get_logger().error(f"{service_name} exception: {e}")
+            return None
+
+    def _call_service_rosbridge(self, service_name, timeout_sec):
+        attr = self._WS_SERVICE_MAP.get(service_name)
+        if not attr:
+            self.get_logger().error(f"Unknown rosbridge service: {service_name}")
+            return None
+
+        ws_service = getattr(self, attr, None)
+        if ws_service is None:
+            return None
+
+        result = [None]
+        done = threading.Event()
+
+        def _on_response(resp):
+            result[0] = resp
+            done.set()
+
+        def _on_error(exc):
+            self.get_logger().error(f"{service_name} rosbridge error: {exc}")
+            done.set()
+
+        try:
+            ws_service.call(
+                roslibpy.ServiceRequest(),
+                callback=_on_response,
+                errback=_on_error,
+            )
+        except Exception as e:
+            self.get_logger().error(f"{service_name} call failed: {e}")
+            return None
+
+        if not done.wait(timeout=timeout_sec):
+            self.get_logger().warn(
+                f"{service_name} rosbridge timed out after {timeout_sec:.0f}s"
+            )
+            return None
+
+        if result[0] is None:
+            return None
+
+        return {
+            "success": result[0].get("success", False),
+            "message": result[0].get("message", ""),
+        }
+
+    def _call_trigger_service(self, client, timeout_sec=30.0):
+        """Synchronously call a Trigger service via DDS. Used for local services."""
+        request = Trigger.Request()
+        future = client.call_async(request)
+        deadline = time.time() + timeout_sec
+
+        while not future.done():
+            if self.stop_requested:
+                return None
+            if time.time() > deadline:
+                self.get_logger().warn(
+                    f"Service call timed out after {timeout_sec:.0f}s"
+                )
+                future.cancel()
                 return None
             time.sleep(0.1)
 

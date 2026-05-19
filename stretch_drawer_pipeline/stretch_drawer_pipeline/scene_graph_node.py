@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+import roslibpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
@@ -38,8 +39,9 @@ from sensor_msgs.msg import CameraInfo, Image as RosImage
 from std_msgs.msg import ColorRGBA, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, TransformStamped, Vector3, Quaternion
 from builtin_interfaces.msg import Duration as RosDuration
+from tf2_msgs.msg import TFMessage
 import tf2_ros
 
 _SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent / "semantic-object-container-room"
@@ -48,7 +50,6 @@ if str(_SEMANTIC_ROOT) not in sys.path:
 
 MAX_PROJECTION_DEPTH = 5.0
 MIN_PROJECTION_DEPTH = 0.1
-TF_READY_THRESHOLD = 5
 
 
 def _bbox_iou(a, b):
@@ -118,12 +119,15 @@ class SceneGraphNode(Node):
         self.camera_K = None
         self._rgb_stamp = 0.0
         self._depth_stamp = 0.0
+        self._rgb_ros_stamp = None
+        self._depth_ros_stamp = None
         self._detecting = False
 
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=30))
         self._tf_ready = False
-        self._tf_consecutive_ok = 0
+        self._has_tf = False
+        self._has_tf_static = False
 
         # Lazy-loaded models
         self._models_loaded = False
@@ -173,11 +177,7 @@ class SceneGraphNode(Node):
         )
 
         # Services
-        self.create_service(
-            Trigger, "/scene_graph/build_and_rank",
-            self._build_and_rank_callback,
-            callback_group=self.cb_group,
-        )
+        # Services that don't need models
         self.create_service(
             Trigger, "/scene_graph/get_rankings",
             self._get_rankings_callback,
@@ -189,18 +189,70 @@ class SceneGraphNode(Node):
             callback_group=self.cb_group,
         )
 
+        # Load models, then register services — service availability
+        # signals readiness to the exploration node
+        self.get_logger().info("Loading models (Detic, CLIP, GNN)...")
+        self._ensure_models_loaded()
+        self.get_logger().info(f"All models loaded on {self.device}")
+
+        self.create_service(
+            Trigger, "/scene_graph/process_frame",
+            self._process_frame_callback,
+            callback_group=self.cb_group,
+        )
+        self.create_service(
+            Trigger, "/scene_graph/build_and_rank",
+            self._build_and_rank_callback,
+            callback_group=self.cb_group,
+        )
+        if hasattr(self, "_ros_client"):
+            self._ws_process_frame_service = roslibpy.Service(
+                self._ros_client, "/scene_graph/process_frame", "std_srvs/srv/Trigger"
+            )
+            self._ws_process_frame_service.advertise(self._rosbridge_process_frame_handler)
+            self.get_logger().info("Advertised /scene_graph/process_frame via rosbridge")
+
         self.get_logger().info(
-            f"Scene graph node initialized: room={self.room_type}, "
+            f"Scene graph node ready: room={self.room_type}, "
             f"query={self.query}, device={self.device}"
         )
+
+    # ── TF readiness ────────────────────────────────────────────────
+
+    def _on_tf_msg(self, msg):
+        if not self._has_tf:
+            self._has_tf = True
+            self._check_tf_ready()
+
+    def _on_tf_static_msg(self, msg):
+        if not self._has_tf_static:
+            self._has_tf_static = True
+            self._check_tf_ready()
+
+    def _check_tf_ready(self):
+        if self._has_tf and self._has_tf_static and not self._tf_ready:
+            self._tf_ready = True
+            self.get_logger().info("TF ready")
 
     # ── Image transport ──────────────────────────────────────────────
 
     def _setup_dds_images(self):
-        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        tf_static_qos = QoSProfile(
+            depth=100,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.create_subscription(
+            TFMessage, "/tf", self._on_tf_msg, 10
+        )
+        self.create_subscription(
+            TFMessage, "/tf_static", self._on_tf_static_msg, tf_static_qos
+        )
 
         self.create_subscription(
             RosImage, "/camera/color/image_raw",
@@ -250,19 +302,36 @@ class SceneGraphNode(Node):
             "std_msgs/msg/String",
         )
 
+        self._ws_tf_topic = roslibpy.Topic(
+            self._ros_client, "/tf", "tf2_msgs/msg/TFMessage",
+        )
+        self._ws_tf_static_topic = roslibpy.Topic(
+            self._ros_client, "/tf_static_volatile", "tf2_msgs/msg/TFMessage",
+        )
+
+        self._tf_pub = self.create_publisher(TFMessage, "/tf", 100)
+        self._tf_static_pub = self.create_publisher(
+            TFMessage, "/tf_static",
+            rclpy.qos.QoSProfile(
+                depth=100,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+
         self._rgb_topic.subscribe(self._rgb_ws_callback)
         self._depth_topic.subscribe(self._depth_ws_callback)
         self._camera_info_topic.subscribe(self._camera_info_ws_callback)
         self._exploration_status_topic.subscribe(self._exploration_status_ws_callback)
-
-        # TF: rely on Node 2 republishing TF locally from rosbridge.
-        # We just need a TF listener on the local ROS2 network.
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self._ws_tf_topic.subscribe(self._rosbridge_tf_callback)
+        self._ws_tf_static_topic.subscribe(self._rosbridge_tf_static_callback)
 
         self._ros_client_thread = threading.Thread(
             target=self._ros_client.run, daemon=True
         )
         self._ros_client_thread.start()
+
+        # /scene_graph/process_frame rosbridge advertisement is deferred
+        # to after model loading — see end of __init__
 
     # ── DDS image callbacks ──────────────────────────────────────────
 
@@ -274,6 +343,7 @@ class SceneGraphNode(Node):
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_rgb = arr
             self._rgb_stamp = time.monotonic()
+            self._rgb_ros_stamp = msg.header.stamp
         except Exception as e:
             self.get_logger().warn(f"RGB decode error: {e}", throttle_duration_sec=5.0)
 
@@ -286,6 +356,7 @@ class SceneGraphNode(Node):
             self.latest_depth = depth.astype(np.float32)
             if self.latest_depth.max() > 100:
                 self.latest_depth /= 1000.0
+            self._depth_ros_stamp = msg.header.stamp
             self._depth_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"Depth decode error: {e}", throttle_duration_sec=5.0)
@@ -319,6 +390,11 @@ class SceneGraphNode(Node):
                     arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
                 self.latest_rgb = arr
                 self._rgb_stamp = time.monotonic()
+                stamp = msg.get("header", {}).get("stamp", {})
+                self._rgb_ros_stamp = rclpy.time.Time(
+                    seconds=stamp.get("sec", 0),
+                    nanoseconds=stamp.get("nanosec", 0),
+                ).to_msg()
         except Exception as e:
             self.get_logger().warn(f"WS RGB error: {e}", throttle_duration_sec=5.0)
 
@@ -339,6 +415,11 @@ class SceneGraphNode(Node):
             self.latest_depth = depth.astype(np.float32)
             if self.latest_depth.max() > 100:
                 self.latest_depth /= 1000.0
+            stamp = msg.get("header", {}).get("stamp", {})
+            self._depth_ros_stamp = rclpy.time.Time(
+                seconds=stamp.get("sec", 0),
+                nanoseconds=stamp.get("nanosec", 0),
+            ).to_msg()
             self._depth_stamp = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"WS depth error: {e}", throttle_duration_sec=5.0)
@@ -359,6 +440,59 @@ class SceneGraphNode(Node):
         except Exception:
             pass
 
+    # ── Rosbridge TF callbacks ──────────────────────────────────────
+
+    def _rosbridge_tf_callback(self, msg_dict):
+        self._republish_tf(msg_dict, self._tf_pub)
+        if not self._has_tf:
+            self._has_tf = True
+            self._check_tf_ready()
+
+    def _rosbridge_tf_static_callback(self, msg_dict):
+        self._republish_tf(msg_dict, self._tf_static_pub, static=True)
+        if not self._has_tf_static:
+            self._has_tf_static = True
+            self._check_tf_ready()
+        self._ws_tf_static_topic.unsubscribe()
+        self.get_logger().info("Received and republished static TFs via rosbridge")
+
+    def _republish_tf(self, msg_dict, publisher, static=False):
+        try:
+            tf_msg = TFMessage()
+            for t in msg_dict.get("transforms", []):
+                ts = TransformStamped()
+                h = t.get("header", {})
+                stamp = h.get("stamp", {})
+                ts.header.stamp.sec = stamp.get("sec", 0)
+                ts.header.stamp.nanosec = stamp.get("nanosec", 0)
+                ts.header.frame_id = h.get("frame_id", "")
+                ts.child_frame_id = t.get("child_frame_id", "")
+                tr = t.get("transform", {})
+                tl = tr.get("translation", {})
+                rot = tr.get("rotation", {})
+                ts.transform.translation = Vector3(
+                    x=tl.get("x", 0.0),
+                    y=tl.get("y", 0.0),
+                    z=tl.get("z", 0.0),
+                )
+                ts.transform.rotation = Quaternion(
+                    x=rot.get("x", 0.0),
+                    y=rot.get("y", 0.0),
+                    z=rot.get("z", 0.0),
+                    w=rot.get("w", 1.0),
+                )
+                tf_msg.transforms.append(ts)
+                if static:
+                    self.tf_buffer.set_transform_static(ts, "rosbridge")
+                else:
+                    self.tf_buffer.set_transform(ts, "rosbridge")
+        except Exception as e:
+            self.get_logger().warn(f"TF decode failed: {e}", throttle_duration_sec=5.0)
+        try:
+            publisher.publish(tf_msg)
+        except Exception as e:
+            self.get_logger().warn(f"TF republish failed: {e}", throttle_duration_sec=10.0)
+
     # ── Exploration status ───────────────────────────────────────────
 
     def _exploration_status_callback(self, msg: String):
@@ -368,23 +502,13 @@ class SceneGraphNode(Node):
         self._handle_exploration_status(msg.get("data", ""))
 
     def _handle_exploration_status(self, status: str):
-        if status == "paused_for_detection":
-            if not self._detecting:
-                self._detecting = True
-                self._exploration_complete_handled = False
-                self._pause_stamp = time.monotonic()
-                self.latest_rgb = None
-                self.latest_depth = None
-                threading.Thread(
-                    target=self._process_current_frame, daemon=True
-                ).start()
-        elif status == "complete":
+        if status == "complete":
             self._detecting = False
-            if not getattr(self, '_exploration_complete_handled', False):
+            if not getattr(self, "_exploration_complete_handled", False):
                 self._exploration_complete_handled = True
                 self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
                 threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
-        else:
+        elif status != "paused_for_detection":
             self._detecting = False
 
     def _auto_build_and_rank(self):
@@ -424,7 +548,7 @@ class SceneGraphNode(Node):
             )
 
             self._detector = VisualDetector(
-                device="cpu", score_threshold=self.det_min_score
+                device=device, score_threshold=self.det_min_score
             )
             self._clip_model, self._clip_preprocess = clip_module.load(
                 "ViT-B/32", device=device
@@ -474,6 +598,12 @@ class SceneGraphNode(Node):
 
     def _process_current_frame(self):
         """Process the current camera frame: Detic → CLIP → 3D project → builder."""
+        try:
+            self._process_current_frame_inner()
+        finally:
+            self._detecting = False
+
+    def _process_current_frame_inner(self):
         import torch
         from PIL import Image
 
@@ -482,11 +612,24 @@ class SceneGraphNode(Node):
 
         # Wait for fresh images received AFTER the pause signal
         pause_t = getattr(self, '_pause_stamp', 0.0)
+        stamp_slop = 0.05
         for _ in range(50):
             rgb_fresh = self.latest_rgb is not None and self._rgb_stamp > pause_t
             depth_fresh = self.latest_depth is not None and self._depth_stamp > pause_t
             if rgb_fresh and depth_fresh:
-                break
+                rs = self._rgb_ros_stamp
+                ds = self._depth_ros_stamp
+                if rs is not None and ds is not None:
+                    rgb_t = rs.sec + rs.nanosec / 1e9
+                    depth_t = ds.sec + ds.nanosec / 1e9
+                    if abs(rgb_t - depth_t) <= stamp_slop:
+                        break
+                    self.get_logger().debug(
+                        f"RGB/depth stamp gap {abs(rgb_t - depth_t):.3f}s — waiting for matching pair",
+                        throttle_duration_sec=2.0,
+                    )
+                else:
+                    break
             time.sleep(0.1)
 
         if self.latest_rgb is None or self.latest_depth is None:
@@ -496,27 +639,26 @@ class SceneGraphNode(Node):
             )
             return
 
-        # Use latest TF — head is paused during detection so latest is correct.
-        # Stamped lookups fail because TF arrives via rosbridge with delay.
+        rgb_stamp = self._rgb_ros_stamp
         camera_frame = "camera_color_optical_frame"
         try:
+            stamp = rclpy.time.Time.from_msg(rgb_stamp) if rgb_stamp else rclpy.time.Time()
             transform = self.tf_buffer.lookup_transform(
                 "odom", camera_frame,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=1.0),
+                stamp,
+                timeout=rclpy.duration.Duration(seconds=2.0),
             )
         except Exception as e:
-            self._tf_consecutive_ok = 0
-            self.get_logger().warn(
-                f"TF lookup failed: {e}", throttle_duration_sec=5.0
+            self.get_logger().error(
+                f"TF lookup FAILED for stamp={stamp} — skipping frame: {e}"
             )
             return
 
         camera_pose = self._transform_to_matrix(transform)
         t = transform.transform.translation
         tf_stamp = transform.header.stamp
-        now_sec = time.time()
-        tf_age = now_sec - (tf_stamp.sec + tf_stamp.nanosec / 1e9)
+        now = self.get_clock().now()
+        tf_age = now.nanoseconds / 1e9 - (tf_stamp.sec + tf_stamp.nanosec / 1e9)
         self.get_logger().info(
             f"Camera pose in odom: ({t.x:.3f}, {t.y:.3f}, {t.z:.3f})"
             f"  tf_stamp={tf_stamp.sec}.{tf_stamp.nanosec:09d}  age={tf_age:.1f}s"
@@ -529,14 +671,8 @@ class SceneGraphNode(Node):
             return
 
         if not self._tf_ready:
-            self._tf_consecutive_ok += 1
-            if self._tf_consecutive_ok < TF_READY_THRESHOLD:
-                self.get_logger().info(
-                    f"TF warming up: {self._tf_consecutive_ok}/{TF_READY_THRESHOLD}"
-                )
-                return
-            self._tf_ready = True
-            self.get_logger().info("TF ready")
+            self.get_logger().warn("TF not yet warmed up — skipping frame")
+            return
 
         if self.camera_K is None:
             self.get_logger().debug("No camera_K yet")
@@ -551,8 +687,15 @@ class SceneGraphNode(Node):
 
         dets = self._detector.detect(rgb, return_crops=True)
         dets = [d for d in dets if d.score >= self.det_min_score]
+        n_raw = len(dets)
         dets = nms_by_type(dets)
+        n_nms1 = len(dets)
         dets = _cross_class_nms(dets, iou_threshold=0.3)
+        self.get_logger().info(
+            f"Detic: {n_raw} raw → {n_nms1} after per-type NMS → {len(dets)} after cross-class NMS")
+        for d in dets:
+            self.get_logger().info(
+                f"  kept: {d.object_type} bbox={d.bbox} score={d.score:.2f}")
 
         if dets:
             self._ensure_type_text_embeddings(
@@ -596,6 +739,7 @@ class SceneGraphNode(Node):
             x0, y0, x1, y1 = det.bbox
             area = (x1 - x0) * (y1 - y0)
 
+            n_before = self._builder.n_nodes
             self._builder.add_observation(
                 obj_type=det.object_type,
                 position_3d=world_pos,
@@ -603,6 +747,13 @@ class SceneGraphNode(Node):
                 scene_frame_clip=scene_frame_emb,
                 crop_area=area,
             )
+            n_after = self._builder.n_nodes
+            if n_after > n_before:
+                self.get_logger().info(
+                    f"    NEW node for {det.object_type} (total {n_after})")
+            else:
+                self.get_logger().info(
+                    f"    MERGED {det.object_type} into existing node")
             n_added += 1
 
             with self._detected_objects_lock:
@@ -712,6 +863,33 @@ class SceneGraphNode(Node):
 
     # ── Service callbacks ────────────────────────────────────────────
 
+    def _process_frame_callback(self, request, response):
+        """Process one frame: Detic + CLIP + 3D projection into scene graph."""
+        if not self._tf_ready:
+            response.success = False
+            response.message = "TF not ready"
+            return response
+        self._pause_stamp = time.monotonic()
+        self.latest_rgb = None
+        self.latest_depth = None
+        self._rgb_ros_stamp = None
+        self._depth_ros_stamp = None
+        self._detecting = True
+        try:
+            self._process_current_frame_inner()
+            response.success = True
+            response.message = (
+                f"{self._builder.n_nodes} nodes, "
+                f"{self._n_observations} observations"
+            )
+        except Exception as e:
+            self.get_logger().error(f"process_frame failed: {e}")
+            response.success = False
+            response.message = str(e)
+        finally:
+            self._detecting = False
+        return response
+
     def _build_and_rank_callback(self, request, response):
         """Build scene graph, run GNN, push rankings to Node 2."""
         ranking = self._run_scoring()
@@ -737,6 +915,42 @@ class SceneGraphNode(Node):
     def _score_now_callback(self, request, response):
         """Force re-scoring (same as build_and_rank)."""
         return self._build_and_rank_callback(request, response)
+
+    # ── Rosbridge service handlers ──────────────────────────────────
+
+    def _rosbridge_process_frame_handler(self, request, response):
+        """Handle /scene_graph/process_frame called via rosbridge."""
+        def _do_process():
+            if not self._tf_ready:
+                response(roslibpy.ServiceResponse({
+                    "success": False,
+                    "message": "TF not ready",
+                }))
+                return
+            self._pause_stamp = time.monotonic()
+            self.latest_rgb = None
+            self.latest_depth = None
+            self._rgb_ros_stamp = None
+            self._depth_ros_stamp = None
+            self._detecting = True
+            try:
+                self._process_current_frame_inner()
+                response(roslibpy.ServiceResponse({
+                    "success": True,
+                    "message": (
+                        f"{self._builder.n_nodes} nodes, "
+                        f"{self._n_observations} observations"
+                    ),
+                }))
+            except Exception as e:
+                self.get_logger().error(f"Rosbridge process_frame failed: {e}")
+                response(roslibpy.ServiceResponse({
+                    "success": False,
+                    "message": str(e),
+                }))
+            finally:
+                self._detecting = False
+        threading.Thread(target=_do_process, daemon=True).start()
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -861,8 +1075,10 @@ class SceneGraphNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = SceneGraphNode()
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

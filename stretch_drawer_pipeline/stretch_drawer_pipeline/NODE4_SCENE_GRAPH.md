@@ -8,9 +8,9 @@ This node runs its own Detic pass with the full 21K vocabulary, separate from No
 
 ## How It Works
 
-1. **During exploration**: Listens to `/exploration_status`. On each `paused_for_detection` frame, captures RGB+depth, runs Detic (all classes), computes CLIP embeddings for each crop, projects to 3D world coordinates, and adds to the VoxelGraphBuilder.
+1. **During exploration**: At each pause point, Node 1 calls `/scene_graph/process_frame` (via DDS in sim, rosbridge on real robot). This captures RGB+depth, runs Detic (all classes), computes CLIP embeddings for each crop, projects to 3D world coordinates, and adds to the VoxelGraphBuilder. Node 1 waits for the response before continuing.
 
-2. **On exploration complete**: Node 1 calls `/scene_graph/build_and_rank`. The node:
+2. **On exploration complete**: Node 1 publishes `complete` on `/exploration_status`. Node 4 picks this up via topic subscription and auto-triggers GNN scoring:
    - Clusters raw detections with DBSCAN (eps=0.2m)
    - Builds a HeteroData scene graph with container, landmark, and room nodes
    - Computes soft-ldist spatial features
@@ -45,7 +45,8 @@ This node runs its own Detic pass with the full 21K vocabulary, separate from No
 
 | Service | Type | Description |
 |---------|------|-------------|
-| `/scene_graph/build_and_rank` | Trigger | Build graph, run GNN, push rankings to Node 2 |
+| `/scene_graph/process_frame` | Trigger | Process one frame (Detic + CLIP + 3D projection). Called by Node 1 at each pause point. Available via rosbridge on real robot. |
+| `/scene_graph/build_and_rank` | Trigger | Build graph, run GNN, push rankings to Node 2. Auto-triggered on exploration complete, also callable manually. |
 | `/scene_graph/get_rankings` | Trigger | Return current rankings as JSON |
 | `/scene_graph/score_now` | Trigger | Force re-scoring (alias for build_and_rank) |
 
@@ -60,6 +61,7 @@ Models are loaded on first use to reduce startup time:
 
 | Aspect | Simulation | Real Robot |
 |--------|-----------|------------|
+| Service transport | DDS (same machine as Node 1) | rosbridge (advertised through robot's rosbridge) |
 | Image transport | DDS (raw topics) | rosbridge WebSocket (compressed) |
 | Image rotation | None | 90 CW (matches Node 2) |
 | Camera K | From camera_info topic | Rotated intrinsics |

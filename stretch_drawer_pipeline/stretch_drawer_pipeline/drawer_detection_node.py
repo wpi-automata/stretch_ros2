@@ -118,6 +118,7 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("throttle_rate_ms", 2000)
         self.declare_parameter("keep_drawers_open", True)
         self.declare_parameter("gnn_match_threshold", 0.5)
+        self.declare_parameter("device", "cuda")
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -131,6 +132,7 @@ class DrawerDetectionNode(Node):
         self.detection_rate = self.get_parameter("detection_rate_hz").value
         self.keep_drawers_open = self.get_parameter("keep_drawers_open").value
         self.gnn_match_threshold = self.get_parameter("gnn_match_threshold").value
+        self.device = self.get_parameter("device").value
 
         params = {p.name: p.value for p in self.get_parameters(
             [d.name for d in self._parameters.values()]
@@ -164,6 +166,7 @@ class DrawerDetectionNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_rgb_stamp = None
+        self.latest_depth_stamp = None
         self._rgb_mono_stamp = 0.0
         self._depth_mono_stamp = 0.0
         self._pause_stamp = 0.0
@@ -190,8 +193,9 @@ class DrawerDetectionNode(Node):
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=30))
         self._tf_ready = False
-        self._tf_consecutive_ok = 0
-        self._TF_READY_THRESHOLD = 5
+        self._has_tf = False
+        self._has_tf_static = False
+        self._detecting = False
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -228,12 +232,7 @@ class DrawerDetectionNode(Node):
         else:
             self._setup_dds_images()
 
-        # Services
-        self.create_service(
-            Trigger, "/detection/trigger",
-            self.trigger_detection_callback,
-            callback_group=self.cb_group,
-        )
+        # Services that don't need the model
         self.create_service(
             Trigger, "/detection/get_drawers",
             self.get_drawers_callback,
@@ -260,15 +259,37 @@ class DrawerDetectionNode(Node):
                 "run colcon build to enable GNN ranking"
             )
 
-        # Detection timer
-        period = 1.0 / self.detection_rate
-        self.create_timer(period, self.detection_tick)
+        # Test mode: periodic detection without exploration trigger
+        if self.test_mode:
+            period = 1.0 / self.detection_rate
+            self.create_timer(period, self._test_mode_tick)
 
         # Visualization timer
         self.create_timer(1.0, self.publish_markers)
 
+        # Load Detic, then register /detection/trigger — service
+        # availability signals readiness to the exploration node
+        self.get_logger().info("Loading Detic model...")
+        from realrobot.detector import VisualDetector
+        self.detector = VisualDetector(
+            device=self.device, score_threshold=self.detection_confidence
+        )
+        self.get_logger().info(f"Detic model loaded on {self.device}")
+
+        self.create_service(
+            Trigger, "/detection/trigger",
+            self.trigger_detection_callback,
+            callback_group=self.cb_group,
+        )
+        if hasattr(self, "_ros_client"):
+            self._ws_trigger_service = roslibpy.Service(
+                self._ros_client, "/detection/trigger", "std_srvs/srv/Trigger"
+            )
+            self._ws_trigger_service.advertise(self._rosbridge_trigger_handler)
+            self.get_logger().info("Advertised /detection/trigger via rosbridge")
+
         self.get_logger().info(
-            f"Drawer detection node initialized: "
+            f"Drawer detection node ready: "
             f"confidence={self.detection_confidence}, "
             f"test_mode={self.test_mode}, "
             f"rank_via_LOCUS={self.rank_via_locus}"
@@ -278,10 +299,24 @@ class DrawerDetectionNode(Node):
 
     def _setup_dds_images(self):
         """Subscribe to camera topics via DDS (sim or same-machine)."""
-        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        tf_static_qos = QoSProfile(
+            depth=100,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.create_subscription(
+            TFMessage, "/tf",
+            self._on_tf_msg, 10
+        )
+        self.create_subscription(
+            TFMessage, "/tf_static",
+            self._on_tf_static_msg, tf_static_qos
+        )
 
         self.create_subscription(
             RosImage, "/camera/color/image_raw",
@@ -393,6 +428,9 @@ class DrawerDetectionNode(Node):
         )
         self._ros_client_thread.start()
 
+        # /detection/trigger rosbridge advertisement is deferred to after
+        # model loading — see end of __init__
+
         self.create_timer(10.0, self._ws_log_stats)
 
     def _rosbridge_rgb_callback(self, msg_dict):
@@ -443,6 +481,12 @@ class DrawerDetectionNode(Node):
             if not self.use_sim:
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = arr
+            stamp = msg_dict.get("header", {}).get("stamp", {})
+            depth_sec = stamp.get("sec", 0)
+            depth_nsec = stamp.get("nanosec", 0)
+            self.latest_depth_stamp = rclpy.time.Time(
+                seconds=depth_sec, nanoseconds=depth_nsec,
+            ).to_msg()
             self._ws_depth_count += 1
             self._depth_mono_stamp = time.monotonic()
         except Exception as e:
@@ -478,11 +522,32 @@ class DrawerDetectionNode(Node):
         except Exception as e:
             self.get_logger().warn(f"camera_info decode failed: {e}")
 
+    def _on_tf_msg(self, msg):
+        if not self._has_tf:
+            self._has_tf = True
+            self._check_tf_ready()
+
+    def _on_tf_static_msg(self, msg):
+        if not self._has_tf_static:
+            self._has_tf_static = True
+            self._check_tf_ready()
+
+    def _check_tf_ready(self):
+        if self._has_tf and self._has_tf_static and not self._tf_ready:
+            self._tf_ready = True
+            self.get_logger().info("TF ready")
+
     def _rosbridge_tf_callback(self, msg_dict):
         self._republish_tf(msg_dict, self._tf_pub)
+        if not self._has_tf:
+            self._has_tf = True
+            self._check_tf_ready()
 
     def _rosbridge_tf_static_callback(self, msg_dict):
         self._republish_tf(msg_dict, self._tf_static_pub, static=True)
+        if not self._has_tf_static:
+            self._has_tf_static = True
+            self._check_tf_ready()
         self._tf_static_topic.unsubscribe()
         self.get_logger().info("Received and republished static TFs via rosbridge")
 
@@ -590,6 +655,7 @@ class DrawerDetectionNode(Node):
         if not self.use_sim:
             arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
         self.latest_depth = arr
+        self.latest_depth_stamp = msg.header.stamp
         self._depth_mono_stamp = time.monotonic()
 
     def _camera_info_dds_callback(self, msg: CameraInfo):
@@ -614,12 +680,9 @@ class DrawerDetectionNode(Node):
         self.camera_K = K
 
     def exploration_status_callback(self, msg: String):
-        if msg.data == "paused_for_detection" and not self.exploring:
-            self.exploring = True
-            self._single_shot_pending = True
-            self._pause_stamp = time.monotonic()
-            self.latest_rgb = None
-            self.latest_depth = None
+        if msg.data == "complete":
+            self.exploring = False
+            self._detection_mode = "detecting"
         elif msg.data != "paused_for_detection":
             self.exploring = False
 
@@ -685,11 +748,39 @@ class DrawerDetectionNode(Node):
 
     def trigger_detection_callback(self, request, response):
         """Trigger one detection pass, then disable continuous detection."""
+        if not self._tf_ready:
+            response.success = False
+            response.message = "TF not ready"
+            return response
         count = self._run_detection()
         self.exploring = False
         response.success = True
         response.message = f"Detected {count} total drawers"
         return response
+
+    def _rosbridge_trigger_handler(self, request, response):
+        """Handle /detection/trigger called via rosbridge from the robot."""
+        def _do_detection():
+            try:
+                if not self._tf_ready:
+                    response(roslibpy.ServiceResponse({
+                        "success": False,
+                        "message": "TF not ready",
+                    }))
+                    return
+                count = self._run_detection()
+                self.exploring = False
+                response(roslibpy.ServiceResponse({
+                    "success": True,
+                    "message": f"Detected {count} total drawers",
+                }))
+            except Exception as e:
+                self.get_logger().error(f"Rosbridge trigger failed: {e}")
+                response(roslibpy.ServiceResponse({
+                    "success": False,
+                    "message": str(e),
+                }))
+        threading.Thread(target=_do_detection, daemon=True).start()
 
     def get_drawers_callback(self, request, response):
         """Return current drawer list as JSON."""
@@ -821,33 +912,41 @@ class DrawerDetectionNode(Node):
 
     # ─── Detection logic ──────────────────────────────────────────────
 
-    def detection_tick(self):
-        """Periodic detection pass gated by detection mode.
-
-        In exploration mode, runs exactly one detection per paused_for_detection
-        window then stops until the next pause.
-        """
+    def _test_mode_tick(self):
+        """Periodic detection for standalone test_mode (no exploration)."""
         if self._detection_mode == "stopped":
             return
-        if not self.exploring and not self.test_mode and self._detection_mode != "detecting":
+        if not self._tf_ready:
             return
         if self.latest_rgb is None or self.latest_depth is None:
-            self.get_logger().info(
-                f"Waiting: rgb={'ok' if self.latest_rgb is not None else 'NONE'}, "
-                f"depth={'ok' if self.latest_depth is not None else 'NONE'}, "
-                f"camera_K={'ok' if self.camera_K is not None else 'NONE'}",
-                throttle_duration_sec=5.0,
-            )
-            return
-        if self.exploring and not getattr(self, '_single_shot_pending', True):
             return
         self._run_detection()
-        if self.exploring:
-            self._single_shot_pending = False
 
     def _run_detection(self) -> int:
         """Run Detic detection on current frame, find drawers and handles."""
+        pause_t = getattr(self, '_pause_stamp', 0.0)
+        stamp_slop = 0.05  # 50 ms — reject RGB/depth pairs from different frames
+        for _ in range(50):
+            rgb_fresh = self.latest_rgb is not None and self._rgb_mono_stamp > pause_t
+            depth_fresh = self.latest_depth is not None and self._depth_mono_stamp > pause_t
+            if rgb_fresh and depth_fresh:
+                rs = self.latest_rgb_stamp
+                ds = self.latest_depth_stamp
+                if rs is not None and ds is not None:
+                    rgb_t = rs.sec + rs.nanosec / 1e9
+                    depth_t = ds.sec + ds.nanosec / 1e9
+                    if abs(rgb_t - depth_t) <= stamp_slop:
+                        break
+                    self.get_logger().debug(
+                        f"RGB/depth stamp gap {abs(rgb_t - depth_t):.3f}s — waiting for matching pair",
+                        throttle_duration_sec=2.0,
+                    )
+                else:
+                    break
+            time.sleep(0.1)
+
         if self.latest_rgb is None or self.latest_depth is None:
+            self.get_logger().warn("No fresh camera data — skipping detection")
             return 0
         if self.camera_K is None:
             self.get_logger().debug("Waiting for camera_info...")
@@ -855,16 +954,16 @@ class DrawerDetectionNode(Node):
 
         camera_frame = "camera_color_optical_frame"
         try:
+            rgb_stamp = self.latest_rgb_stamp
+            stamp = rclpy.time.Time.from_msg(rgb_stamp) if rgb_stamp else rclpy.time.Time()
             transform = self.tf_buffer.lookup_transform(
                 "odom", camera_frame,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.5),
+                stamp,
+                timeout=rclpy.duration.Duration(seconds=2.0),
             )
         except Exception as e:
-            self._tf_consecutive_ok = 0
-            self.get_logger().warn(
-                f"TF lookup failed (skipping frame): {e}",
-                throttle_duration_sec=5.0,
+            self.get_logger().error(
+                f"TF lookup FAILED for stamp={stamp} — skipping detection: {e}"
             )
             return len(self.drawers)
 
@@ -879,18 +978,6 @@ class DrawerDetectionNode(Node):
             f"{transform.transform.translation.z:.3f})",
             throttle_duration_sec=5.0,
         )
-
-        # Gate: require N consecutive successful lookups before allowing detections
-        if not self._tf_ready:
-            self._tf_consecutive_ok += 1
-            if self._tf_consecutive_ok < self._TF_READY_THRESHOLD:
-                self.get_logger().info(
-                    f"TF warming up: {self._tf_consecutive_ok}/{self._TF_READY_THRESHOLD}",
-                    throttle_duration_sec=2.0,
-                )
-                return 0
-            self._tf_ready = True
-            self.get_logger().info("TF chain confirmed — detections enabled")
 
         rgb = self.latest_rgb.copy()
         depth = self.latest_depth.copy()
@@ -928,7 +1015,7 @@ class DrawerDetectionNode(Node):
         # GNN rankings are applied externally via /detection/set_rankings
         # (called by scene_graph_node after exploration completes)
 
-        self._save_debug_image(rgb, all_detections, drawer_bboxes)
+        # self._save_debug_image(rgb, all_detections, drawer_bboxes)
 
         self.get_logger().info(
             f"Detection pass: {new_detections} new | "
@@ -1300,7 +1387,7 @@ class DrawerDetectionNode(Node):
 
         if self.detector is None:
             self.detector = VisualDetector(
-                device="cpu", score_threshold=self.detection_confidence
+                device=self.device, score_threshold=self.detection_confidence
             )
 
         detections = self.detector.detect(rgb, return_crops=False)
@@ -2076,8 +2163,10 @@ class DrawerDetectionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = DrawerDetectionNode()
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
