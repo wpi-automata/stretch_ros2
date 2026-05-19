@@ -267,13 +267,28 @@ class DrawerDetectionNode(Node):
         # Visualization timer
         self.create_timer(1.0, self.publish_markers)
 
-        # Load Detic, then register /detection/trigger — service
-        # availability signals readiness to the exploration node
-        self.get_logger().info("Loading Detic model...")
+        # Detic + trigger service are loaded in a one-shot timer so the
+        # executor is already spinning — TF callbacks can fill the buffer
+        # while the model loads on another executor thread.
         from realrobot.detector import VisualDetector
         self.detector = VisualDetector(
             device=self.device, score_threshold=self.detection_confidence
         )
+        self._deferred_init_timer = self.create_timer(
+            0.1, self._deferred_model_load, callback_group=self.cb_group,
+        )
+
+        self.get_logger().info(
+            f"Drawer detection node starting (model loading deferred): "
+            f"confidence={self.detection_confidence}, "
+            f"test_mode={self.test_mode}, "
+            f"rank_via_LOCUS={self.rank_via_locus}"
+        )
+
+    def _deferred_model_load(self):
+        """One-shot: load Detic weights, then advertise the trigger service."""
+        self._deferred_init_timer.cancel()
+        self.get_logger().info("Loading Detic model...")
         self.detector._load_model()
         self.get_logger().info(f"Detic model loaded on {self.device}")
 
@@ -289,12 +304,7 @@ class DrawerDetectionNode(Node):
             self._ws_trigger_service.advertise(self._rosbridge_trigger_handler)
             self.get_logger().info("Advertised /detection/trigger via rosbridge")
 
-        self.get_logger().info(
-            f"Drawer detection node ready: "
-            f"confidence={self.detection_confidence}, "
-            f"test_mode={self.test_mode}, "
-            f"rank_via_LOCUS={self.rank_via_locus}"
-        )
+        self.get_logger().info("Drawer detection node ready")
 
     # ─── Image transport setup ───────────────────────────────────────
 
@@ -1715,7 +1725,16 @@ class DrawerDetectionNode(Node):
                 dist = np.linalg.norm(
                     world_pos - np.array(existing.handle_center_world)
                 )
-                if dist < self.dedup_distance:
+                handle_close = dist < self.dedup_distance
+                bbox_overlap = (
+                    drawer_corners is not None
+                    and existing.drawer_corners_world is not None
+                    and self._aabbs_overlap(
+                        drawer_corners, existing.drawer_corners_world,
+                        self.dedup_distance
+                    )
+                )
+                if handle_close or bbox_overlap:
                     existing.observations += 1
                     if confidence > existing.confidence:
                         existing.handle_center_world = world_pos
@@ -1738,6 +1757,21 @@ class DrawerDetectionNode(Node):
                     return True
 
         return False
+
+    @staticmethod
+    def _aabbs_overlap(corners_a, corners_b, pad=0.0):
+        """Check if two sets of 4 world-space corners overlap as padded AABBs."""
+        a = np.array(corners_a)
+        b = np.array(corners_b)
+        a_min = a.min(axis=0) - pad
+        a_max = a.max(axis=0) + pad
+        b_min = b.min(axis=0) - pad
+        b_max = b.max(axis=0) + pad
+        return bool(
+            a_min[0] <= b_max[0] and b_min[0] <= a_max[0]
+            and a_min[1] <= b_max[1] and b_min[1] <= a_max[1]
+            and a_min[2] <= b_max[2] and b_min[2] <= a_max[2]
+        )
 
     def _update_distances(self):
         """Update distance_to_robot for all drawers."""

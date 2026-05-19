@@ -189,8 +189,21 @@ class SceneGraphNode(Node):
             callback_group=self.cb_group,
         )
 
-        # Load models, then register services — service availability
-        # signals readiness to the exploration node
+        # Defer model loading + service registration so the executor is
+        # already spinning — TF callbacks can fill the buffer while
+        # Detic/CLIP/GNN load on another executor thread.
+        self._deferred_init_timer = self.create_timer(
+            0.1, self._deferred_model_load, callback_group=self.cb_group,
+        )
+
+        self.get_logger().info(
+            f"Scene graph node starting (model loading deferred): "
+            f"room={self.room_type}, query={self.query}, device={self.device}"
+        )
+
+    def _deferred_model_load(self):
+        """One-shot: load Detic/CLIP/GNN, then advertise services."""
+        self._deferred_init_timer.cancel()
         self.get_logger().info("Loading models (Detic, CLIP, GNN)...")
         self._ensure_models_loaded()
         self.get_logger().info(f"All models loaded on {self.device}")
@@ -212,10 +225,7 @@ class SceneGraphNode(Node):
             self._ws_process_frame_service.advertise(self._rosbridge_process_frame_handler)
             self.get_logger().info("Advertised /scene_graph/process_frame via rosbridge")
 
-        self.get_logger().info(
-            f"Scene graph node ready: room={self.room_type}, "
-            f"query={self.query}, device={self.device}"
-        )
+        self.get_logger().info("Scene graph node ready")
 
     # ── TF readiness ────────────────────────────────────────────────
 
