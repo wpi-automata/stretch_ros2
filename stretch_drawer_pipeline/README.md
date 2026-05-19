@@ -97,6 +97,7 @@ This mode uses direct ROS2 FollowJointTrajectory commands and only requires the 
 | Aspect | Simulation | Real Robot |
 |--------|-----------|------------|
 | **Driver** | `stretch_mujoco_driver` | `stretch_driver` |
+| **Service transport** | DDS (same machine) | rosbridge WebSocket (robot ↔ automata-3) |
 | **Image transport** | DDS (direct ROS2 topics) | rosbridge WebSocket (compressed) |
 | **Image rotation** | None (1280x720) | 90 CW (720x1280) |
 | **Camera K** | Original intrinsics | Rotated intrinsics |
@@ -115,21 +116,27 @@ exploration_node starts
   ├─ [SCANNING] head scan or head sweep
   │
   ├─ [PAUSED_FOR_DETECTION] robot is still
-  │   ├─ Node 1 calls /detection/trigger on Node 2
-  │   │   └─ Node 2 runs one Detic pass (drawers+handles), then stops
-  │   └─ Node 4 processes the same frame (all objects → VoxelGraphBuilder)
+  │   ├─ Node 1 calls /detection/trigger on Node 2 (waits for response)
+  │   │   └─ Node 2 runs one Detic pass (drawers+handles)
+  │   ├─ Node 1 calls /scene_graph/process_frame on Node 4 (waits for response)
+  │   │   └─ Node 4 runs Detic (all objects) + CLIP → VoxelGraphBuilder
+  │   └─ Exploration continues only after both respond success
   │
   ├─ [DRIVING] move to next position
-  │   └─ Node 2 does NOT detect (exploring=False)
   │
   └─ repeat until complete
        │
-       ├─ Node 1 calls /scene_graph/build_and_rank on Node 4
-       │   ├─ Node 4 runs GNN scoring
-       │   └─ Node 4 calls /detection/set_rankings on Node 2
+       ├─ Node 1 publishes "complete" on /exploration_status
+       ├─ Node 4 auto-triggers GNN scoring (via topic)
+       │   ├─ Runs ContextGNN
+       │   └─ Calls /detection/set_rankings on Node 2
        │       └─ Node 2 matches GNN containers to drawers spatially
        │
        └─ [COMPLETE]
+
+Service transport:
+  sim (use_sim=true):  DDS service calls (same machine)
+  real (use_sim=false): rosbridge WebSocket (robot ↔ automata-3)
 ```
 
 ## Topics
@@ -154,7 +161,8 @@ exploration_node starts
 | `/detection/get_drawers` | Trigger | Node 2 | Get drawer list (JSON) |
 | `/detection/choose_drawer` | Trigger | Node 2 | Select best drawer |
 | `/detection/set_rankings` | SetRankings | Node 2 | Inject GNN rankings |
-| `/scene_graph/build_and_rank` | Trigger | Node 4 | Run GNN, push rankings |
+| `/scene_graph/process_frame` | Trigger | Node 4 | Process one frame (called by Node 1 at each pause) |
+| `/scene_graph/build_and_rank` | Trigger | Node 4 | Run GNN, push rankings (auto-triggered on complete) |
 | `/scene_graph/get_rankings` | Trigger | Node 4 | Get current rankings |
 | `/scene_graph/score_now` | Trigger | Node 4 | Force re-scoring |
 | `/navigate_open/execute` | Trigger | Node 3 | Navigate and open drawer |
