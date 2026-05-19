@@ -123,10 +123,14 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("keep_drawers_open", True)
         self.declare_parameter("gnn_match_threshold", 0.5)
         self.declare_parameter("device", "cuda")
+        self.declare_parameter("nms_iou_threshold", 0.7)
+        self.declare_parameter("enclosed_threshold", 0.7)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
         self.dedup_distance = self.get_parameter("dedup_distance_m").value
+        self.nms_iou_threshold = self.get_parameter("nms_iou_threshold").value
+        self.enclosed_threshold = self.get_parameter("enclosed_threshold").value
         self.max_reach_height = self.get_parameter("max_reach_height").value
         self.min_reach_height = self.get_parameter("min_reach_height").value
         self.max_reach_distance = self.get_parameter("max_reach_distance").value
@@ -1034,6 +1038,9 @@ class DrawerDetectionNode(Node):
         
         self._pair_handles_to_gripper_pos_after_opening_drawer(projected_handles, unpaired_handles, depth, camera_pose, camera_K)
 
+        if self.enable_dedup:
+            self._consolidate_drawers()
+
         if self._pending_items_scan:
             elapsed = time.time() - self._pending_items_scan_time
             if elapsed >= 5.0:
@@ -1436,7 +1443,7 @@ class DrawerDetectionNode(Node):
 
         drawer_dets = [d for d in detections
                        if d.object_type in self._drawer_classes and d.score >= self.detection_confidence]
-        drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=0.7)
+        drawer_dets = self._cross_class_nms(drawer_dets, iou_threshold=self.nms_iou_threshold)
 
         handle_dets = [d for d in detections if d.object_type in self._handle_classes]
         handle_dets = self._cross_class_nms(handle_dets, iou_threshold=0.3)
@@ -1688,50 +1695,60 @@ class DrawerDetectionNode(Node):
 
     # ─── De-duplication ───────────────────────────────────────────────
 
-    def _try_merge_detection(self, world_pos: np.ndarray, confidence: float,
-                             drawer_corners=None) -> bool:
+    def _should_merge(self, handle_a, corners_a, handle_b, corners_b):
+        """Decide whether two detections refer to the same drawer.
+
+        Returns (should_merge, handle_dist).
+        """
+        dist = float(np.linalg.norm(np.array(handle_a) - np.array(handle_b)))
+        handle_close = dist < self.dedup_distance
+
+        if corners_a is not None and corners_b is not None:
+            centers_close = self._centers_close(
+                corners_a, corners_b, self.dedup_distance
+            )
+        else:
+            centers_close = False
+
+        return (handle_close or centers_close), dist
+
+    def _absorb_detection(self, existing, world_pos, confidence, drawer_corners):
+        """Merge a new detection into an existing drawer, keeping higher confidence."""
+        existing.observations += 1
+        if confidence > existing.confidence:
+            existing.handle_center_world = world_pos
+            existing.handle_grasp_world = world_pos.copy()
+            existing.confidence = confidence
+            if drawer_corners is not None:
+                existing.drawer_corners_world = drawer_corners
+
+    def _try_merge_detection(self, world_pos, confidence, drawer_corners=None):
         """Check if this detection matches an existing or interacted drawer.
 
-        If the new detection has higher confidence, its position and
-        bounding box replace the existing one entirely.
         Returns True if merged (i.e., it's a duplicate or already interacted).
         """
         with self.drawers_lock:
             for existing in self.drawers:
                 if existing.handle_center_world is None:
                     continue
-                dist = np.linalg.norm(
-                    world_pos - np.array(existing.handle_center_world)
+                merge, dist = self._should_merge(
+                    world_pos, drawer_corners,
+                    existing.handle_center_world, existing.drawer_corners_world
                 )
-                handle_close = dist < self.dedup_distance
-                if drawer_corners is not None and existing.drawer_corners_world is not None:
-                    centers_close = self._centers_close(
-                        drawer_corners, existing.drawer_corners_world,
-                        self.dedup_distance
+                if not merge and dist < self.dedup_distance * 2:
+                    c_dist = None
+                    if drawer_corners is not None and existing.drawer_corners_world is not None:
+                        c_dist = float(np.linalg.norm(
+                            np.array(drawer_corners).mean(axis=0) -
+                            np.array(existing.drawer_corners_world).mean(axis=0)
+                        ))
+                    self.get_logger().warn(
+                        f"Dedup NEAR-MISS: handle_dist={dist:.3f}m, "
+                        f"centers_dist={c_dist:.3f}m, "
+                        f"threshold={self.dedup_distance}m"
                     )
-                else:
-                    centers_close = False
-                if not (handle_close or centers_close):
-                    if dist < self.dedup_distance * 2:
-                        c_dist = None
-                        if drawer_corners is not None and existing.drawer_corners_world is not None:
-                            c_dist = float(np.linalg.norm(
-                                np.array(drawer_corners).mean(axis=0) -
-                                np.array(existing.drawer_corners_world).mean(axis=0)
-                            ))
-                        self.get_logger().warn(
-                            f"Dedup NEAR-MISS: handle_dist={dist:.3f}m, "
-                            f"centers_dist={c_dist:.3f}m, "
-                            f"threshold={self.dedup_distance}m"
-                        )
-                if handle_close or centers_close:
-                    existing.observations += 1
-                    if confidence > existing.confidence:
-                        existing.handle_center_world = world_pos
-                        existing.handle_grasp_world = world_pos.copy()
-                        existing.confidence = confidence
-                        if drawer_corners is not None:
-                            existing.drawer_corners_world = drawer_corners
+                if merge:
+                    self._absorb_detection(existing, world_pos, confidence, drawer_corners)
                     return True
 
         for info in self.interacted_drawers.values():
@@ -1745,6 +1762,48 @@ class DrawerDetectionNode(Node):
                 opened_pos = np.array([oh["x"], oh["y"], oh["z"]])
                 if np.linalg.norm(world_pos - opened_pos) < self.dedup_distance:
                     return True
+
+        return False
+
+    def _consolidate_drawers(self):
+        """Merge existing drawers whose positions drifted together after updates."""
+        with self.drawers_lock:
+            merged_indices = set()
+            for i in range(len(self.drawers)):
+                if i in merged_indices:
+                    continue
+                a = self.drawers[i]
+                if a.handle_center_world is None:
+                    continue
+                for j in range(i + 1, len(self.drawers)):
+                    if j in merged_indices:
+                        continue
+                    b = self.drawers[j]
+                    if b.handle_center_world is None:
+                        continue
+
+                    merge, dist = self._should_merge(
+                        a.handle_center_world, a.drawer_corners_world,
+                        b.handle_center_world, b.drawer_corners_world
+                    )
+                    if merge:
+                        if b.confidence > a.confidence:
+                            keeper, absorbed = b, a
+                            merged_indices.add(i)
+                        else:
+                            keeper, absorbed = a, b
+                            merged_indices.add(j)
+                        keeper.observations += absorbed.observations
+                        self.get_logger().info(
+                            f"Consolidate: merged drawer (conf={absorbed.confidence:.2f}) "
+                            f"into drawer (conf={keeper.confidence:.2f}), "
+                            f"handle_dist={dist:.3f}m"
+                        )
+                        if i in merged_indices:
+                            break
+
+            if merged_indices:
+                self.drawers = [d for idx, d in enumerate(self.drawers) if idx not in merged_indices]
 
         return False
 
@@ -1769,6 +1828,20 @@ class DrawerDetectionNode(Node):
             and a_min[1] <= b_max[1] and b_min[1] <= a_max[1]
             and a_min[2] <= b_max[2] and b_min[2] <= a_max[2]
         )
+
+    # TODO: integrate into _should_merge as a merge criterion, or delete
+    @staticmethod
+    def _bbox_volume_inside(corners_inner, corners_outer):
+        """Fraction of inner's 3D AABB volume that falls inside outer's 3D AABB."""
+        a = np.array(corners_inner)
+        b = np.array(corners_outer)
+        a_min, a_max = a.min(axis=0), a.max(axis=0)
+        b_min, b_max = b.min(axis=0), b.max(axis=0)
+        a_vol = np.prod(np.maximum(a_max - a_min, 1e-6))
+        overlap_min = np.maximum(a_min, b_min)
+        overlap_max = np.minimum(a_max, b_max)
+        overlap_vol = np.prod(np.maximum(overlap_max - overlap_min, 0.0))
+        return float(overlap_vol / a_vol)
 
     def _update_distances(self):
         """Update distance_to_robot for all drawers."""
