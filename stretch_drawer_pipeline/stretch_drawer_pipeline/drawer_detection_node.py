@@ -747,6 +747,7 @@ class DrawerDetectionNode(Node):
             "opened_corners": None,
             "handle_orientation": entry.get("handle_orientation", "horizontal"),
             "pull_distance": entry.get("pull_distance", 0.0),
+            "reachable": entry.get("reachable", True),
             "status": "opened",
         }
 
@@ -1373,6 +1374,7 @@ class DrawerDetectionNode(Node):
             "opened_corners": interacted.get("opened_corners"),
             "handle_orientation": interacted.get("handle_orientation", "horizontal"),
             "pull_distance": interacted.get("pull_distance", 0.0),
+            "reachable": interacted.get("reachable", True),
             "items": self.drawer_items.get(drawer_id, []),
         }
 

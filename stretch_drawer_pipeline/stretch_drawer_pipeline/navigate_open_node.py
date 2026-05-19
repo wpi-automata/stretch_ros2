@@ -69,6 +69,8 @@ class OpenState(Enum):
     GRASPING = "grasping_handle"
     PULLING = "pulling_drawer"
     RELEASING = "releasing"
+    WAITING_HUMAN_OPEN = "waiting_human_open"
+    WAITING_HUMAN_CLOSE = "waiting_human_close"
     COMPLETE = "complete"
     FAILED = "failed"
 
@@ -262,62 +264,64 @@ class NavigateOpenNode(Node):
                 drawer["handle_center_world"]["z"],
             ])
             orientation = drawer["handle_orientation"]
+            reachable = drawer.get("reachable", True)
             self.get_logger().info(
                 f"Target drawer: {drawer['drawer_id']} at "
                 f"({handle_pos[0]:.2f}, {handle_pos[1]:.2f}, {handle_pos[2]:.2f}), "
-                f"orientation={orientation}"
+                f"orientation={orientation}, reachable={reachable}"
             )
 
-            # Step 2: Switch to position mode, retract arm, and navigate to approach pose
-            if not self._switch_to_position_mode():
-                self.get_logger().error("Cannot proceed without position mode")
-                self._set_state(OpenState.FAILED)
-                return
-            time.sleep(0.5)
+            if reachable:
+                # ── Robot opens drawer (existing pipeline) ──
+                if not self._switch_to_position_mode():
+                    self.get_logger().error("Cannot proceed without position mode")
+                    self._set_state(OpenState.FAILED)
+                    return
+                time.sleep(0.5)
 
-            self._set_state(OpenState.NAVIGATING)
-            corners = drawer.get("drawer_corners_world")
-            self._retract_arm()
-            nav_success = self._navigate_to_approach_pose(handle_pos, corners)
-            if not nav_success or self.stop_requested:
-                self._set_state(OpenState.FAILED)
-                return
+                self._set_state(OpenState.NAVIGATING)
+                corners = drawer.get("drawer_corners_world")
+                self._retract_arm()
+                nav_success = self._navigate_to_approach_pose(handle_pos, corners)
+                if not nav_success or self.stop_requested:
+                    self._set_state(OpenState.FAILED)
+                    return
 
-            # Step 3: Open gripper, orient toward handle
-            self._open_gripper()
-            time.sleep(0.5)
-            self._orient_gripper_toward(handle_pos, orientation)
+                self._open_gripper()
+                time.sleep(0.5)
+                self._orient_gripper_toward(handle_pos, orientation)
 
-            # Step 4: Extend arm to handle location
-            self._set_state(OpenState.GRASPING)
-            self._extend_to_point(handle_pos)
+                self._set_state(OpenState.GRASPING)
+                self._extend_to_point(handle_pos)
 
-            # Step 9: Close gripper
-            self._close_gripper()
-            time.sleep(1.0)
+                self._close_gripper()
+                time.sleep(1.0)
 
-            # Step 10: Pull drawer open
-            self._set_state(OpenState.PULLING)
-            pull_success, pull_distance = self._pull_drawer()
+                self._set_state(OpenState.PULLING)
+                pull_success, pull_distance = self._pull_drawer()
 
-            # Record opened handle position (gripper is at the handle)
-            opened_handle_pos = self._get_gripper_world_pos()
+                opened_handle_pos = self._get_gripper_world_pos()
 
-            # Step 11: Release (arm stays at handle for close)
-            self._set_state(OpenState.RELEASING)
-            self._open_gripper()
-            time.sleep(0.5)
+                self._set_state(OpenState.RELEASING)
+                self._open_gripper()
+                time.sleep(0.5)
 
-            # Step 12: Look at the opened drawer
-            self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
+                self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
 
-            if pull_success:
-                self._record_opened_drawer(drawer, handle_pos, opened_handle_pos, pull_distance)
-                self._set_state(OpenState.COMPLETE)
-                self.get_logger().info("Drawer opened successfully!")
+                if pull_success:
+                    self._record_opened_drawer(drawer, handle_pos, opened_handle_pos, pull_distance)
+                    self._set_state(OpenState.COMPLETE)
+                    self.get_logger().info("Drawer opened successfully!")
+                else:
+                    self._set_state(OpenState.FAILED)
+                    self.get_logger().warn("Pull did not reach force threshold")
             else:
-                self._set_state(OpenState.FAILED)
-                self.get_logger().warn("Pull did not reach force threshold")
+                # ── Human opens unreachable drawer ──
+                self._human_assist_open(drawer, handle_pos)
+                self._look_at_drawer(handle_pos, drawer.get("drawer_corners_world"))
+                self._record_opened_drawer(drawer, handle_pos, None, 0.0)
+                self._set_state(OpenState.COMPLETE)
+                self.get_logger().info("Human-assisted open complete — item scan triggered")
 
         except Exception as e:
             self.get_logger().error(f"Pipeline failed: {e}")
@@ -363,6 +367,7 @@ class NavigateOpenNode(Node):
             "handle_orientation": drawer.get("handle_orientation", "horizontal"),
             "gripper_pos": gripper_pos,
             "pull_distance": float(pull_distance),
+            "reachable": drawer.get("reachable", True),
         }
 
         self.opened_drawers[drawer_id] = entry
@@ -384,8 +389,17 @@ class NavigateOpenNode(Node):
         except json.JSONDecodeError as e:
             self.get_logger().warn(f"Bad close_drawer JSON: {e}")
             return
-        self.get_logger().info(f"Close drawer command received for {data.get('drawer_id')}")
-        thread = threading.Thread(target=self._close_drawer_pipeline, args=(data,), daemon=True)
+
+        reachable = data.get("reachable", True)
+        self.get_logger().info(
+            f"Close drawer command received for {data.get('drawer_id')}, reachable={reachable}"
+        )
+
+        if reachable:
+            target = self._close_drawer_pipeline
+        else:
+            target = self._human_assist_close_from_command
+        thread = threading.Thread(target=target, args=(data,), daemon=True)
         thread.start()
 
     def _speak(self, text: str):
@@ -455,6 +469,67 @@ class NavigateOpenNode(Node):
             self._speak("I had trouble closing the drawer.")
         finally:
             self._switch_to_navigation_mode()
+
+    # ─── Human-assist pipelines ─────────────────────────────────────
+
+    def _human_assist_open(self, drawer: dict, handle_pos: np.ndarray):
+        """Ask a human to open an unreachable drawer, then wait 30s."""
+        self._set_state(OpenState.WAITING_HUMAN_OPEN)
+        x, y, z = handle_pos[0], handle_pos[1], handle_pos[2]
+        drawer_id = drawer["drawer_id"]
+
+        self.get_logger().warn(
+            f"HUMAN ASSIST REQUIRED — DRAWER/CABINET {drawer_id} IS UNREACHABLE. "
+            f"PLEASE OPEN THE HANDLE AT WORLD COORDINATE "
+            f"({x:.3f}, {y:.3f}, {z:.3f}). "
+            f"WAITING 30 SECONDS FOR YOU TO OPEN IT."
+        )
+        self._speak(
+            f"I cannot reach drawer {drawer_id}. "
+            f"Please open it for me. I will wait 30 seconds."
+        )
+
+        self.get_logger().info("Waiting 30 seconds for human to open drawer...")
+        time.sleep(30)
+        self.get_logger().info("Wait complete — proceeding to detect items")
+
+    def _human_assist_close(self, data: dict, handle_pos: np.ndarray):
+        """Ask a human to close an unreachable drawer, then wait 30s."""
+        self._set_state(OpenState.WAITING_HUMAN_CLOSE)
+        x, y, z = handle_pos[0], handle_pos[1], handle_pos[2]
+        drawer_id = data.get("drawer_id", "?")
+        items = data.get("items", [])
+
+        if items:
+            labels = [i["label"] for i in items]
+            unique = list(dict.fromkeys(labels))
+            self._speak(f"I found {', '.join(unique)} in the drawer.")
+        else:
+            self._speak("The drawer is empty.")
+
+        self.get_logger().warn(
+            f"HUMAN ASSIST REQUIRED — DRAWER/CABINET {drawer_id} IS UNREACHABLE. "
+            f"PLEASE CLOSE THE HANDLE AT WORLD COORDINATE "
+            f"({x:.3f}, {y:.3f}, {z:.3f}). "
+            f"WAITING 30 SECONDS FOR YOU TO CLOSE IT."
+        )
+        self._speak(
+            f"Please close drawer {drawer_id} for me. "
+            f"I will wait 30 seconds."
+        )
+
+        self.get_logger().info("Waiting 30 seconds for human to close drawer...")
+        time.sleep(30)
+        self.get_logger().info("Wait complete — drawer assumed closed")
+
+    def _human_assist_close_from_command(self, data: dict):
+        """Adapter for _human_assist_close when invoked from a close-drawer command."""
+        handle_pos_d = data.get("opened_handle") or data.get("closed_handle")
+        if handle_pos_d:
+            handle_pos = np.array([handle_pos_d["x"], handle_pos_d["y"], handle_pos_d["z"]])
+        else:
+            handle_pos = np.array([0.0, 0.0, 0.0])
+        self._human_assist_close(data, handle_pos)
 
     # ─── Navigation ───────────────────────────────────────────────────
 
