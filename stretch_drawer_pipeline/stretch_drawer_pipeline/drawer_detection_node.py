@@ -803,27 +803,20 @@ class DrawerDetectionNode(Node):
 
     def _rosbridge_trigger_handler(self, request, response):
         """Handle /detection/trigger called via rosbridge from the robot."""
-        def _do_detection():
-            try:
-                if not self._tf_ready:
-                    response(roslibpy.ServiceResponse({
-                        "success": False,
-                        "message": "TF not ready",
-                    }))
-                    return
-                count = self._run_detection()
-                self.exploring = False
-                response(roslibpy.ServiceResponse({
-                    "success": True,
-                    "message": f"Detected {count} total drawers",
-                }))
-            except Exception as e:
-                self.get_logger().error(f"Rosbridge trigger failed: {e}")
-                response(roslibpy.ServiceResponse({
-                    "success": False,
-                    "message": str(e),
-                }))
-        threading.Thread(target=_do_detection, daemon=True).start()
+        try:
+            if not self._tf_ready:
+                response["success"] = False
+                response["message"] = "TF not ready"
+                return True
+            count = self._run_detection()
+            self.exploring = False
+            response["success"] = True
+            response["message"] = f"Detected {count} total drawers"
+        except Exception as e:
+            self.get_logger().error(f"Rosbridge trigger failed: {e}")
+            response["success"] = False
+            response["message"] = str(e)
+        return True
 
     def get_drawers_callback(self, request, response):
         """Return current drawer list as JSON."""

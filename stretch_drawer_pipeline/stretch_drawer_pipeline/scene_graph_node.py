@@ -977,37 +977,30 @@ class SceneGraphNode(Node):
 
     def _rosbridge_process_frame_handler(self, request, response):
         """Handle /scene_graph/process_frame called via rosbridge."""
-        def _do_process():
-            if not self._tf_ready:
-                response(roslibpy.ServiceResponse({
-                    "success": False,
-                    "message": "TF not ready",
-                }))
-                return
-            self._pause_stamp = time.monotonic()
-            self.latest_rgb = None
-            self.latest_depth = None
-            self._rgb_ros_stamp = None
-            self._depth_ros_stamp = None
-            self._detecting = True
-            try:
-                self._process_current_frame_inner()
-                response(roslibpy.ServiceResponse({
-                    "success": True,
-                    "message": (
-                        f"{self._builder.n_nodes} nodes, "
-                        f"{self._n_observations} observations"
-                    ),
-                }))
-            except Exception as e:
-                self.get_logger().error(f"Rosbridge process_frame failed: {e}")
-                response(roslibpy.ServiceResponse({
-                    "success": False,
-                    "message": str(e),
-                }))
-            finally:
-                self._detecting = False
-        threading.Thread(target=_do_process, daemon=True).start()
+        if not self._tf_ready:
+            response["success"] = False
+            response["message"] = "TF not ready"
+            return True
+        self._pause_stamp = time.monotonic()
+        self.latest_rgb = None
+        self.latest_depth = None
+        self._rgb_ros_stamp = None
+        self._depth_ros_stamp = None
+        self._detecting = True
+        try:
+            self._process_current_frame_inner()
+            response["success"] = True
+            response["message"] = (
+                f"{self._builder.n_nodes} nodes, "
+                f"{self._n_observations} observations"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Rosbridge process_frame failed: {e}")
+            response["success"] = False
+            response["message"] = str(e)
+        finally:
+            self._detecting = False
+        return True
 
     # ── Helpers ───────────────────────────────────────────────────────
 
