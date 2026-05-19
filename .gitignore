@@ -40,3 +40,6 @@ log/
 #ROS tf files
 frames*
 stretchframes*
+
+# Logs
+stretch_drawer_pipeline/stretch_drawer_pipeline/logs/*
