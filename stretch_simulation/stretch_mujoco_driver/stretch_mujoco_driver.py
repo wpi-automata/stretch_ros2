@@ -1549,8 +1549,21 @@ def create_camera_info(
     camera_info_msg.distortion_model = "plumb_bob"
 
     camera_info_msg.d = camera_settings.get_distortion_params_d()
-    camera_info_msg.k = camera_settings.get_intrinsic_params_k()
-    camera_info_msg.p = camera_settings.get_projection_matrix_p()
+
+    import math
+    fovy = camera_settings.field_of_view_vertical_in_degrees
+    w, h = camera_settings.width, camera_settings.height
+    f = 0.5 * h / math.tan(fovy * math.pi / 360)
+    camera_info_msg.k = [
+        f,   0.0, w / 2.0,
+        0.0, f,   h / 2.0,
+        0.0, 0.0, 1.0,
+    ]
+    camera_info_msg.p = [
+        f,   0.0, w / 2.0, 0.0,
+        0.0, f,   h / 2.0, 0.0,
+        0.0, 0.0, 1.0,     0.0,
+    ]
 
     if camera_settings.crop is not None:
         camera_info_msg.roi.x_offset = camera_settings.crop.x_offset
