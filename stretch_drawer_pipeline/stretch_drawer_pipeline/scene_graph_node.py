@@ -349,8 +349,7 @@ class SceneGraphNode(Node):
         import cv2
         try:
             arr = self.bridge.imgmsg_to_cv2(msg, "rgb8")
-            if not self.use_sim:
-                arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
             self.latest_rgb = arr
             self._rgb_stamp = time.monotonic()
             self._rgb_ros_stamp = msg.header.stamp
@@ -361,8 +360,7 @@ class SceneGraphNode(Node):
         import cv2
         try:
             depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-            if not self.use_sim:
-                depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
+            depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = depth.astype(np.float32)
             if self.latest_depth.max() > 100:
                 self.latest_depth /= 1000.0
@@ -376,12 +374,11 @@ class SceneGraphNode(Node):
             return
         K = np.array(msg.k).reshape(3, 3)
         if K[0, 0] > 0:
-            if not self.use_sim:
-                H = 720
-                fx, fy = K[1, 1], K[0, 0]
-                cx = (H - 1) - K[1, 2]
-                cy = K[0, 2]
-                K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+            H = msg.height
+            fx, fy = K[1, 1], K[0, 0]
+            cx = (H - 1) - K[1, 2]
+            cy = K[0, 2]
+            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
             self.camera_K = K
             self.get_logger().info(f"Camera K set from camera_info: fx={K[0,0]:.1f}")
 
@@ -396,8 +393,7 @@ class SceneGraphNode(Node):
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if bgr is not None:
                 arr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                if not self.use_sim:
-                    arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+                arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
                 self.latest_rgb = arr
                 self._rgb_stamp = time.monotonic()
                 stamp = msg.get("header", {}).get("stamp", {})
@@ -420,8 +416,7 @@ class SceneGraphNode(Node):
                 depth = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
             if depth is None:
                 return
-            if not self.use_sim:
-                depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
+            depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
             self.latest_depth = depth.astype(np.float32)
             if self.latest_depth.max() > 100:
                 self.latest_depth /= 1000.0
@@ -440,11 +435,11 @@ class SceneGraphNode(Node):
         try:
             K = np.array(msg["k"]).reshape(3, 3)
             if K[0, 0] > 0:
-                if not self.use_sim:
-                    fx, fy = K[1, 1], K[0, 0]
-                    cx = 719 - K[1, 2]
-                    cy = K[0, 2]
-                    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+                H = msg.get("height", 720)
+                fx, fy = K[1, 1], K[0, 0]
+                cx = (H - 1) - K[1, 2]
+                cy = K[0, 2]
+                K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 self.camera_K = K
                 self.get_logger().info(f"Camera K (WS): fx={K[0,0]:.1f}")
         except Exception:
@@ -720,7 +715,7 @@ class SceneGraphNode(Node):
             world_pos = project_bbox_to_world_se3(
                 det.bbox, depth, camera_pose, camera_K,
                 max_depth=MAX_PROJECTION_DEPTH,
-                image_rotated_cw90=not self.use_sim,
+                image_rotated_cw90=True,
             )
             if world_pos is None:
                 continue
