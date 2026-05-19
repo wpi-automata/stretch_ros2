@@ -36,7 +36,9 @@ Services:
 
 Parameters:
   - detection_confidence: min Detic score for drawer class (default 0.5)
-  - dedup_distance_m: distance threshold to consider two detections the same (default 0.3)
+  - dedup_handles_distance_m: handle distance threshold for dedup (default 0.1)
+  - dedup_centers_distance_m: bbox center distance threshold for dedup (default 0.2)
+  - enclosed_threshold: 3D AABB volume overlap fraction to consider enclosed (default 0.7)
   - max_reach_height: max z the gripper can reach (default 1.4m)
   - min_reach_height: min z the gripper can reach (default 0.1m)
   - test_mode: if true, process all frames without waiting for exploration (default false)
@@ -106,7 +108,8 @@ class DrawerDetectionNode(Node):
         # Parameters
         self.declare_parameter("detection_confidence", 0.5)
         self.declare_parameter("enable_dedup", True)
-        self.declare_parameter("dedup_distance_m", 0.2)
+        self.declare_parameter("dedup_handles_distance_m", 0.1)
+        self.declare_parameter("dedup_centers_distance_m", 0.1)
         self.declare_parameter("max_reach_height", 1.4)
         self.declare_parameter("min_reach_height", 0.1)
         self.declare_parameter("max_reach_distance", 0.6)
@@ -128,7 +131,8 @@ class DrawerDetectionNode(Node):
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
-        self.dedup_distance = self.get_parameter("dedup_distance_m").value
+        self.dedup_handles_distance = self.get_parameter("dedup_handles_distance_m").value
+        self.dedup_centers_distance = self.get_parameter("dedup_centers_distance_m").value
         self.nms_iou_threshold = self.get_parameter("nms_iou_threshold").value
         self.enclosed_threshold = self.get_parameter("enclosed_threshold").value
         self.max_reach_height = self.get_parameter("max_reach_height").value
@@ -157,6 +161,7 @@ class DrawerDetectionNode(Node):
         self._pending_items_scan = None
         self.gripper_handle_locations = []
 
+        #TODO: get these from ontologies
         self._drawer_classes = {
             "Drawer", "Cabinet", "Chest",
             "NightStand", "SideTable",
@@ -164,8 +169,10 @@ class DrawerDetectionNode(Node):
             "ChinaCabinet", "Credenza", "Cupboard", "AiringCupboard",
             "HopeChest", "Hutch", "Locker", "Footlocker",
             "MedicineChest", "Pantry", "Sideboard", "Wardrobe",
-            "Cabinetwork",
-        } # "Armoire", "Dresser", "FilingCabinet", "ChestOfDrawers"
+            "Cabinetwork", "Dishwasher", "Refrigerator"
+        } 
+        # These are not included since they are a set of drawers:
+        # "Armoire", "Dresser", "FilingCabinet", "ChestOfDrawers"
         self._handle_classes = {
             "Handle", "Knob", "Doorknob",
             "Pull", "Bellpull", "PullChain",
@@ -671,7 +678,7 @@ class DrawerDetectionNode(Node):
                 cy = sum(c[1] for c in corners) / len(corners)
                 cz = sum(c[2] for c in corners) / len(corners)
                 entry.drawer_center = Point(x=float(cx), y=float(cy), z=float(cz))
-                entry.dedup_distance = self.dedup_distance
+                entry.dedup_distance = self.dedup_handles_distance
                 msg.drawers.append(entry)
         self.drawer_cleanup_pub.publish(msg)
         self.get_logger().info(
@@ -1698,19 +1705,28 @@ class DrawerDetectionNode(Node):
     def _should_merge(self, handle_a, corners_a, handle_b, corners_b):
         """Decide whether two detections refer to the same drawer.
 
+        Condition: handle_close AND (enclosed OR centers_close).
         Returns (should_merge, handle_dist).
         """
         dist = float(np.linalg.norm(np.array(handle_a) - np.array(handle_b)))
-        handle_close = dist < self.dedup_distance
+        handle_close = dist < self.dedup_handles_distance
+
+        # if not handle_close:
+        #     return False, dist
 
         if corners_a is not None and corners_b is not None:
             centers_close = self._centers_close(
-                corners_a, corners_b, self.dedup_distance
+                corners_a, corners_b, self.dedup_centers_distance
             )
+            enclosed = max(
+                self._rect_area_inside(corners_a, corners_b),
+                self._rect_area_inside(corners_b, corners_a),
+            ) >= self.enclosed_threshold
         else:
             centers_close = False
+            enclosed = False
 
-        return (handle_close or centers_close), dist
+        return (handle_close or enclosed or centers_close), dist
 
     def _absorb_detection(self, existing, world_pos, confidence, drawer_corners):
         """Merge a new detection into an existing drawer, keeping higher confidence."""
@@ -1735,17 +1751,22 @@ class DrawerDetectionNode(Node):
                     world_pos, drawer_corners,
                     existing.handle_center_world, existing.drawer_corners_world
                 )
-                if not merge and dist < self.dedup_distance * 2:
+                if not merge and dist < self.dedup_handles_distance * 2:
                     c_dist = None
+                    vol_frac = None
                     if drawer_corners is not None and existing.drawer_corners_world is not None:
                         c_dist = float(np.linalg.norm(
                             np.array(drawer_corners).mean(axis=0) -
                             np.array(existing.drawer_corners_world).mean(axis=0)
                         ))
+                        vol_frac = max(
+                            self._rect_area_inside(drawer_corners, existing.drawer_corners_world),
+                            self._rect_area_inside(existing.drawer_corners_world, drawer_corners),
+                        )
                     self.get_logger().warn(
-                        f"Dedup NEAR-MISS: handle_dist={dist:.3f}m, "
-                        f"centers_dist={c_dist:.3f}m, "
-                        f"threshold={self.dedup_distance}m"
+                        f"Dedup NEAR-MISS: handle_dist={dist:.3f}m (thresh={self.dedup_handles_distance}m), "
+                        f"centers_dist={c_dist}m (thresh={self.dedup_centers_distance}m), "
+                        f"enclosed={vol_frac} (thresh={self.enclosed_threshold})"
                     )
                 if merge:
                     self._absorb_detection(existing, world_pos, confidence, drawer_corners)
@@ -1755,12 +1776,12 @@ class DrawerDetectionNode(Node):
             ch = info.get("closed_handle")
             if ch:
                 closed_pos = np.array([ch["x"], ch["y"], ch["z"]])
-                if np.linalg.norm(world_pos - closed_pos) < self.dedup_distance:
+                if np.linalg.norm(world_pos - closed_pos) < self.dedup_handles_distance:
                     return True
             oh = info.get("opened_handle")
             if oh:
                 opened_pos = np.array([oh["x"], oh["y"], oh["z"]])
-                if np.linalg.norm(world_pos - opened_pos) < self.dedup_distance:
+                if np.linalg.norm(world_pos - opened_pos) < self.dedup_handles_distance:
                     return True
 
         return False
@@ -1829,19 +1850,28 @@ class DrawerDetectionNode(Node):
             and a_min[2] <= b_max[2] and b_min[2] <= a_max[2]
         )
 
-    # TODO: integrate into _should_merge as a merge criterion, or delete
     @staticmethod
-    def _bbox_volume_inside(corners_inner, corners_outer):
-        """Fraction of inner's 3D AABB volume that falls inside outer's 3D AABB."""
-        a = np.array(corners_inner)
-        b = np.array(corners_outer)
-        a_min, a_max = a.min(axis=0), a.max(axis=0)
-        b_min, b_max = b.min(axis=0), b.max(axis=0)
-        a_vol = np.prod(np.maximum(a_max - a_min, 1e-6))
-        overlap_min = np.maximum(a_min, b_min)
-        overlap_max = np.minimum(a_max, b_max)
-        overlap_vol = np.prod(np.maximum(overlap_max - overlap_min, 0.0))
-        return float(overlap_vol / a_vol)
+    def _rect_area_inside(corners_inner, corners_outer):
+        """Fraction of inner's area that overlaps outer, computed in outer's local 2D frame."""
+        outer = np.array(corners_outer)
+        inner = np.array(corners_inner)
+        origin = outer[0]
+        right = outer[1] - outer[0]
+        up = outer[3] - outer[0]
+        r_len = np.linalg.norm(right)
+        u_len = np.linalg.norm(up)
+        if r_len < 1e-6 or u_len < 1e-6:
+            return 0.0
+        right_hat = right / r_len
+        up_hat = up / u_len
+        i_r = np.array([(c - origin) @ right_hat for c in inner])
+        i_u = np.array([(c - origin) @ up_hat for c in inner])
+        i_min_r, i_max_r = i_r.min(), i_r.max()
+        i_min_u, i_max_u = i_u.min(), i_u.max()
+        inner_area = max(i_max_r - i_min_r, 1e-6) * max(i_max_u - i_min_u, 1e-6)
+        ov_r = max(0.0, min(i_max_r, r_len) - max(i_min_r, 0.0))
+        ov_u = max(0.0, min(i_max_u, u_len) - max(i_min_u, 0.0))
+        return float((ov_r * ov_u) / inner_area)
 
     def _update_distances(self):
         """Update distance_to_robot for all drawers."""
