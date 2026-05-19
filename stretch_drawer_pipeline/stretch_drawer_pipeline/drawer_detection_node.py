@@ -102,7 +102,7 @@ class DrawerDetectionNode(Node):
         # Parameters
         self.declare_parameter("detection_confidence", 0.5)
         self.declare_parameter("enable_dedup", True)
-        self.declare_parameter("dedup_distance_m", 0.1)
+        self.declare_parameter("dedup_distance_m", 0.2)
         self.declare_parameter("max_reach_height", 1.4)
         self.declare_parameter("min_reach_height", 0.1)
         self.declare_parameter("max_reach_distance", 0.6)
@@ -1634,15 +1634,14 @@ class DrawerDetectionNode(Node):
                     world_pos - np.array(existing.handle_center_world)
                 )
                 handle_close = dist < self.dedup_distance
-                bbox_overlap = (
-                    drawer_corners is not None
-                    and existing.drawer_corners_world is not None
-                    and self._aabbs_overlap(
+                if drawer_corners is not None and existing.drawer_corners_world is not None:
+                    centers_close = self._centers_close(
                         drawer_corners, existing.drawer_corners_world,
                         self.dedup_distance
                     )
-                )
-                if handle_close or bbox_overlap:
+                else:
+                    centers_close = False
+                if handle_close and centers_close:
                     existing.observations += 1
                     if confidence > existing.confidence:
                         existing.handle_center_world = world_pos
@@ -1665,6 +1664,13 @@ class DrawerDetectionNode(Node):
                     return True
 
         return False
+
+    @staticmethod
+    def _centers_close(corners_a, corners_b, threshold):
+        """Check if the 3D centroids of two quadrilaterals are within threshold distance."""
+        a_center = np.array(corners_a).mean(axis=0)
+        b_center = np.array(corners_b).mean(axis=0)
+        return float(np.linalg.norm(a_center - b_center)) < threshold
 
     @staticmethod
     def _aabbs_overlap(corners_a, corners_b, pad=0.0):
