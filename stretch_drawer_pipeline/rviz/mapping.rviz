@@ -207,6 +207,16 @@ Visualization Manager:
         Value: /drawer_chosen_marker
       Value: true
 
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Refined Handle
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /detection/refined_handle_marker
+      Value: true
+
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Scene Graph

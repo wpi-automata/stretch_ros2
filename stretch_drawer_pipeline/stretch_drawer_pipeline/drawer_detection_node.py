@@ -46,6 +46,7 @@ Parameters:
 """
 
 import base64
+from enum import StrEnum
 import json
 import math
 import sys
@@ -77,6 +78,7 @@ if str(_SEMANTIC_ROOT) not in sys.path:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from logging_utils import setup_file_logging
+from ontologies import DRAWER_CLASSES, HANDLE_CLASSES
 from rosbridge_utils import ThreadedService
 
 
@@ -160,22 +162,8 @@ class DrawerDetectionNode(Node):
         self._pending_items_scan = None
         self.gripper_handle_locations = []
 
-        #TODO: get these from ontologies
-        self._drawer_classes = {
-            "Drawer", "Cabinet", "Chest",
-            "NightStand", "SideTable",
-            "Buffet", "CedarChest",
-            "ChinaCabinet", "Credenza", "Cupboard", "AiringCupboard",
-            "HopeChest", "Hutch", "Locker", "Footlocker",
-            "MedicineChest", "Pantry", "Sideboard", "Wardrobe",
-            "Cabinetwork", "Dishwasher", "Refrigerator"
-        } 
-        # These are not included since they are a set of drawers:
-        # "Armoire", "Dresser", "FilingCabinet", "ChestOfDrawers"
-        self._handle_classes = {
-            "Handle", "Knob", "Doorknob",
-            "Pull", "Bellpull", "PullChain",
-        }
+        self._drawer_classes = DRAWER_CLASSES
+        self._handle_classes = HANDLE_CLASSES
         self.bridge = CvBridge()
         self.latest_rgb = None
         self.latest_depth = None
@@ -808,8 +796,19 @@ class DrawerDetectionNode(Node):
             f"items scan pending, detection pass triggered"
         )
 
-        self._pause_stamp = time.time()
+        self._pause_stamp = time.monotonic()
         self._run_detection()
+
+        # _run_detection is synchronous — if it succeeded, _scan_items cleared
+        # _pending_items_scan and sent the close command. If it's still set,
+        # detection failed, so send close with no items as fallback.
+        if self._pending_items_scan:
+            self.get_logger().warn(
+                f"Detection pass failed — sending close command with no items for {drawer_id}"
+            )
+            self._pending_items_scan = None
+            self.drawer_items[drawer_id] = []
+            self._send_close_drawer_command(drawer_id)
 
     # UNUSED!!!
     # def _get_gripper_world_pos(self):
