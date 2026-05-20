@@ -26,6 +26,7 @@ install(PROGRAMS
   stretch_drawer_pipeline/exploration_node.py
   stretch_drawer_pipeline/scene_graph_node.py
   stretch_drawer_pipeline/logging_utils.py
+  stretch_drawer_pipeline/rosbridge_utils.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
