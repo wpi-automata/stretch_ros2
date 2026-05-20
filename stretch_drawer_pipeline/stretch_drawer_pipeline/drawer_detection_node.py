@@ -770,7 +770,6 @@ class DrawerDetectionNode(Node):
         }
 
         self._pending_items_scan = drawer_id
-        self._pending_items_scan_time = time.time()
         self._detection_mode = "detecting"
 
         gripper = entry.get("gripper_pos")
@@ -779,8 +778,11 @@ class DrawerDetectionNode(Node):
         self.get_logger().info(
             f"Drawer {drawer_id} opened — removed from closed "
             f"({len(self.drawers)} remaining), gripper at {gstr}, "
-            f"items scan pending, detection resumed"
+            f"items scan pending, detection pass triggered"
         )
+
+        self._pause_stamp = time.time()
+        self._run_detection()
 
     # UNUSED!!!
     # def _get_gripper_world_pos(self):
@@ -1033,6 +1035,18 @@ class DrawerDetectionNode(Node):
         # Detect drawers in the frame
         drawer_bboxes, all_detections, unpaired_handles = self._detect_drawers_detic(rgb)
 
+        if self._pending_items_scan:
+            self._scan_items(all_detections, rgb, depth, camera_pose, camera_K)
+
+        return self._update_drawers(camera_K, camera_pose, rgb, depth, drawer_bboxes, all_detections, unpaired_handles)
+    
+    def _scan_items(self, all_detections, rgb, depth, camera_pose, camera_K):
+        scan_id = self._pending_items_scan
+        self._pending_items_scan = None
+        self._scan_drawer_items(scan_id, all_detections, rgb, depth, camera_pose, camera_K)
+    
+    def _update_drawers(self, camera_K, camera_pose, rgb, depth, drawer_bboxes, all_detections, unpaired_handles):
+
         new_detections = 0
         projected_handles = []
         for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
@@ -1048,13 +1062,6 @@ class DrawerDetectionNode(Node):
 
         if self.enable_dedup:
             self._consolidate_drawers()
-
-        if self._pending_items_scan:
-            elapsed = time.time() - self._pending_items_scan_time
-            if elapsed >= 5.0:
-                scan_id = self._pending_items_scan
-                self._pending_items_scan = None
-                self._scan_drawer_items(scan_id, all_detections, rgb, depth, camera_pose, camera_K)
 
         # Update distances to robot
         self._update_distances()
