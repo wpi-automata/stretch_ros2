@@ -77,6 +77,7 @@ if str(_SEMANTIC_ROOT) not in sys.path:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from logging_utils import setup_file_logging
+from rosbridge_utils import ThreadedService
 
 
 class DetectedDrawer:
@@ -312,7 +313,7 @@ class DrawerDetectionNode(Node):
             callback_group=self.cb_group,
         )
         if hasattr(self, "_ros_client"):
-            self._ws_trigger_service = roslibpy.Service(
+            self._ws_trigger_service = ThreadedService(
                 self._ros_client, "/detection/trigger", "std_srvs/srv/Trigger"
             )
             self._ws_trigger_service.advertise(self._rosbridge_trigger_handler)
@@ -559,6 +560,14 @@ class DrawerDetectionNode(Node):
 
     def _rosbridge_tf_callback(self, msg_dict):
         self._republish_tf(msg_dict, self._tf_pub)
+        transforms = msg_dict.get("transforms", [])
+        if transforms:
+            s = transforms[0].get("header", {}).get("stamp", {})
+            tf_t = s.get("sec", 0) + s.get("nanosec", 0) / 1e9
+            frames = [f"{t.get('header',{}).get('frame_id','')}→{t.get('child_frame_id','')}" for t in transforms]
+            self.get_logger().info(
+                f"TF received: stamp={tf_t:.3f} frames={frames}", throttle_duration_sec=5.0
+            )
         if not self._has_tf:
             self._has_tf = True
             self._check_tf_ready()
@@ -803,6 +812,7 @@ class DrawerDetectionNode(Node):
 
     def _rosbridge_trigger_handler(self, request, response):
         """Handle /detection/trigger called via rosbridge from the robot."""
+        self.get_logger().info("Received /detection/trigger via rosbridge")
         try:
             if not self._tf_ready:
                 response["success"] = False

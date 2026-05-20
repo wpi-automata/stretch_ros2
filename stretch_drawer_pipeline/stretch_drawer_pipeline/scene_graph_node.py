@@ -83,6 +83,7 @@ def _cross_class_nms(detections, iou_threshold=0.3):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from logging_utils import setup_file_logging
+from rosbridge_utils import ThreadedService
 
 
 class SceneGraphNode(Node):
@@ -124,6 +125,8 @@ class SceneGraphNode(Node):
         self.camera_K = None
         self._rgb_stamp = 0.0
         self._depth_stamp = 0.0
+        self._ws_rgb_count = 0
+        self._ws_depth_count = 0
         self._rgb_ros_stamp = None
         self._depth_ros_stamp = None
         self._detecting = False
@@ -207,9 +210,19 @@ class SceneGraphNode(Node):
             0.1, self._deferred_model_load, callback_group=self.cb_group,
         )
 
+        if self._robot_ip:
+            self.create_timer(10.0, self._ws_log_stats)
+
         self.get_logger().info(
             f"Scene graph node starting (model loading deferred): "
             f"room={self.room_type}, query={self.query}, device={self.device}"
+        )
+
+    def _ws_log_stats(self):
+        connected = self._ros_client.is_connected
+        self.get_logger().info(
+            f"rosbridge: rgb={self._ws_rgb_count}, "
+            f"depth={self._ws_depth_count}, connected={connected}"
         )
 
     def _deferred_model_load(self):
@@ -230,7 +243,7 @@ class SceneGraphNode(Node):
             callback_group=self.cb_group,
         )
         if hasattr(self, "_ros_client"):
-            self._ws_process_frame_service = roslibpy.Service(
+            self._ws_process_frame_service = ThreadedService(
                 self._ros_client, "/scene_graph/process_frame", "std_srvs/srv/Trigger"
             )
             self._ws_process_frame_service.advertise(self._rosbridge_process_frame_handler)
@@ -407,6 +420,7 @@ class SceneGraphNode(Node):
                 arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
                 self.latest_rgb = arr
                 self._rgb_stamp = time.monotonic()
+                self._ws_rgb_count += 1
                 stamp = msg.get("header", {}).get("stamp", {})
                 self._rgb_ros_stamp = rclpy.time.Time(
                     seconds=stamp.get("sec", 0),
@@ -437,6 +451,7 @@ class SceneGraphNode(Node):
                 nanoseconds=stamp.get("nanosec", 0),
             ).to_msg()
             self._depth_stamp = time.monotonic()
+            self._ws_depth_count += 1
         except Exception as e:
             self.get_logger().warn(f"WS depth error: {e}", throttle_duration_sec=5.0)
 
@@ -460,6 +475,13 @@ class SceneGraphNode(Node):
 
     def _rosbridge_tf_callback(self, msg_dict):
         self._republish_tf(msg_dict, self._tf_pub)
+        transforms = msg_dict.get("transforms", [])
+        if transforms:
+            s = transforms[0].get("header", {}).get("stamp", {})
+            tf_t = s.get("sec", 0) + s.get("nanosec", 0) / 1e9
+            self.get_logger().info(
+                f"TF received: stamp={tf_t:.3f}", throttle_duration_sec=5.0
+            )
         if not self._has_tf:
             self._has_tf = True
             self._check_tf_ready()
@@ -977,6 +999,7 @@ class SceneGraphNode(Node):
 
     def _rosbridge_process_frame_handler(self, request, response):
         """Handle /scene_graph/process_frame called via rosbridge."""
+        self.get_logger().info("Received /scene_graph/process_frame via rosbridge")
         if not self._tf_ready:
             response["success"] = False
             response["message"] = "TF not ready"
