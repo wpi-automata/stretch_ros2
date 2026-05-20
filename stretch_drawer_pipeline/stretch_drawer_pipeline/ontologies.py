@@ -1,7 +1,7 @@
-from enum import StrEnum
+from enum import Enum
 
 
-class DrawerClass(StrEnum):
+class DrawerClass(str, Enum):
     DRAWER = "Drawer"
     CABINET = "Cabinet"
     CHEST = "Chest"
@@ -31,7 +31,7 @@ class DrawerClass(StrEnum):
     # CHEST_OF_DRAWERS = "ChestOfDrawers"
 
 
-class HandleClass(StrEnum):
+class HandleClass(str, Enum):
     HANDLE = "Handle"
     KNOB = "Knob"
     DOORKNOB = "Doorknob"

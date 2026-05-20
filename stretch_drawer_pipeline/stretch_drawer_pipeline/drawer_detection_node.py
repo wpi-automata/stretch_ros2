@@ -46,7 +46,7 @@ Parameters:
 """
 
 import base64
-from enum import StrEnum
+from enum import Enum
 import json
 import math
 import sys
