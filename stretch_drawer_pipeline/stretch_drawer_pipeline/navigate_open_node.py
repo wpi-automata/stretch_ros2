@@ -431,6 +431,7 @@ class NavigateOpenNode(Node):
                             f"Refined handle: ({handle_pos[0]:.3f}, {handle_pos[1]:.3f}, "
                             f"{handle_pos[2]:.3f}), orientation={orientation}"
                         )
+                        self._align_arm_toward(handle_pos)
 
                 self._open_gripper()
                 time.sleep(0.5)
@@ -876,6 +877,26 @@ class NavigateOpenNode(Node):
 
         except Exception as e:
             self.get_logger().warn(f"Cannot look at drawer: {e}")
+
+    def _align_arm_toward(self, handle_pos: np.ndarray):
+        """Small base rotation so the arm axis points at the handle."""
+        mast_pose = self._get_mast_pose()
+        robot_yaw = self._get_robot_yaw()
+        if mast_pose is None or robot_yaw is None:
+            self.get_logger().warn("Cannot align arm: no mast pose or yaw")
+            return
+
+        dx = handle_pos[0] - mast_pose[0]
+        dy = handle_pos[1] - mast_pose[1]
+        angle_to_handle = math.atan2(dy, dx)
+        desired_heading = angle_to_handle - math.pi / 2
+        angle_diff = (desired_heading - robot_yaw + math.pi) % (2 * math.pi) - math.pi
+
+        if abs(angle_diff) > 0.03:
+            self.get_logger().info(
+                f"Aligning arm toward refined handle: rotating {math.degrees(angle_diff):.1f} deg"
+            )
+            self._rotate_in_place(angle_diff)
 
     # ─── Arm control ──────────────────────────────────────────────────
 
