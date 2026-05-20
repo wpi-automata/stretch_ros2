@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/NavigateToDrawer.srv"
   "srv/TriggerDetection.srv"
   "srv/SetRankings.srv"
+  "srv/RefineHandle.srv"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 

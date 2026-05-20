@@ -1,0 +1,10 @@
+string drawer_nav_id
+float64 handle_x
+float64 handle_y
+float64 handle_z
+string handle_orientation
+---
+float64 updated_handle_x
+float64 updated_handle_y
+float64 updated_handle_z
+string updated_handle_orientation
