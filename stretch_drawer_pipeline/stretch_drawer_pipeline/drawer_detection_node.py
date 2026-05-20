@@ -124,7 +124,6 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("remote_depth_topic", "/camera/aligned_depth_to_color/image_raw/compressedDepth")
         self.declare_parameter("remote_camera_info_topic", "/camera/color/camera_info")
         self.declare_parameter("throttle_rate_ms", 2000)
-        self.declare_parameter("keep_drawers_open", True)
         self.declare_parameter("gnn_match_threshold", 0.5)
         self.declare_parameter("device", "cuda")
         self.declare_parameter("nms_iou_threshold", 0.7)
@@ -143,7 +142,6 @@ class DrawerDetectionNode(Node):
         self.rank_via_locus = self.get_parameter("rank_via_LOCUS").value
         self.use_sim = self.get_parameter("use_sim").value
         self.detection_rate = self.get_parameter("detection_rate_hz").value
-        self.keep_drawers_open = self.get_parameter("keep_drawers_open").value
         self.gnn_match_threshold = self.get_parameter("gnn_match_threshold").value
         self.device = self.get_parameter("device").value
 
@@ -1244,8 +1242,7 @@ class DrawerDetectionNode(Node):
         interacted = self.interacted_drawers.get(drawer_id)
         if not interacted:
             self.drawer_items[drawer_id] = []
-            if not self.keep_drawers_open:
-                self._send_close_drawer_command(drawer_id)
+            self._send_close_drawer_command(drawer_id)
             return
 
         closed_corners = interacted.get("closed_corners")
@@ -1255,8 +1252,7 @@ class DrawerDetectionNode(Node):
                 f"No closed corners or pull_distance for drawer {drawer_id}, skipping items scan"
             )
             self.drawer_items[drawer_id] = []
-            if not self.keep_drawers_open:
-                self._send_close_drawer_command(drawer_id)
+            self._send_close_drawer_command(drawer_id)
             return
 
         pts = np.array([[c["x"], c["y"], c["z"]] for c in closed_corners])
@@ -1267,8 +1263,7 @@ class DrawerDetectionNode(Node):
         norm_len = np.linalg.norm(normal)
         if norm_len < 1e-6:
             self.drawer_items[drawer_id] = []
-            if not self.keep_drawers_open:
-                self._send_close_drawer_command(drawer_id)
+            self._send_close_drawer_command(drawer_id)
             return
         normal = normal / norm_len
 
@@ -1310,8 +1305,7 @@ class DrawerDetectionNode(Node):
         if volume_pixels is None:
             self.get_logger().info("Items scan: _world_to_pixels returned None (points behind camera)")
             self.drawer_items[drawer_id] = []
-            if not self.keep_drawers_open:
-                self._send_close_drawer_command(drawer_id)
+            self._send_close_drawer_command(drawer_id)
             return
 
         self.get_logger().info(
@@ -1376,8 +1370,7 @@ class DrawerDetectionNode(Node):
         )
         self._save_items_scan_debug_2d(rgb, all_detections, hull, items, drawer_id)
 
-        if not self.keep_drawers_open:
-            self._send_close_drawer_command(drawer_id)
+        self._send_close_drawer_command(drawer_id)
 
     def _send_close_drawer_command(self, drawer_id):
         """Publish a close-drawer command to the robot."""
