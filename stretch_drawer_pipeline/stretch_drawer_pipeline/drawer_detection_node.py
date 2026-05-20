@@ -272,6 +272,23 @@ class DrawerDetectionNode(Node):
                 "run colcon build to enable GNN ranking"
             )
 
+        # RefineHandle service (called by navigate_open_node before grasping)
+        try:
+            from stretch_drawer_pipeline.srv import RefineHandle
+            self._RefineHandle = RefineHandle
+            self.create_service(
+                RefineHandle, "/detection/refine_handle",
+                self._refine_handle_callback,
+                callback_group=self.cb_group,
+            )
+            self.get_logger().info("RefineHandle service registered")
+        except ImportError:
+            self._RefineHandle = None
+            self.get_logger().warn(
+                "RefineHandle srv not built yet — "
+                "run colcon build to enable handle refinement"
+            )
+
         # Test mode: periodic detection without exploration trigger
         if self.test_mode:
             period = 1.0 / self.detection_rate
@@ -316,6 +333,13 @@ class DrawerDetectionNode(Node):
             )
             self._ws_trigger_service.advertise(self._rosbridge_trigger_handler)
             self.get_logger().info("Advertised /detection/trigger via rosbridge")
+
+            self._ws_refine_service = ThreadedService(
+                self._ros_client, "/detection/refine_handle",
+                "stretch_drawer_pipeline/srv/RefineHandle"
+            )
+            self._ws_refine_service.advertise(self._rosbridge_refine_handle_handler)
+            self.get_logger().info("Advertised /detection/refine_handle via rosbridge")
 
         self.get_logger().info("Drawer detection node ready")
 
@@ -826,6 +850,94 @@ class DrawerDetectionNode(Node):
             self.get_logger().error(f"Rosbridge trigger failed: {e}")
             response["success"] = False
             response["message"] = str(e)
+        return True
+
+    def _refine_handle_logic(self, drawer_nav_id, handle_x, handle_y, handle_z, handle_orientation):
+        """Shared logic for RefineHandle (DDS and rosbridge).
+
+        Returns (x, y, z, orientation) — either improved or original.
+        """
+        incoming_pos = np.array([handle_x, handle_y, handle_z])
+
+        saved_confidence = 0.0
+        with self.drawers_lock:
+            for d in self.drawers:
+                if d.drawer_id == drawer_nav_id:
+                    saved_confidence = d.confidence
+                    break
+            else:
+                self.get_logger().warn(
+                    f"RefineHandle: drawer_nav_id '{drawer_nav_id}' not found, "
+                    f"using confidence=0.0 as baseline"
+                )
+
+        self._run_detection()
+
+        best_dist = float("inf")
+        best_pos = None
+        best_orientation = None
+        with self.drawers_lock:
+            for d in self.drawers:
+                if d.handle_center_world is None:
+                    continue
+                dist = float(np.linalg.norm(d.handle_center_world - incoming_pos))
+                if (dist < self.dedup_handles_distance
+                        and d.confidence >= saved_confidence
+                        and dist < best_dist):
+                    best_dist = dist
+                    best_pos = d.handle_center_world.copy()
+                    best_orientation = d.handle_orientation
+
+        if best_pos is not None:
+            self.get_logger().info(
+                f"RefineHandle: improved handle at "
+                f"({best_pos[0]:.3f}, {best_pos[1]:.3f}, {best_pos[2]:.3f}), "
+                f"dist={best_dist:.3f}m, orientation={best_orientation}"
+            )
+            return (float(best_pos[0]), float(best_pos[1]), float(best_pos[2]),
+                    best_orientation)
+
+        self.get_logger().info("NO IMPROVED HANDLE.")
+        return (handle_x, handle_y, handle_z, handle_orientation)
+
+    def _refine_handle_callback(self, request, response):
+        """DDS handler for /detection/refine_handle."""
+        self.get_logger().info(
+            f"RefineHandle request: drawer={request.drawer_nav_id}, "
+            f"pos=({request.handle_x:.3f}, {request.handle_y:.3f}, {request.handle_z:.3f})"
+        )
+        x, y, z, orient = self._refine_handle_logic(
+            request.drawer_nav_id,
+            request.handle_x, request.handle_y, request.handle_z,
+            request.handle_orientation,
+        )
+        response.updated_handle_x = x
+        response.updated_handle_y = y
+        response.updated_handle_z = z
+        response.updated_handle_orientation = orient
+        return response
+
+    def _rosbridge_refine_handle_handler(self, request, response):
+        """Rosbridge handler for /detection/refine_handle."""
+        self.get_logger().info("Received /detection/refine_handle via rosbridge")
+        try:
+            x, y, z, orient = self._refine_handle_logic(
+                request.get("drawer_nav_id", ""),
+                float(request.get("handle_x", 0.0)),
+                float(request.get("handle_y", 0.0)),
+                float(request.get("handle_z", 0.0)),
+                request.get("handle_orientation", "horizontal"),
+            )
+            response["updated_handle_x"] = x
+            response["updated_handle_y"] = y
+            response["updated_handle_z"] = z
+            response["updated_handle_orientation"] = orient
+        except Exception as e:
+            self.get_logger().error(f"Rosbridge refine_handle failed: {e}")
+            response["updated_handle_x"] = float(request.get("handle_x", 0.0))
+            response["updated_handle_y"] = float(request.get("handle_y", 0.0))
+            response["updated_handle_z"] = float(request.get("handle_z", 0.0))
+            response["updated_handle_orientation"] = request.get("handle_orientation", "horizontal")
         return True
 
     def get_drawers_callback(self, request, response):

@@ -42,6 +42,7 @@ from pathlib import Path as _Path
 
 import numpy as np
 import rclpy
+import roslibpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
@@ -91,6 +92,8 @@ class NavigateOpenNode(Node):
         self.declare_parameter("use_sim", False)
         self.declare_parameter("arm_extension_speed", 0.01)
         self.declare_parameter("max_pull_distance", 0.4)
+        self.declare_parameter("refine_handle", True)
+        self.declare_parameter("rosbridge_port", 9090)
 
         self.approach_distance = self.get_parameter("approach_distance").value
         self.grasp_force_threshold = self.get_parameter("grasp_force_threshold").value
@@ -100,6 +103,8 @@ class NavigateOpenNode(Node):
         self.use_sim = self.get_parameter("use_sim").value
         self.arm_extension_speed = self.get_parameter("arm_extension_speed").value
         self.max_pull_distance = self.get_parameter("max_pull_distance").value
+        self.refine_handle = self.get_parameter("refine_handle").value
+        self._rosbridge_port = self.get_parameter("rosbridge_port").value
 
         # State
         self.state = OpenState.IDLE
@@ -176,6 +181,41 @@ class NavigateOpenNode(Node):
             self._close_drawer_callback, 10
         )
 
+        # RefineHandle service client
+        self._refine_ros_client = None
+        self._ws_refine_service = None
+        self._refine_handle_client = None
+        if self.refine_handle:
+            if self.use_sim:
+                try:
+                    from stretch_drawer_pipeline.srv import RefineHandle
+                    self._RefineHandle = RefineHandle
+                    self._refine_handle_client = self.create_client(
+                        RefineHandle, "/detection/refine_handle",
+                        callback_group=self.cb_group,
+                    )
+                    self.get_logger().info("RefineHandle DDS client created")
+                except ImportError:
+                    self._RefineHandle = None
+                    self.get_logger().warn(
+                        "RefineHandle srv not built yet — handle refinement disabled"
+                    )
+            else:
+                self._refine_ros_client = roslibpy.Ros(
+                    host="localhost", port=self._rosbridge_port
+                )
+                self._refine_ros_client_thread = threading.Thread(
+                    target=self._refine_ros_client.run, daemon=True
+                )
+                self._refine_ros_client_thread.start()
+                self._ws_refine_service = roslibpy.Service(
+                    self._refine_ros_client, "/detection/refine_handle",
+                    "stretch_drawer_pipeline/srv/RefineHandle"
+                )
+                self.get_logger().info(
+                    f"RefineHandle rosbridge client on localhost:{self._rosbridge_port}"
+                )
+
         # Status timer
         self.create_timer(0.5, self.publish_status)
 
@@ -245,6 +285,99 @@ class NavigateOpenNode(Node):
         response.message = "Stop requested"
         return response
 
+    # ─── Handle refinement ─────────────────────────────────────────────
+
+    def _call_refine_handle(self, drawer_id, handle_pos, orientation, timeout_sec=30.0):
+        """Call /detection/refine_handle via DDS (sim) or rosbridge (real).
+
+        Returns (np.array([x,y,z]), orientation_str) or None on failure.
+        """
+        if self.use_sim:
+            return self._call_refine_handle_dds(drawer_id, handle_pos, orientation, timeout_sec)
+        return self._call_refine_handle_rosbridge(drawer_id, handle_pos, orientation, timeout_sec)
+
+    def _call_refine_handle_dds(self, drawer_id, handle_pos, orientation, timeout_sec):
+        if self._refine_handle_client is None or self._RefineHandle is None:
+            self.get_logger().warn("RefineHandle DDS client not available")
+            return None
+
+        request = self._RefineHandle.Request()
+        request.drawer_nav_id = drawer_id
+        request.handle_x = float(handle_pos[0])
+        request.handle_y = float(handle_pos[1])
+        request.handle_z = float(handle_pos[2])
+        request.handle_orientation = orientation
+
+        future = self._refine_handle_client.call_async(request)
+        deadline = time.time() + timeout_sec
+        while not future.done():
+            if self.stop_requested:
+                return None
+            if time.time() > deadline:
+                self.get_logger().warn(
+                    f"RefineHandle DDS timed out after {timeout_sec:.0f}s"
+                )
+                future.cancel()
+                return None
+            time.sleep(0.1)
+
+        try:
+            result = future.result()
+            return (
+                np.array([result.updated_handle_x, result.updated_handle_y, result.updated_handle_z]),
+                result.updated_handle_orientation,
+            )
+        except Exception as e:
+            self.get_logger().error(f"RefineHandle DDS exception: {e}")
+            return None
+
+    def _call_refine_handle_rosbridge(self, drawer_id, handle_pos, orientation, timeout_sec):
+        if self._ws_refine_service is None:
+            self.get_logger().warn("RefineHandle rosbridge client not available")
+            return None
+
+        result = [None]
+        done = threading.Event()
+
+        def _on_response(resp):
+            result[0] = resp
+            done.set()
+
+        def _on_error(exc):
+            self.get_logger().error(f"RefineHandle rosbridge error: {exc}")
+            done.set()
+
+        try:
+            self._ws_refine_service.call(
+                roslibpy.ServiceRequest({
+                    "drawer_nav_id": drawer_id,
+                    "handle_x": float(handle_pos[0]),
+                    "handle_y": float(handle_pos[1]),
+                    "handle_z": float(handle_pos[2]),
+                    "handle_orientation": orientation,
+                }),
+                callback=_on_response,
+                errback=_on_error,
+            )
+        except Exception as e:
+            self.get_logger().error(f"RefineHandle rosbridge call failed: {e}")
+            return None
+
+        if not done.wait(timeout=timeout_sec):
+            self.get_logger().warn(
+                f"RefineHandle rosbridge timed out after {timeout_sec:.0f}s"
+            )
+            return None
+
+        if result[0] is None:
+            return None
+
+        resp = result[0]
+        return (
+            np.array([resp["updated_handle_x"], resp["updated_handle_y"], resp["updated_handle_z"]]),
+            resp["updated_handle_orientation"],
+        )
+
     # ─── Main pipeline ────────────────────────────────────────────────
 
     def _execute_pipeline(self):
@@ -286,6 +419,18 @@ class NavigateOpenNode(Node):
                 if not nav_success or self.stop_requested:
                     self._set_state(OpenState.FAILED)
                     return
+
+                if self.refine_handle:
+                    self._look_at_drawer(handle_pos, corners)
+                    refined = self._call_refine_handle(
+                        drawer['drawer_id'], handle_pos, orientation
+                    )
+                    if refined is not None:
+                        handle_pos, orientation = refined
+                        self.get_logger().info(
+                            f"Refined handle: ({handle_pos[0]:.3f}, {handle_pos[1]:.3f}, "
+                            f"{handle_pos[2]:.3f}), orientation={orientation}"
+                        )
 
                 self._open_gripper()
                 time.sleep(0.5)
