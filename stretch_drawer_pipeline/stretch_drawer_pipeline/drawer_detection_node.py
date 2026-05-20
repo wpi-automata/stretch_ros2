@@ -219,6 +219,9 @@ class DrawerDetectionNode(Node):
         self.chosen_drawer_json_pub = self.create_publisher(
             String, "/detection/chosen_drawer_json", 10
         )
+        self.refined_handle_marker_pub = self.create_publisher(
+            Marker, "/detection/refined_handle_marker", 10
+        )
         self.close_drawer_pub = self.create_publisher(
             String, "/detection/close_drawer_json", 10
         )
@@ -894,11 +897,33 @@ class DrawerDetectionNode(Node):
                 f"({best_pos[0]:.3f}, {best_pos[1]:.3f}, {best_pos[2]:.3f}), "
                 f"dist={best_dist:.3f}m, orientation={best_orientation}"
             )
-            return (float(best_pos[0]), float(best_pos[1]), float(best_pos[2]),
-                    best_orientation)
+            result = (float(best_pos[0]), float(best_pos[1]), float(best_pos[2]),
+                      best_orientation)
+        else:
+            self.get_logger().info("NO IMPROVED HANDLE.")
+            result = (handle_x, handle_y, handle_z, handle_orientation)
 
-        self.get_logger().info("NO IMPROVED HANDLE.")
-        return (handle_x, handle_y, handle_z, handle_orientation)
+        self._publish_refined_handle_marker(*result[:3])
+        return result
+
+    def _publish_refined_handle_marker(self, x, y, z):
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "refined_handle"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(x)
+        marker.pose.position.y = float(y)
+        marker.pose.position.z = float(z)
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.04
+        marker.scale.y = 0.04
+        marker.scale.z = 0.04
+        marker.color = ColorRGBA(r=0.6, g=0.0, b=0.9, a=1.0)
+        marker.lifetime.sec = 120
+        self.refined_handle_marker_pub.publish(marker)
 
     def _refine_handle_callback(self, request, response):
         """DDS handler for /detection/refine_handle."""

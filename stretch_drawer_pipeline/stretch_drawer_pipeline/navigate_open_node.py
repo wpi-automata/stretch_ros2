@@ -889,7 +889,7 @@ class NavigateOpenNode(Node):
         dx = handle_pos[0] - mast_pose[0]
         dy = handle_pos[1] - mast_pose[1]
         angle_to_handle = math.atan2(dy, dx)
-        desired_heading = angle_to_handle - math.pi / 2
+        desired_heading = angle_to_handle + math.pi / 2
         angle_diff = (desired_heading - robot_yaw + math.pi) % (2 * math.pi) - math.pi
 
         if abs(angle_diff) > 0.03:
