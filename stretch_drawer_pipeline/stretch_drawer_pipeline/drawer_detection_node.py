@@ -2326,17 +2326,26 @@ class DrawerDetectionNode(Node):
     def _publish_scene_graph_markers(self):
         """Publish the GNN scene graph as RViz markers.
 
-        Visualises the actual graph that feeds the GNN:
-          - Container nodes (merged ClusteredNodes from the builder)
-          - Room node at the centroid of all containers
-          - room-container edges as lines
-          - Ranked containers (after GNN scoring) as a second layer
+        Visualises the heterogeneous graph that feeds the GNN:
+          - Container nodes (blue spheres)
+          - Landmark nodes (green spheres)
+          - Dual-role nodes (purple spheres) — in both stores
+          - Room node (orange sphere) at centroid of all nodes
+          - room↔container edges (orange lines)
+          - landmark↔container spatial edges (green lines, within edge_cutoff)
+          - Ranked containers (red→green gradient by score)
         """
         if self.ranker is None:
             return
         data = self.ranker.get_marker_data()
-        nodes = data["nodes"]
+        container_nodes = data["container_nodes"]
+        landmark_nodes = data["landmark_nodes"]
         rankings = data["rankings"]
+        edge_cutoff = data["edge_cutoff"]
+
+        container_ids = {n.instance_id for n in container_nodes}
+        landmark_ids = {n.instance_id for n in landmark_nodes}
+        dual_ids = container_ids & landmark_ids
 
         now_stamp = self.get_clock().now().to_msg()
         ma = MarkerArray()
@@ -2349,155 +2358,157 @@ class DrawerDetectionNode(Node):
 
         marker_id = 0
 
-        container_positions = []
-        for node in nodes:
+        def _make_sphere(ns, px, py, pz, sz, color):
+            nonlocal marker_id
+            m = Marker()
+            m.header.frame_id = "odom"
+            m.header.stamp = now_stamp
+            m.ns = ns
+            m.id = marker_id
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = px
+            m.pose.position.y = py
+            m.pose.position.z = pz
+            m.pose.orientation.w = 1.0
+            m.scale.x = sz
+            m.scale.y = sz
+            m.scale.z = sz
+            m.color = color
+            m.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(m)
+            marker_id += 1
+
+        def _make_label(ns, px, py, pz, text, color):
+            nonlocal marker_id
+            m = Marker()
+            m.header.frame_id = "odom"
+            m.header.stamp = now_stamp
+            m.ns = ns
+            m.id = marker_id
+            m.type = Marker.TEXT_VIEW_FACING
+            m.action = Marker.ADD
+            m.pose.position.x = px
+            m.pose.position.y = py
+            m.pose.position.z = pz
+            m.pose.orientation.w = 1.0
+            m.scale.z = 0.06
+            m.color = color
+            m.text = text
+            m.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(m)
+            marker_id += 1
+
+        all_positions = {}
+
+        for node in container_nodes:
             p = node.position_3d
             px, py, pz = p["x"], p["y"], p["z"]
-            container_positions.append((px, py, pz))
+            all_positions[node.instance_id] = (px, py, pz)
+            is_dual = node.instance_id in dual_ids
+            sz = 0.08 + 0.02 * min(node.n_obs, 10)
+            if is_dual:
+                color = ColorRGBA(r=0.6, g=0.2, b=0.9, a=0.9)
+                role = "dual"
+            else:
+                color = ColorRGBA(r=0.2, g=0.4, b=0.9, a=0.85)
+                role = "container"
+            _make_sphere("graph_containers", px, py, pz, sz, color)
+            _make_label("graph_labels", px, py, pz + 0.12,
+                        f"[{role}] {node.node_type} (n={node.n_obs})",
+                        ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9))
 
-            sphere = Marker()
-            sphere.header.frame_id = "odom"
-            sphere.header.stamp = now_stamp
-            sphere.ns = "graph_containers"
-            sphere.id = marker_id
-            sphere.type = Marker.SPHERE
-            sphere.action = Marker.ADD
-            sphere.pose.position.x = px
-            sphere.pose.position.y = py
-            sphere.pose.position.z = pz
-            sphere.pose.orientation.w = 1.0
-            sz = 0.06 + 0.02 * min(node.n_obs, 10)
-            sphere.scale.x = sz
-            sphere.scale.y = sz
-            sphere.scale.z = sz
-            s = min(node.max_score, 1.0)
-            sphere.color = ColorRGBA(r=0.2, g=0.4 + 0.6 * s, b=0.9, a=0.85)
-            sphere.lifetime = RosDuration(sec=0, nanosec=0)
-            ma.markers.append(sphere)
-            marker_id += 1
+        for node in landmark_nodes:
+            if node.instance_id in dual_ids:
+                continue
+            p = node.position_3d
+            px, py, pz = p["x"], p["y"], p["z"]
+            all_positions[node.instance_id] = (px, py, pz)
+            sz = 0.06 + 0.015 * min(node.n_obs, 10)
+            _make_sphere("graph_landmarks", px, py, pz, sz,
+                         ColorRGBA(r=0.2, g=0.85, b=0.3, a=0.8))
+            _make_label("graph_labels", px, py, pz + 0.10,
+                        f"[landmark] {node.node_type} (n={node.n_obs})",
+                        ColorRGBA(r=0.8, g=1.0, b=0.8, a=0.9))
 
-            label = Marker()
-            label.header.frame_id = "odom"
-            label.header.stamp = now_stamp
-            label.ns = "graph_labels"
-            label.id = marker_id
-            label.type = Marker.TEXT_VIEW_FACING
-            label.action = Marker.ADD
-            label.pose.position.x = px
-            label.pose.position.y = py
-            label.pose.position.z = pz + 0.12
-            label.pose.orientation.w = 1.0
-            label.scale.z = 0.06
-            label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9)
-            label.text = f"{node.node_type} ({node.max_score:.2f})"
-            label.lifetime = RosDuration(sec=0, nanosec=0)
-            ma.markers.append(label)
-            marker_id += 1
+        if all_positions:
+            positions = list(all_positions.values())
+            cx = sum(p[0] for p in positions) / len(positions)
+            cy = sum(p[1] for p in positions) / len(positions)
+            cz = sum(p[2] for p in positions) / len(positions)
 
-        if container_positions:
-            cx = sum(p[0] for p in container_positions) / len(container_positions)
-            cy = sum(p[1] for p in container_positions) / len(container_positions)
-            cz = sum(p[2] for p in container_positions) / len(container_positions)
+            _make_sphere("graph_room", cx, cy, cz, 0.18,
+                         ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.8))
+            _make_label("graph_room_label", cx, cy, cz + 0.15,
+                        f"room:{data['room_type']}",
+                        ColorRGBA(r=1.0, g=0.8, b=0.2, a=1.0))
 
-            room_sphere = Marker()
-            room_sphere.header.frame_id = "odom"
-            room_sphere.header.stamp = now_stamp
-            room_sphere.ns = "graph_room"
-            room_sphere.id = marker_id
-            room_sphere.type = Marker.SPHERE
-            room_sphere.action = Marker.ADD
-            room_sphere.pose.position.x = cx
-            room_sphere.pose.position.y = cy
-            room_sphere.pose.position.z = cz
-            room_sphere.pose.orientation.w = 1.0
-            room_sphere.scale.x = 0.18
-            room_sphere.scale.y = 0.18
-            room_sphere.scale.z = 0.18
-            room_sphere.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.8)
-            room_sphere.lifetime = RosDuration(sec=0, nanosec=0)
-            ma.markers.append(room_sphere)
-            marker_id += 1
-
-            room_label = Marker()
-            room_label.header.frame_id = "odom"
-            room_label.header.stamp = now_stamp
-            room_label.ns = "graph_room_label"
-            room_label.id = marker_id
-            room_label.type = Marker.TEXT_VIEW_FACING
-            room_label.action = Marker.ADD
-            room_label.pose.position.x = cx
-            room_label.pose.position.y = cy
-            room_label.pose.position.z = cz + 0.15
-            room_label.pose.orientation.w = 1.0
-            room_label.scale.z = 0.08
-            room_label.color = ColorRGBA(r=1.0, g=0.8, b=0.2, a=1.0)
-            room_label.text = f"room:{data['room_type']}"
-            room_label.lifetime = RosDuration(sec=0, nanosec=0)
-            ma.markers.append(room_label)
-            marker_id += 1
-
-            edges = Marker()
-            edges.header.frame_id = "odom"
-            edges.header.stamp = now_stamp
-            edges.ns = "graph_edges"
-            edges.id = marker_id
-            edges.type = Marker.LINE_LIST
-            edges.action = Marker.ADD
-            edges.pose.orientation.w = 1.0
-            edges.scale.x = 0.01
-            edges.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.4)
-            edges.lifetime = RosDuration(sec=0, nanosec=0)
+            room_edges = Marker()
+            room_edges.header.frame_id = "odom"
+            room_edges.header.stamp = now_stamp
+            room_edges.ns = "graph_room_edges"
+            room_edges.id = marker_id
+            room_edges.type = Marker.LINE_LIST
+            room_edges.action = Marker.ADD
+            room_edges.pose.orientation.w = 1.0
+            room_edges.scale.x = 0.008
+            room_edges.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.35)
+            room_edges.lifetime = RosDuration(sec=0, nanosec=0)
             room_pt = Point(x=cx, y=cy, z=cz)
-            for px, py, pz in container_positions:
-                edges.points.append(room_pt)
-                edges.points.append(Point(x=px, y=py, z=pz))
-            ma.markers.append(edges)
+            for node in container_nodes:
+                p = node.position_3d
+                room_edges.points.append(room_pt)
+                room_edges.points.append(Point(x=p["x"], y=p["y"], z=p["z"]))
+            ma.markers.append(room_edges)
             marker_id += 1
+
+        landmark_positions = []
+        for node in landmark_nodes:
+            p = node.position_3d
+            landmark_positions.append((p["x"], p["y"], p["z"]))
+        container_positions = []
+        for node in container_nodes:
+            p = node.position_3d
+            container_positions.append((p["x"], p["y"], p["z"]))
+
+        if landmark_positions and container_positions:
+            spatial_edges = Marker()
+            spatial_edges.header.frame_id = "odom"
+            spatial_edges.header.stamp = now_stamp
+            spatial_edges.ns = "graph_spatial_edges"
+            spatial_edges.id = marker_id
+            spatial_edges.type = Marker.LINE_LIST
+            spatial_edges.action = Marker.ADD
+            spatial_edges.pose.orientation.w = 1.0
+            spatial_edges.scale.x = 0.006
+            spatial_edges.color = ColorRGBA(r=0.2, g=0.85, b=0.3, a=0.3)
+            spatial_edges.lifetime = RosDuration(sec=0, nanosec=0)
+            for lx, ly, lz in landmark_positions:
+                for cx2, cy2, cz2 in container_positions:
+                    dx = lx - cx2
+                    dy = ly - cy2
+                    dz = lz - cz2
+                    dist = (dx*dx + dy*dy + dz*dz) ** 0.5
+                    if dist <= edge_cutoff:
+                        spatial_edges.points.append(Point(x=lx, y=ly, z=lz))
+                        spatial_edges.points.append(Point(x=cx2, y=cy2, z=cz2))
+            if spatial_edges.points:
+                ma.markers.append(spatial_edges)
+                marker_id += 1
 
         for rank in rankings:
             pos = rank.get("position_3d")
             if pos is None:
                 continue
             score = rank.get("score", 0.0)
-
-            sphere = Marker()
-            sphere.header.frame_id = "odom"
-            sphere.header.stamp = now_stamp
-            sphere.ns = "ranked_containers"
-            sphere.id = marker_id
-            sphere.type = Marker.SPHERE
-            sphere.action = Marker.ADD
-            sphere.pose.position.x = pos[0]
-            sphere.pose.position.y = pos[1]
-            sphere.pose.position.z = pos[2] if len(pos) > 2 else 0.5
-            sphere.pose.orientation.w = 1.0
-            sphere.scale.x = 0.15
-            sphere.scale.y = 0.15
-            sphere.scale.z = 0.15
-            sphere.color = ColorRGBA(
-                r=1.0 - score, g=score, b=0.0, a=0.9
-            )
-            sphere.lifetime = RosDuration(sec=0, nanosec=0)
-            ma.markers.append(sphere)
-            marker_id += 1
-
-            label = Marker()
-            label.header.frame_id = "odom"
-            label.header.stamp = now_stamp
-            label.ns = "ranked_labels"
-            label.id = marker_id
-            label.type = Marker.TEXT_VIEW_FACING
-            label.action = Marker.ADD
-            label.pose.position.x = pos[0]
-            label.pose.position.y = pos[1]
-            label.pose.position.z = (pos[2] if len(pos) > 2 else 0.5) + 0.15
-            label.pose.orientation.w = 1.0
-            label.scale.z = 0.08
-            label.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
-            label.text = f"{rank.get('container_type', '?')} ({score:.2f})"
-            label.lifetime = RosDuration(sec=0, nanosec=0)
-            ma.markers.append(label)
-            marker_id += 1
+            px = pos[0]
+            py = pos[1]
+            pz = pos[2] if len(pos) > 2 else 0.5
+            _make_sphere("ranked_containers", px, py, pz, 0.15,
+                         ColorRGBA(r=1.0 - score, g=score, b=0.0, a=0.9))
+            _make_label("ranked_labels", px, py, pz + 0.15,
+                        f"{rank.get('container_type', '?')} ({score:.2f})",
+                        ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0))
 
         self.scene_graph_marker_pub.publish(ma)
 

@@ -337,21 +337,25 @@ class SceneGraphRanker:
     def _ensure_type_text_embeddings(self, obj_types):
         import torch
         import clip as clip_module
+        from realrobot.voxel_graph_builder import CONTAINER_TYPES, DUAL_ROLE_TYPES
 
-        new_types = [
-            t for t in obj_types
-            if f"container_type:{t}" not in self._text_embeddings
-        ]
-        if not new_types:
+        needed = {}
+        for t in obj_types:
+            if t in CONTAINER_TYPES:
+                needed.setdefault(f"container_type:{t}", t)
+            if t not in CONTAINER_TYPES or t in DUAL_ROLE_TYPES:
+                needed.setdefault(f"landmark_type:{t}", t)
+
+        new_keys = [k for k in needed if k not in self._text_embeddings]
+        if not new_keys:
             return
-        tokens = clip_module.tokenize(
-            [f"a photo of a {t}" for t in new_types]
-        ).to(self._device)
+        prompts = [f"a photo of a {needed[k]}" for k in new_keys]
+        tokens = clip_module.tokenize(prompts).to(self._device)
         with torch.no_grad():
             embs = self._clip_model.encode_text(tokens)
             embs = embs / embs.norm(dim=-1, keepdim=True)
-        for i, t in enumerate(new_types):
-            self._text_embeddings[f"container_type:{t}"] = embs[i].float().cpu()
+        for i, key in enumerate(new_keys):
+            self._text_embeddings[key] = embs[i].float().cpu()
 
     # ── GNN scoring ──────────────────────────────────────────────────
 
@@ -394,7 +398,50 @@ class SceneGraphRanker:
                 f"(score={top.get('score', 0):.3f})"
             )
 
+        self._auto_save_state()
         return ranking
+
+    def _auto_save_state(self):
+        import torch
+        from pathlib import Path
+        save_dir = Path("/home/ros2_stretch/ament_ws/src/stretch_ros2/stretch_drawer_pipeline/stretch_drawer_pipeline/runs/scenegraphs")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(save_dir.glob("scene_graph_state_*.pt"))
+        idx = int(existing[-1].stem.split("_")[-1]) + 1 if existing else 0
+        save_path = save_dir / f"scene_graph_state_{idx:03d}.pt"
+        try:
+            det_list = []
+            for d in self._builder._detections:
+                det_list.append({
+                    "obj_type": d.obj_type,
+                    "position": d.position.tolist() if hasattr(d.position, 'tolist') else list(d.position),
+                    "clip_embedding": d.clip_embedding,
+                    "scene_frame_clip": d.scene_frame_clip,
+                    "crop_area": d.crop_area,
+                    "score": d.score,
+                })
+            state = {
+                "scene_id": self._builder.scene_id,
+                "room_type": self._builder.room_type,
+                "room_id": self._builder.room_id,
+                "edge_cutoff": self._builder.edge_cutoff,
+                "dbscan_eps": self._builder.dbscan_eps,
+                "min_obs": self._builder.min_obs,
+                "text_embeddings": self._builder.text_embeddings,
+                "detections": det_list,
+                "query": self.query,
+                "query_embeddings": {q: e.cpu() for q, e in self._query_embeddings.items()},
+                "proto_matrix": self._proto_matrix.cpu(),
+                "gnn_cfg": self._gnn_cfg,
+                "gnn_checkpoint": self.checkpoint,
+                "rankings": self._rankings,
+            }
+            torch.save(state, save_path)
+            self._logger.info(
+                f"Scene graph state saved: {len(det_list)} detections, "
+                f"{len(self._query_embeddings)} queries → {save_path}")
+        except Exception as e:
+            self._logger.warn(f"Failed to save scene graph state: {e}")
 
     def get_rankings(self) -> list:
         """Return current rankings."""
@@ -406,15 +453,27 @@ class SceneGraphRanker:
     def get_marker_data(self):
         """Return data needed by the owning node to publish RViz markers.
 
-        Returns dict with keys: nodes, rankings, room_type.
+        Returns dict with keys: container_nodes, landmark_nodes, rankings,
+        room_type, edge_cutoff.
         """
-        nodes = list(self._builder.nodes.values()) if self._builder else []
+        if self._builder:
+            if self._builder._dirty:
+                self._builder._recluster()
+            container_nodes = list(self._builder.container_nodes.values())
+            landmark_nodes = list(self._builder.landmark_nodes.values())
+            edge_cutoff = self._builder.edge_cutoff
+        else:
+            container_nodes = []
+            landmark_nodes = []
+            edge_cutoff = 2.0
         with self._rankings_lock:
             rankings = list(self._rankings)
         return {
-            "nodes": nodes,
+            "container_nodes": container_nodes,
+            "landmark_nodes": landmark_nodes,
             "rankings": rankings,
             "room_type": self.room_type,
+            "edge_cutoff": edge_cutoff,
         }
 
     @property
