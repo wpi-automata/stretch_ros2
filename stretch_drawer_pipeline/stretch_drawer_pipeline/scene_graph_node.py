@@ -337,13 +337,15 @@ class SceneGraphRanker:
     def _ensure_type_text_embeddings(self, obj_types):
         import torch
         import clip as clip_module
-        from realrobot.voxel_graph_builder import CONTAINER_TYPES, DUAL_ROLE_TYPES
+        from realrobot.voxel_graph_builder import CONTAINER_TYPES, _is_landmark, _is_dual_role
 
         needed = {}
         for t in obj_types:
             if t in CONTAINER_TYPES:
                 needed.setdefault(f"container_type:{t}", t)
-            if t not in CONTAINER_TYPES or t in DUAL_ROLE_TYPES:
+                if _is_dual_role(t):
+                    needed.setdefault(f"landmark_type:{t}", t)
+            elif _is_landmark(t):
                 needed.setdefault(f"landmark_type:{t}", t)
 
         new_keys = [k for k in needed if k not in self._text_embeddings]
