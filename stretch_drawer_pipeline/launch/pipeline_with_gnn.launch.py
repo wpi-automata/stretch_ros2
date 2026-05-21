@@ -2,13 +2,15 @@
 
 Supports both simulation (use_sim:=true) and real robot (default).
 
+The scene graph ranker (GNN) is embedded inside drawer_detection_node —
+no separate process is needed.
+
 Nodes launched:
   1. exploration_node — multi-mode exploration (funmap / occupancy_grid / simple)
-  2. drawer_detection_node — Detic drawer+handle detection
-  3. scene_graph_node — Detic all-class detection, VoxelGraphBuilder, GNN scoring
-  4. navigate_open_node — navigate to and open chosen drawer
-  5. funmap (sim only, when exploration_mode=funmap)
-  6. rviz2 (optional)
+  2. drawer_detection_node — Detic drawer+handle detection + GNN ranking
+  3. navigate_open_node — navigate to and open chosen drawer
+  4. funmap (sim only, when exploration_mode=funmap)
+  5. rviz2 (optional)
 
 Simulation prerequisites:
   ros2 launch stretch_simulation stretch_mujoco_driver.launch.py use_cameras:=true use_rviz:=false mode:=navigation
@@ -65,18 +67,8 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "detection_params.yaml"),
-            {"use_sim": use_sim, "test_mode": False},
-        ],
-    )
-
-    scene_graph_node = Node(
-        package="stretch_drawer_pipeline",
-        executable="scene_graph_node.py",
-        name="scene_graph_node",
-        output="screen",
-        parameters=[
             os.path.join(config_dir, "scene_graph_params.yaml"),
-            {"use_sim": use_sim},
+            {"use_sim": use_sim, "test_mode": False},
         ],
     )
 
@@ -115,7 +107,6 @@ def generate_launch_description():
         funmap_node,
         exploration_node,
         detection_node,
-        scene_graph_node,
         navigate_node,
         rviz_node,
     ])

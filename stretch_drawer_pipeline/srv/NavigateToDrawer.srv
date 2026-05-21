@@ -1,8 +1,0 @@
-# Request the robot to navigate to and open a drawer
-
-# Which drawer to open (by drawer_id). Empty string = use ranking/closest.
-string drawer_id
----
-# Whether navigation and open succeeded
-bool success
-string message

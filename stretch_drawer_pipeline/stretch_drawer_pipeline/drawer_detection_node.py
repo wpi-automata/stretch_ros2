@@ -67,6 +67,7 @@ from sensor_msgs.msg import CameraInfo, Image as RosImage
 from std_msgs.msg import String, Header, ColorRGBA
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
+from builtin_interfaces.msg import Duration as RosDuration
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 import roslibpy
@@ -80,6 +81,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from logging_utils import setup_file_logging
 from ontologies import DRAWER_CLASSES, HANDLE_CLASSES
 from rosbridge_utils import ThreadedService
+from scene_graph_node import SceneGraphRanker
 
 
 class DetectedDrawer:
@@ -131,6 +133,11 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("device", "cuda")
         self.declare_parameter("nms_iou_threshold", 0.7)
         self.declare_parameter("enclosed_threshold", 0.7)
+        self.declare_parameter("room_type", "kitchen")
+        self.declare_parameter("query", "fork")
+        self.declare_parameter("gnn_checkpoint", "")
+        self.declare_parameter("edge_cutoff", 0.9)
+        self.declare_parameter("gnn_det_min_score", 0.7)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -216,11 +223,8 @@ class DrawerDetectionNode(Node):
         self.close_drawer_pub = self.create_publisher(
             String, "/detection/close_drawer_json", 10
         )
-
-        from stretch_drawer_pipeline.msg import DrawerCleanupList
-        self._cleanup_msg_type = DrawerCleanupList
-        self.drawer_cleanup_pub = self.create_publisher(
-            DrawerCleanupList, "/drawer_cleanup", 10
+        self.scene_graph_marker_pub = self.create_publisher(
+            MarkerArray, "/scene_graph/markers", 10
         )
 
         self.create_subscription(
@@ -251,20 +255,8 @@ class DrawerDetectionNode(Node):
             callback_group=self.cb_group,
         )
 
-        # GNN ranking service (called by scene_graph_node)
-        try:
-            from stretch_drawer_pipeline.srv import SetRankings
-            self.create_service(
-                SetRankings, "/detection/set_rankings",
-                self._set_rankings_callback,
-                callback_group=self.cb_group,
-            )
-            self.get_logger().info("SetRankings service registered")
-        except ImportError:
-            self.get_logger().warn(
-                "SetRankings srv not built yet — "
-                "run colcon build to enable GNN ranking"
-            )
+        # Scene graph ranker (GNN scoring, owned by this node)
+        self.ranker = None
 
         # RefineHandle service (called by navigate_open_node before grasping)
         try:
@@ -315,6 +307,37 @@ class DrawerDetectionNode(Node):
         self.get_logger().info("Loading Detic model...")
         self.detector._load_model()
         self.get_logger().info(f"Detic model loaded on {self.device}")
+
+        # Instantiate the scene graph ranker — shares our Detic detector
+        self.ranker = SceneGraphRanker(
+            logger=self.get_logger(),
+            detector=self.detector,
+            device=self.device,
+            room_type=self.get_parameter("room_type").value,
+            query=self.get_parameter("query").value,
+            checkpoint=self.get_parameter("gnn_checkpoint").value,
+            edge_cutoff=self.get_parameter("edge_cutoff").value,
+            det_min_score=self.get_parameter("gnn_det_min_score").value,
+        )
+        self.ranker.load_models()
+        self.get_logger().info("SceneGraphRanker loaded")
+
+        # Scene graph services (thin wrappers)
+        self.create_service(
+            Trigger, "/scene_graph/build_and_rank",
+            self._scene_graph_build_and_rank_callback,
+            callback_group=self.cb_group,
+        )
+        self.create_service(
+            Trigger, "/scene_graph/get_rankings",
+            self._scene_graph_get_rankings_callback,
+            callback_group=self.cb_group,
+        )
+        self.create_service(
+            Trigger, "/scene_graph/score_now",
+            self._scene_graph_build_and_rank_callback,
+            callback_group=self.cb_group,
+        )
 
         self.create_service(
             Trigger, "/detection/trigger",
@@ -686,28 +709,27 @@ class DrawerDetectionNode(Node):
             self.get_logger().warn(f"rosbridge drawer publish failed: {e}", throttle_duration_sec=10.0)
 
     def _publish_drawer_cleanup(self):
-        from stretch_drawer_pipeline.msg import DrawerCleanupEntry
-        msg = self._cleanup_msg_type()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "odom"
+        """Send drawer handle/center positions to the ranker for dedup."""
+        cleanup_entries = []
         with self.drawers_lock:
             for d in self.drawers:
-                entry = DrawerCleanupEntry()
-                entry.handle_center = Point(
-                    x=float(d.handle_center_world[0]),
-                    y=float(d.handle_center_world[1]),
-                    z=float(d.handle_center_world[2]),
-                )
                 corners = d.drawer_corners_world
                 cx = sum(c[0] for c in corners) / len(corners)
                 cy = sum(c[1] for c in corners) / len(corners)
                 cz = sum(c[2] for c in corners) / len(corners)
-                entry.drawer_center = Point(x=float(cx), y=float(cy), z=float(cz))
-                entry.dedup_distance = self.dedup_handles_distance
-                msg.drawers.append(entry)
-        self.drawer_cleanup_pub.publish(msg)
+                cleanup_entries.append({
+                    "handle_center": np.array([
+                        float(d.handle_center_world[0]),
+                        float(d.handle_center_world[1]),
+                        float(d.handle_center_world[2]),
+                    ]),
+                    "drawer_center": np.array([float(cx), float(cy), float(cz)]),
+                    "dedup_distance": self.dedup_handles_distance,
+                })
+        if self.ranker is not None:
+            self.ranker.handle_cleanup(cleanup_entries)
         self.get_logger().info(
-            f"Published drawer cleanup: {len(msg.drawers)} entries"
+            f"Drawer cleanup: {len(cleanup_entries)} entries"
         )
 
     # ─── Callbacks ────────────────────────────────────────────────────
@@ -750,8 +772,20 @@ class DrawerDetectionNode(Node):
         if msg.data == "complete":
             self.exploring = False
             self._detection_mode = "detecting"
+            if self.ranker is not None and not getattr(self, "_exploration_complete_handled", False):
+                self._exploration_complete_handled = True
+                self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
+                threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
         elif msg.data != "paused_for_detection":
             self.exploring = False
+
+    def _auto_build_and_rank(self):
+        """Auto-triggered when exploration completes. Runs GNN and applies rankings."""
+        ranking = self.ranker.build_and_rank()
+        self._publish_scene_graph_markers()
+        if ranking:
+            n_matched = self._apply_gnn_rankings(ranking)
+            self.get_logger().info(f"Auto GNN ranking: {n_matched} drawers matched")
 
     def _opened_drawers_json_callback(self, msg: String):
         """Handle opened drawer notification from Node 3.
@@ -811,6 +845,7 @@ class DrawerDetectionNode(Node):
                 self.get_logger().warn(
                     f"Items scan attempt {attempt + 1}/3 failed for {drawer_id}, retrying..."
                 )
+                time.sleep(5)
             # All retries failed — send close with no items.
             self.get_logger().warn(
                 f"All detection attempts failed — sending close command with no items for {drawer_id}"
@@ -844,7 +879,8 @@ class DrawerDetectionNode(Node):
         count = self._run_detection()
         self.exploring = False
         response.success = True
-        response.message = f"Detected {count} total drawers"
+        sg_info = f", scene_graph={self.ranker.n_nodes} nodes" if self.ranker else ""
+        response.message = f"Detected {count} total drawers{sg_info}"
         return response
 
     def _rosbridge_trigger_handler(self, request, response):
@@ -858,7 +894,8 @@ class DrawerDetectionNode(Node):
             count = self._run_detection()
             self.exploring = False
             response["success"] = True
-            response["message"] = f"Detected {count} total drawers"
+            sg_info = f", scene_graph={self.ranker.n_nodes} nodes" if self.ranker else ""
+            response["message"] = f"Detected {count} total drawers{sg_info}"
         except Exception as e:
             self.get_logger().error(f"Rosbridge trigger failed: {e}")
             response["success"] = False
@@ -1192,6 +1229,17 @@ class DrawerDetectionNode(Node):
         if self._pending_items_scan:
             self._scan_items(all_detections, rgb, depth, camera_pose, camera_K)
 
+        # Feed the same frame to the scene graph ranker
+        if self.ranker is not None:
+            try:
+                depth_f = depth.astype(np.float32)
+                if depth_f.max() > 100:
+                    depth_f /= 1000.0
+                self.ranker.process_frame(rgb, depth_f, camera_pose, camera_K)
+                self._publish_scene_graph_markers()
+            except Exception as e:
+                self.get_logger().warn(f"Scene graph process_frame failed: {e}")
+
         return self._update_drawers(camera_K, camera_pose, rgb, depth, drawer_bboxes, all_detections, unpaired_handles)
     
     def _scan_items(self, all_detections, rgb, depth, camera_pose, camera_K):
@@ -1220,8 +1268,6 @@ class DrawerDetectionNode(Node):
         # Update distances to robot
         self._update_distances()
 
-        # GNN rankings are applied externally via /detection/set_rankings
-        # (called by scene_graph_node after exploration completes)
 
         # self._save_debug_image(rgb, all_detections, drawer_bboxes)
 
@@ -2055,23 +2101,6 @@ class DrawerDetectionNode(Node):
 
     # ─── GNN ranking integration ────────────────────────────────────
 
-    def _set_rankings_callback(self, request, response):
-        """Receive GNN rankings from scene_graph_node and apply to drawers."""
-        try:
-            rankings = json.loads(request.rankings_json)
-        except json.JSONDecodeError as e:
-            response.success = False
-            response.message = f"Bad JSON: {e}"
-            return response
-
-        n_matched = self._apply_gnn_rankings(rankings)
-        response.success = True
-        response.message = (
-            f"Applied {n_matched} matches from {len(rankings)} GNN containers "
-            f"to {len(self.drawers)} drawers"
-        )
-        return response
-
     def _apply_gnn_rankings(self, gnn_rankings: list) -> int:
         """Match GNN container rankings to detected drawers by spatial proximity.
 
@@ -2149,6 +2178,31 @@ class DrawerDetectionNode(Node):
             )
 
         return n_matched
+
+    # ─── Scene graph service wrappers ─────────────────────────────────
+
+    def _scene_graph_build_and_rank_callback(self, request, response):
+        ranking = self.ranker.build_and_rank()
+        self._publish_scene_graph_markers()
+        if ranking:
+            n_matched = self._apply_gnn_rankings(ranking)
+            response.success = True
+            top = ranking[0]
+            response.message = (
+                f"Scored {len(ranking)} containers, "
+                f"top={top.get('container_type')} ({top.get('score', 0):.3f}), "
+                f"{n_matched} drawers matched"
+            )
+        else:
+            response.success = False
+            response.message = "No containers to score"
+        return response
+
+    def _scene_graph_get_rankings_callback(self, request, response):
+        rankings = self.ranker.get_rankings()
+        response.success = len(rankings) > 0
+        response.message = json.dumps(rankings)
+        return response
 
     def _save_projection_debug(self, rgb, depth, drawer_bbox, handle_bbox):
         debug_dir = Path("/tmp/detic_debug")
@@ -2268,6 +2322,184 @@ class DrawerDetectionNode(Node):
         path = debug_dir / f"items_2d_{drawer_id}_{stamp}.jpg"
         cv2.imwrite(str(path), cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
         self.get_logger().info(f"Items scan 2D debug saved: {path}")
+
+    def _publish_scene_graph_markers(self):
+        """Publish the GNN scene graph as RViz markers.
+
+        Visualises the actual graph that feeds the GNN:
+          - Container nodes (merged ClusteredNodes from the builder)
+          - Room node at the centroid of all containers
+          - room-container edges as lines
+          - Ranked containers (after GNN scoring) as a second layer
+        """
+        if self.ranker is None:
+            return
+        data = self.ranker.get_marker_data()
+        nodes = data["nodes"]
+        rankings = data["rankings"]
+
+        now_stamp = self.get_clock().now().to_msg()
+        ma = MarkerArray()
+
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        delete_marker.header.frame_id = "odom"
+        delete_marker.header.stamp = now_stamp
+        ma.markers.append(delete_marker)
+
+        marker_id = 0
+
+        container_positions = []
+        for node in nodes:
+            p = node.position_3d
+            px, py, pz = p["x"], p["y"], p["z"]
+            container_positions.append((px, py, pz))
+
+            sphere = Marker()
+            sphere.header.frame_id = "odom"
+            sphere.header.stamp = now_stamp
+            sphere.ns = "graph_containers"
+            sphere.id = marker_id
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = px
+            sphere.pose.position.y = py
+            sphere.pose.position.z = pz
+            sphere.pose.orientation.w = 1.0
+            sz = 0.06 + 0.02 * min(node.n_obs, 10)
+            sphere.scale.x = sz
+            sphere.scale.y = sz
+            sphere.scale.z = sz
+            s = min(node.max_score, 1.0)
+            sphere.color = ColorRGBA(r=0.2, g=0.4 + 0.6 * s, b=0.9, a=0.85)
+            sphere.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(sphere)
+            marker_id += 1
+
+            label = Marker()
+            label.header.frame_id = "odom"
+            label.header.stamp = now_stamp
+            label.ns = "graph_labels"
+            label.id = marker_id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = px
+            label.pose.position.y = py
+            label.pose.position.z = pz + 0.12
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.06
+            label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9)
+            label.text = f"{node.node_type} ({node.max_score:.2f})"
+            label.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(label)
+            marker_id += 1
+
+        if container_positions:
+            cx = sum(p[0] for p in container_positions) / len(container_positions)
+            cy = sum(p[1] for p in container_positions) / len(container_positions)
+            cz = sum(p[2] for p in container_positions) / len(container_positions)
+
+            room_sphere = Marker()
+            room_sphere.header.frame_id = "odom"
+            room_sphere.header.stamp = now_stamp
+            room_sphere.ns = "graph_room"
+            room_sphere.id = marker_id
+            room_sphere.type = Marker.SPHERE
+            room_sphere.action = Marker.ADD
+            room_sphere.pose.position.x = cx
+            room_sphere.pose.position.y = cy
+            room_sphere.pose.position.z = cz
+            room_sphere.pose.orientation.w = 1.0
+            room_sphere.scale.x = 0.18
+            room_sphere.scale.y = 0.18
+            room_sphere.scale.z = 0.18
+            room_sphere.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.8)
+            room_sphere.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(room_sphere)
+            marker_id += 1
+
+            room_label = Marker()
+            room_label.header.frame_id = "odom"
+            room_label.header.stamp = now_stamp
+            room_label.ns = "graph_room_label"
+            room_label.id = marker_id
+            room_label.type = Marker.TEXT_VIEW_FACING
+            room_label.action = Marker.ADD
+            room_label.pose.position.x = cx
+            room_label.pose.position.y = cy
+            room_label.pose.position.z = cz + 0.15
+            room_label.pose.orientation.w = 1.0
+            room_label.scale.z = 0.08
+            room_label.color = ColorRGBA(r=1.0, g=0.8, b=0.2, a=1.0)
+            room_label.text = f"room:{data['room_type']}"
+            room_label.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(room_label)
+            marker_id += 1
+
+            edges = Marker()
+            edges.header.frame_id = "odom"
+            edges.header.stamp = now_stamp
+            edges.ns = "graph_edges"
+            edges.id = marker_id
+            edges.type = Marker.LINE_LIST
+            edges.action = Marker.ADD
+            edges.pose.orientation.w = 1.0
+            edges.scale.x = 0.01
+            edges.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.4)
+            edges.lifetime = RosDuration(sec=0, nanosec=0)
+            room_pt = Point(x=cx, y=cy, z=cz)
+            for px, py, pz in container_positions:
+                edges.points.append(room_pt)
+                edges.points.append(Point(x=px, y=py, z=pz))
+            ma.markers.append(edges)
+            marker_id += 1
+
+        for rank in rankings:
+            pos = rank.get("position_3d")
+            if pos is None:
+                continue
+            score = rank.get("score", 0.0)
+
+            sphere = Marker()
+            sphere.header.frame_id = "odom"
+            sphere.header.stamp = now_stamp
+            sphere.ns = "ranked_containers"
+            sphere.id = marker_id
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = pos[0]
+            sphere.pose.position.y = pos[1]
+            sphere.pose.position.z = pos[2] if len(pos) > 2 else 0.5
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = 0.15
+            sphere.scale.y = 0.15
+            sphere.scale.z = 0.15
+            sphere.color = ColorRGBA(
+                r=1.0 - score, g=score, b=0.0, a=0.9
+            )
+            sphere.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(sphere)
+            marker_id += 1
+
+            label = Marker()
+            label.header.frame_id = "odom"
+            label.header.stamp = now_stamp
+            label.ns = "ranked_labels"
+            label.id = marker_id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = pos[0]
+            label.pose.position.y = pos[1]
+            label.pose.position.z = (pos[2] if len(pos) > 2 else 0.5) + 0.15
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.08
+            label.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)
+            label.text = f"{rank.get('container_type', '?')} ({score:.2f})"
+            label.lifetime = RosDuration(sec=0, nanosec=0)
+            ma.markers.append(label)
+            marker_id += 1
+
+        self.scene_graph_marker_pub.publish(ma)
 
     def publish_markers(self):
         """Publish drawer markers in RViz.

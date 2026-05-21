@@ -133,14 +133,12 @@ class ExplorationNode(Node):
             Trigger, "/funmap/trigger_drive_to_scan", callback_group=self.cb_group
         )
 
-        # Detection & scene graph services — DDS for sim, rosbridge for real
+        # Detection service — DDS for sim, rosbridge for real
+        # Scene graph processing is handled internally by drawer_detection_node
         self._ros_client = None
         if self.use_sim:
             self.detection_trigger_client = self.create_client(
                 Trigger, "/detection/trigger", callback_group=self.cb_group
-            )
-            self.scene_graph_frame_client = self.create_client(
-                Trigger, "/scene_graph/process_frame", callback_group=self.cb_group
             )
         else:
             self._ros_client = roslibpy.Ros(
@@ -152,9 +150,6 @@ class ExplorationNode(Node):
             self._ros_client_thread.start()
             self._ws_detection_service = roslibpy.Service(
                 self._ros_client, "/detection/trigger", "std_srvs/srv/Trigger"
-            )
-            self._ws_scene_graph_frame_service = roslibpy.Service(
-                self._ros_client, "/scene_graph/process_frame", "std_srvs/srv/Trigger"
             )
             self.get_logger().info(
                 f"Rosbridge service clients on localhost:{self._rosbridge_port}"
@@ -253,12 +248,8 @@ class ExplorationNode(Node):
                 self.get_logger().info("/detection/trigger available (DDS)")
             else:
                 self.get_logger().warn("/detection/trigger not available (DDS)")
-            if self.scene_graph_frame_client.wait_for_service(timeout_sec=5.0):
-                self.get_logger().info("/scene_graph/process_frame available (DDS)")
-            else:
-                self.get_logger().warn("/scene_graph/process_frame not available (DDS)")
         else:
-            self.get_logger().info("Using rosbridge for detection and scene graph services")
+            self.get_logger().info("Using rosbridge for detection service")
 
         if mode == "funmap":
             self._run_funmap_loop()
@@ -287,16 +278,12 @@ class ExplorationNode(Node):
     # ── Pause-and-detect helper ──────────────────────────────────────
 
     def _pause_for_detection(self):
-        """Pause, trigger detection and scene graph frame processing, then return."""
+        """Pause, trigger detection (includes scene graph processing), then return."""
         self._set_state(ExplorationState.PAUSED_FOR_DETECTION)
 
         det_result = self._call_service("/detection/trigger", timeout_sec=30.0)
         if det_result:
             self.get_logger().info(f"Detection: {det_result.get('message', '')}")
-
-        sg_result = self._call_service("/scene_graph/process_frame", timeout_sec=30.0)
-        if sg_result:
-            self.get_logger().info(f"Scene graph: {sg_result.get('message', '')}")
 
     # ── Mode 1: funmap ───────────────────────────────────────────────
 
@@ -609,12 +596,10 @@ class ExplorationNode(Node):
 
     _DDS_SERVICE_MAP = {
         "/detection/trigger": "detection_trigger_client",
-        "/scene_graph/process_frame": "scene_graph_frame_client",
     }
 
     _WS_SERVICE_MAP = {
         "/detection/trigger": "_ws_detection_service",
-        "/scene_graph/process_frame": "_ws_scene_graph_frame_service",
     }
 
     def _call_service(self, service_name, timeout_sec=30.0):

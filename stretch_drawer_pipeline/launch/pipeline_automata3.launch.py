@@ -1,7 +1,10 @@
-"""GPU workstation (automata-3) pipeline: detection + scene graph.
+"""GPU workstation (automata-3) pipeline: detection + GNN ranking.
 
 Runs on automata-3. Receives camera images from the robot via rosbridge.
 The exploration and navigate nodes run on the robot via pipeline_robot.launch.py.
+
+The scene graph ranker (GNN) is embedded inside drawer_detection_node —
+no separate scene_graph_node process is needed.
 
 Prerequisites — on the robot:
   ros2 launch stretch_core stretch_driver.launch.py
@@ -36,19 +39,8 @@ def generate_launch_description():
         output="screen",
         parameters=[
             os.path.join(config_dir, "detection_params.yaml"),
-            {"use_sim": False, "test_mode": False},
-            {"robot_ip": robot_ip, "robot_port": robot_port},
-        ],
-    )
-
-    scene_graph_node = Node(
-        package="stretch_drawer_pipeline",
-        executable="scene_graph_node.py",
-        name="scene_graph_node",
-        output="screen",
-        parameters=[
             os.path.join(config_dir, "scene_graph_params.yaml"),
-            {"use_sim": False},
+            {"use_sim": False, "test_mode": False},
             {"robot_ip": robot_ip, "robot_port": robot_port},
         ],
     )
@@ -75,6 +67,5 @@ def generate_launch_description():
             description="Launch RViz",
         ),
         detection_node,
-        scene_graph_node,
         rviz_node,
     ])
