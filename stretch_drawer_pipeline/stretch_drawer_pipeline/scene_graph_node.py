@@ -64,7 +64,8 @@ class SceneGraphRanker:
 
     def __init__(self, *, logger, detector, device="cuda",
                  room_type="kitchen", query="fork", checkpoint="",
-                 edge_cutoff=0.9, det_min_score=0.7):
+                 edge_cutoff=0.9, det_min_score=0.7,
+                 rank_type="scene_graph"):
         self._logger = logger
         self._detector = detector
         self.device = device
@@ -73,6 +74,7 @@ class SceneGraphRanker:
         self.checkpoint = checkpoint
         self.edge_cutoff = edge_cutoff
         self.det_min_score = det_min_score
+        self.rank_type = rank_type
 
         # Lazy-loaded models
         self._models_loaded = False
@@ -86,6 +88,7 @@ class SceneGraphRanker:
         self._text_embeddings = None
         self._clip_dim = None
         self._device = device
+        self._clip_text_query = None
 
         # Rankings
         self._rankings = []
@@ -98,7 +101,7 @@ class SceneGraphRanker:
 
         self._logger.info(
             f"SceneGraphRanker created: room={room_type}, query={query}, "
-            f"device={device}"
+            f"device={device}, rank_type={rank_type}"
         )
 
     # ── Model loading ───────────────────────────────────────────────
@@ -114,69 +117,110 @@ class SceneGraphRanker:
         try:
             import torch
             import clip as clip_module
-            from realrobot.voxel_graph_builder import VoxelGraphBuilder
-            from realrobot.inference import load_locked_model
 
             device = self.device
             if device == "cuda" and not torch.cuda.is_available():
                 device = "cpu"
                 self._logger.warn("CUDA not available — falling back to CPU")
 
-            self._logger.info("Loading GNN + CLIP models…")
-
-            checkpoint = self.checkpoint or None
-            self._gnn_model, self._proto_matrix, self._gnn_cfg = load_locked_model(
-                checkpoint, "cpu"
-            )
-            ec = self._gnn_cfg.get("edge_cutoff", self.edge_cutoff)
-            self._logger.info(
-                f"GNN loaded: K={self._gnn_cfg.get('K')}, "
-                f"alpha={self._gnn_cfg.get('alpha')}, ec={ec}"
-            )
+            self._logger.info(f"Loading models (rank_type={self.rank_type})…")
 
             self._clip_model, self._clip_preprocess = clip_module.load(
                 "ViT-B/32", device=device
             )
 
-            from gnn.config import CLIP_DIM, QUERIES
+            from gnn.config import CLIP_DIM
             self._clip_dim = CLIP_DIM
 
-            query_tokens = clip_module.tokenize(
-                [f"a photo of a {q}" for q in QUERIES]
+            query_token = clip_module.tokenize(
+                [f"a photo of a {self.query}"]
             ).to(device)
             with torch.no_grad():
-                qe = self._clip_model.encode_text(query_tokens)
-                qe = qe / qe.norm(dim=-1, keepdim=True)
-            self._query_embeddings = {
-                q: qe[i].float() for i, q in enumerate(QUERIES)
-            }
+                q_emb = self._clip_model.encode_text(query_token).squeeze(0)
+                q_emb = q_emb / q_emb.norm()
+            self._clip_text_query = q_emb.float().cpu()
+            self._logger.info(f"CLIP text query computed for '{self.query}'")
 
-            room_tokens = clip_module.tokenize(
-                [f"a {self.room_type.replace('_', ' ')}"]
-            ).to(device)
-            with torch.no_grad():
-                feat = self._clip_model.encode_text(room_tokens).squeeze(0)
-                feat = feat / feat.norm()
-            self._text_embeddings = {
-                f"room_type:{self.room_type}": feat.cpu()
-            }
+            if self.rank_type == "scene_graph":
+                from realrobot.voxel_graph_builder import VoxelGraphBuilder
+                from realrobot.inference import load_locked_model
+                from gnn.config import QUERIES
 
-            self._builder = VoxelGraphBuilder(
-                scene_id=f"stretch_{self.room_type}",
-                room_type=self.room_type,
-                text_embeddings=self._text_embeddings,
-                device=device,
-                edge_cutoff=ec,
-            )
+                checkpoint = self.checkpoint or None
+                self._gnn_model, self._proto_matrix, self._gnn_cfg = load_locked_model(
+                    checkpoint, "cpu"
+                )
+                ec = self._gnn_cfg.get("edge_cutoff", self.edge_cutoff)
+                self._logger.info(
+                    f"GNN loaded: K={self._gnn_cfg.get('K')}, "
+                    f"alpha={self._gnn_cfg.get('alpha')}, ec={ec}"
+                )
+
+                query_tokens = clip_module.tokenize(
+                    [f"a photo of a {q}" for q in QUERIES]
+                ).to(device)
+                with torch.no_grad():
+                    qe = self._clip_model.encode_text(query_tokens)
+                    qe = qe / qe.norm(dim=-1, keepdim=True)
+                self._query_embeddings = {
+                    q: qe[i].float() for i, q in enumerate(QUERIES)
+                }
+
+                room_tokens = clip_module.tokenize(
+                    [f"a {self.room_type.replace('_', ' ')}"]
+                ).to(device)
+                with torch.no_grad():
+                    feat = self._clip_model.encode_text(room_tokens).squeeze(0)
+                    feat = feat / feat.norm()
+                self._text_embeddings = {
+                    f"room_type:{self.room_type}": feat.cpu()
+                }
+
+                self._builder = VoxelGraphBuilder(
+                    scene_id=f"stretch_{self.room_type}",
+                    room_type=self.room_type,
+                    text_embeddings=self._text_embeddings,
+                    device=device,
+                    edge_cutoff=ec,
+                )
 
             self._device = device
             self._models_loaded = True
-            self._logger.info("GNN + CLIP models loaded")
+            mode_label = "GNN + CLIP" if self.rank_type == "scene_graph" else "CLIP only"
+            self._logger.info(f"{mode_label} models loaded")
             return True
 
         except Exception as e:
             self._logger.error(f"Failed to load models: {e}")
             return False
+
+    # ── CLIP helper methods (used by all rank_type modes) ────────────
+
+    def get_clip_text_query(self):
+        """Return the pre-computed CLIP text embedding for the search query."""
+        self._ensure_models_loaded()
+        return self._clip_text_query
+
+    def get_clip_text_embedding(self, text):
+        """Encode a text string with CLIP and return L2-normalized CPU tensor."""
+        import torch
+        import clip as clip_module
+        self._ensure_models_loaded()
+        tokens = clip_module.tokenize([text]).to(self._device)
+        with torch.no_grad():
+            emb = self._clip_model.encode_text(tokens).squeeze(0)
+            emb = emb / emb.norm()
+        return emb.float().cpu()
+
+    def get_clip_image_embedding(self, pil_image):
+        """Encode a PIL image with CLIP and return L2-normalized CPU tensor."""
+        import torch
+        self._ensure_models_loaded()
+        img_t = self._clip_preprocess(pil_image).unsqueeze(0).to(self._device)
+        with torch.no_grad():
+            emb = self._clip_model.encode_image(img_t).squeeze(0)
+            emb = emb / emb.norm()
+        return emb.float().cpu()
 
     # ── Cleanup (replaces /drawer_cleanup subscription) ─────────────
 
@@ -187,6 +231,8 @@ class SceneGraphRanker:
             drawers: list of dicts with keys handle_center (np.array),
                      drawer_center (np.array), dedup_distance (float).
         """
+        if self.rank_type != "scene_graph":
+            return
         if self._builder is None:
             return
         removed = 0
@@ -238,6 +284,9 @@ class SceneGraphRanker:
         Returns:
             (n_nodes, n_observations) tuple.
         """
+        if self.rank_type != "scene_graph":
+            return (0, 0)
+
         import torch
         from PIL import Image
 
@@ -363,6 +412,9 @@ class SceneGraphRanker:
 
     def build_and_rank(self) -> list:
         """Build scene graph and run GNN. Returns ranking list."""
+        if self.rank_type != "scene_graph":
+            return []
+
         import torch
         from realrobot.inference import score_containers
 
@@ -458,6 +510,14 @@ class SceneGraphRanker:
         Returns dict with keys: container_nodes, landmark_nodes, rankings,
         room_type, edge_cutoff.
         """
+        if self.rank_type != "scene_graph":
+            return {
+                "container_nodes": [],
+                "landmark_nodes": [],
+                "rankings": [],
+                "room_type": self.room_type,
+                "edge_cutoff": 2.0,
+            }
         if self._builder:
             if self._builder._dirty:
                 self._builder._recluster()

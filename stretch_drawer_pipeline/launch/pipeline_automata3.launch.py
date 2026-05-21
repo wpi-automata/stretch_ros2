@@ -31,6 +31,7 @@ def generate_launch_description():
     robot_ip = LaunchConfiguration("robot_ip")
     robot_port = LaunchConfiguration("robot_port")
     launch_rviz = LaunchConfiguration("rviz")
+    rank_type = LaunchConfiguration("rank_type")
 
     detection_node = Node(
         package="stretch_drawer_pipeline",
@@ -42,6 +43,7 @@ def generate_launch_description():
             os.path.join(config_dir, "scene_graph_params.yaml"),
             {"use_sim": False, "test_mode": False},
             {"robot_ip": robot_ip, "robot_port": robot_port},
+            {"rank_type": rank_type},
         ],
     )
 
@@ -65,6 +67,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "rviz", default_value="true",
             description="Launch RViz",
+        ),
+        DeclareLaunchArgument(
+            "rank_type", default_value="scene_graph",
+            description="Ranking mode: scene_graph, clip_text_text, or clip_image_text",
         ),
         detection_node,
         rviz_node,

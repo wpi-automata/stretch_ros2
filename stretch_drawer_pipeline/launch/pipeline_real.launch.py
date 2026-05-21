@@ -25,6 +25,7 @@ def generate_launch_description():
 
     frontier_method = LaunchConfiguration("frontier_method", default="occupancy_grid")
     launch_rviz = LaunchConfiguration("rviz", default="true")
+    rank_type = LaunchConfiguration("rank_type")
 
     mapping_node = Node(
         package="stretch_drawer_pipeline",
@@ -47,6 +48,7 @@ def generate_launch_description():
             os.path.join(config_dir, "detection_params.yaml"),
             {"use_sim": False},
             {"test_mode": False},
+            {"rank_type": rank_type},
         ],
     )
 
@@ -77,6 +79,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "rviz", default_value="true",
             description="Launch RViz with full pipeline visualization"
+        ),
+        DeclareLaunchArgument(
+            "rank_type", default_value="scene_graph",
+            description="Ranking mode: scene_graph, clip_text_text, or clip_image_text",
         ),
         mapping_node,
         detection_node,

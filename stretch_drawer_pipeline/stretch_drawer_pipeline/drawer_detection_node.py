@@ -102,6 +102,7 @@ class DetectedDrawer:
         self.annotated_image = None
         self.confidence = 0.0
         self.observations = 1
+        self.drawer_label = None
 
 
 class DrawerDetectionNode(Node):
@@ -138,6 +139,7 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("gnn_checkpoint", "")
         self.declare_parameter("edge_cutoff", 0.9)
         self.declare_parameter("gnn_det_min_score", 0.7)
+        self.declare_parameter("rank_type", "scene_graph")
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -154,6 +156,9 @@ class DrawerDetectionNode(Node):
         self.detection_rate = self.get_parameter("detection_rate_hz").value
         self.gnn_match_threshold = self.get_parameter("gnn_match_threshold").value
         self.device = self.get_parameter("device").value
+        self.rank_type = self.get_parameter("rank_type").value
+        assert self.rank_type in ("scene_graph", "clip_text_text", "clip_image_text"), \
+            f"Invalid rank_type: {self.rank_type}"
 
         params = {p.name: p.value for p in self.get_parameters(
             [d.name for d in self._parameters.values()]
@@ -318,6 +323,7 @@ class DrawerDetectionNode(Node):
             checkpoint=self.get_parameter("gnn_checkpoint").value,
             edge_cutoff=self.get_parameter("edge_cutoff").value,
             det_min_score=self.get_parameter("gnn_det_min_score").value,
+            rank_type=self.rank_type,
         )
         self.ranker.load_models()
         self.get_logger().info("SceneGraphRanker loaded")
@@ -774,8 +780,12 @@ class DrawerDetectionNode(Node):
             self._detection_mode = "detecting"
             if self.ranker is not None and not getattr(self, "_exploration_complete_handled", False):
                 self._exploration_complete_handled = True
-                self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
-                threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
+                if self.rank_type == "scene_graph":
+                    self.get_logger().info("Exploration complete — auto-triggering GNN scoring")
+                    threading.Thread(target=self._auto_build_and_rank, daemon=True).start()
+                else:
+                    self.get_logger().info(f"Exploration complete — auto-triggering CLIP ranking ({self.rank_type})")
+                    threading.Thread(target=self._clip_rank_drawers, daemon=True).start()
         elif msg.data != "paused_for_detection":
             self.exploring = False
 
@@ -786,6 +796,42 @@ class DrawerDetectionNode(Node):
         if ranking:
             n_matched = self._apply_gnn_rankings(ranking)
             self.get_logger().info(f"Auto GNN ranking: {n_matched} drawers matched")
+
+    def _clip_rank_drawers(self):
+        """Rank drawers using CLIP cosine similarity (clip_text_text or clip_image_text)."""
+        import torch
+        from PIL import Image
+
+        clip_text_query = self.ranker.get_clip_text_query()
+
+        with self.drawers_lock:
+            drawers_snapshot = list(self.drawers)
+
+        for drawer in drawers_snapshot:
+            if self.rank_type == "clip_text_text":
+                if drawer.drawer_label is None:
+                    continue
+                label_emb = self.ranker.get_clip_text_embedding(
+                    f"a photo of a {drawer.drawer_label}"
+                )
+                score = float(torch.dot(label_emb, clip_text_query))
+            elif self.rank_type == "clip_image_text":
+                if drawer.source_image is None:
+                    continue
+                pil_img = Image.fromarray(drawer.source_image)
+                img_emb = self.ranker.get_clip_image_embedding(pil_img)
+                score = float(torch.dot(img_emb, clip_text_query))
+            else:
+                continue
+            drawer.ranking = max(0.0, score)
+
+        with self.drawers_lock:
+            self.drawers.sort(key=lambda d: -d.ranking)
+
+        self.get_logger().info(
+            f"CLIP ranking ({self.rank_type}): "
+            f"{[(d.drawer_id, f'{d.ranking:.3f}') for d in drawers_snapshot]}"
+        )
 
     def _opened_drawers_json_callback(self, msg: String):
         """Handle opened drawer notification from Node 3.
@@ -1229,8 +1275,8 @@ class DrawerDetectionNode(Node):
         if self._pending_items_scan:
             self._scan_items(all_detections, rgb, depth, camera_pose, camera_K)
 
-        # Feed the same frame to the scene graph ranker
-        if self.ranker is not None:
+        # Feed the same frame to the scene graph ranker (scene_graph mode only)
+        if self.rank_type == "scene_graph" and self.ranker is not None:
             try:
                 depth_f = depth.astype(np.float32)
                 if depth_f.max() > 100:
@@ -1251,9 +1297,9 @@ class DrawerDetectionNode(Node):
 
         new_detections = 0
         projected_handles = []
-        for drawer_bbox, handle_bbox, confidence in drawer_bboxes:
+        for drawer_bbox, handle_bbox, confidence, drawer_label in drawer_bboxes:
 
-            drawer = self._create_drawer(projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth)
+            drawer = self._create_drawer(projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth, drawer_label)
 
             if drawer is not None:
                 with self.drawers_lock:
@@ -1282,11 +1328,12 @@ class DrawerDetectionNode(Node):
         if new_detections > 0:
             self._save_debug_image(rgb, all_detections, drawer_bboxes)
             self._publish_drawers_via_rosbridge()
-            self._publish_drawer_cleanup()
+            if self.rank_type == "scene_graph":
+                self._publish_drawer_cleanup()
 
         return len(self.drawers)
     
-    def _create_drawer(self, projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth):
+    def _create_drawer(self, projected_handles, camera_K, camera_pose, rgb, handle_bbox, drawer_bbox, confidence, depth, drawer_label=None):
         # Project handle center to world
             u_center = int((handle_bbox[0] + handle_bbox[2]) / 2)
             v_center = int((handle_bbox[1] + handle_bbox[3]) / 2)
@@ -1362,6 +1409,7 @@ class DrawerDetectionNode(Node):
             drawer.reachable = reachable
             drawer.handle_orientation = orientation
             drawer.confidence = confidence
+            drawer.drawer_label = drawer_label
             drawer.source_image = rgb.copy()
             drawer.annotated_image = self._annotate_image(
                 rgb, drawer_bbox, handle_bbox
@@ -1682,7 +1730,7 @@ class DrawerDetectionNode(Node):
             self.get_logger().info(
                 f"Handle matched to drawer {drawer_bbox} (conf={det.score:.2f}): handle bbox={handle_bbox}"
             )
-            results.append((drawer_bbox, handle_bbox, det.score))
+            results.append((drawer_bbox, handle_bbox, det.score, det.object_type))
 
         unpaired_handles = [
             handle_dets[i].bbox for i in range(len(handle_dets))
@@ -2182,26 +2230,43 @@ class DrawerDetectionNode(Node):
     # ─── Scene graph service wrappers ─────────────────────────────────
 
     def _scene_graph_build_and_rank_callback(self, request, response):
-        ranking = self.ranker.build_and_rank()
-        self._publish_scene_graph_markers()
-        if ranking:
-            n_matched = self._apply_gnn_rankings(ranking)
-            response.success = True
-            top = ranking[0]
-            response.message = (
-                f"Scored {len(ranking)} containers, "
-                f"top={top.get('container_type')} ({top.get('score', 0):.3f}), "
-                f"{n_matched} drawers matched"
-            )
+        if self.rank_type == "scene_graph":
+            ranking = self.ranker.build_and_rank()
+            self._publish_scene_graph_markers()
+            if ranking:
+                n_matched = self._apply_gnn_rankings(ranking)
+                response.success = True
+                top = ranking[0]
+                response.message = (
+                    f"Scored {len(ranking)} containers, "
+                    f"top={top.get('container_type')} ({top.get('score', 0):.3f}), "
+                    f"{n_matched} drawers matched"
+                )
+            else:
+                response.success = False
+                response.message = "No containers to score"
         else:
-            response.success = False
-            response.message = "No containers to score"
+            self._clip_rank_drawers()
+            with self.drawers_lock:
+                ranked = [(d.drawer_id, d.ranking) for d in self.drawers]
+            response.success = len(ranked) > 0
+            response.message = json.dumps(ranked)
         return response
 
     def _scene_graph_get_rankings_callback(self, request, response):
-        rankings = self.ranker.get_rankings()
-        response.success = len(rankings) > 0
-        response.message = json.dumps(rankings)
+        if self.rank_type == "scene_graph":
+            rankings = self.ranker.get_rankings()
+            response.success = len(rankings) > 0
+            response.message = json.dumps(rankings)
+        else:
+            with self.drawers_lock:
+                ranked = [
+                    {"drawer_id": d.drawer_id, "ranking": d.ranking,
+                     "drawer_label": d.drawer_label}
+                    for d in self.drawers
+                ]
+            response.success = len(ranked) > 0
+            response.message = json.dumps(ranked)
         return response
 
     def _save_projection_debug(self, rgb, depth, drawer_bbox, handle_bbox):
@@ -2281,7 +2346,7 @@ class DrawerDetectionNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
         # Draw matched drawer (blue) and handle (green) bboxes on top
-        for drawer_bbox, handle_bbox, _conf in matched_results:
+        for drawer_bbox, handle_bbox, _conf, *_rest in matched_results:
             cv2.rectangle(debug_img, (drawer_bbox[0], drawer_bbox[1]),
                           (drawer_bbox[2], drawer_bbox[3]), (255, 0, 0), 2)
             cv2.rectangle(debug_img, (handle_bbox[0], handle_bbox[1]),

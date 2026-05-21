@@ -21,5 +21,8 @@ drawer_detection_node:
     # GNN ranking match threshold (meters) for spatial matching
     gnn_match_threshold: 0.5
 
+    # Ranking mode: "scene_graph", "clip_text_text", or "clip_image_text"
+    rank_type: "scene_graph"
+
     # Environment
     use_sim: false

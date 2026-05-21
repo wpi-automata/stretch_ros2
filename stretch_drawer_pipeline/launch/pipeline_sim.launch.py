@@ -7,6 +7,8 @@ Then launch this file to start the pipeline.
 """
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -16,6 +18,8 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory("stretch_drawer_pipeline")
     config_dir = os.path.join(pkg_dir, "config")
     rviz_config = os.path.join(pkg_dir, "rviz", "mapping.rviz")
+
+    rank_type = LaunchConfiguration("rank_type")
 
     funmap_node = Node(
         package="stretch_funmap",
@@ -45,6 +49,7 @@ def generate_launch_description():
             os.path.join(config_dir, "detection_params.yaml"),
             {"use_sim": True, "use_sim_time": True},
             {"test_mode": False},
+            {"rank_type": rank_type},
         ],
     )
 
@@ -69,6 +74,10 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "rank_type", default_value="scene_graph",
+            description="Ranking mode: scene_graph, clip_text_text, or clip_image_text",
+        ),
         funmap_node,
         mapping_node,
         detection_node,
