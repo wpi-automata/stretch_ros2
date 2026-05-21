@@ -1,34 +1,24 @@
+import re
+import sys
 from enum import Enum
+from pathlib import Path
+
+_SEMANTIC_ROOT = Path(__file__).resolve().parent.parent.parent / "semantic-object-container-room"
+if str(_SEMANTIC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SEMANTIC_ROOT))
+
+from realrobot.voxel_graph_builder import CONTAINER_TYPES
 
 
-class DrawerClass(str, Enum):
-    DRAWER = "Drawer"
-    CABINET = "Cabinet"
-    CHEST = "Chest"
-    NIGHT_STAND = "NightStand"
-    SIDE_TABLE = "SideTable"
-    BUFFET = "Buffet"
-    CEDAR_CHEST = "CedarChest"
-    CHINA_CABINET = "ChinaCabinet"
-    CREDENZA = "Credenza"
-    CUPBOARD = "Cupboard"
-    AIRING_CUPBOARD = "AiringCupboard"
-    HOPE_CHEST = "HopeChest"
-    HUTCH = "Hutch"
-    LOCKER = "Locker"
-    FOOTLOCKER = "Footlocker"
-    MEDICINE_CHEST = "MedicineChest"
-    PANTRY = "Pantry"
-    SIDEBOARD = "Sideboard"
-    WARDROBE = "Wardrobe"
-    CABINETWORK = "Cabinetwork"
-    DISHWASHER = "Dishwasher"
-    REFRIGERATOR = "Refrigerator"
-    # Not included since they are a set of drawers:
-    # ARMOIRE = "Armoire"
-    # DRESSER = "Dresser"
-    # FILING_CABINET = "FilingCabinet"
-    # CHEST_OF_DRAWERS = "ChestOfDrawers"
+def _camel_to_upper_snake(name):
+    return re.sub(r'(?<=[a-z0-9])([A-Z])', r'_\1', name).upper()
+
+
+DrawerClass = Enum(
+    "DrawerClass",
+    {_camel_to_upper_snake(t): t for t in sorted(CONTAINER_TYPES)},
+    type=str,
+)
 
 
 class HandleClass(str, Enum):
