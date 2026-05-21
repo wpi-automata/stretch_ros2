@@ -96,6 +96,7 @@ class DetectedDrawer:
         self.handle_orientation = "horizontal"
         self.ranking = 0.0
         self.distance_to_robot = float("inf")
+        self.source_image = None
         self.annotated_image = None
         self.confidence = 0.0
         self.observations = 1
@@ -172,6 +173,8 @@ class DrawerDetectionNode(Node):
         self._rgb_mono_stamp = 0.0
         self._depth_mono_stamp = 0.0
         self._pause_stamp = 0.0
+        self._detection_successes = 0
+        self._detection_failures = 0
         # D435i intrinsics — fallback if camera_info topic is unavailable.
         # Original at 1280x720: fx=911.968, fy=911.456, cx=639.360, cy=375.114
         # After ROTATE_90_CLOCKWISE to 720x1280:
@@ -797,18 +800,26 @@ class DrawerDetectionNode(Node):
         )
 
         self._pause_stamp = time.monotonic()
-        self._run_detection()
 
-        # _run_detection is synchronous — if it succeeded, _scan_items cleared
-        # _pending_items_scan and sent the close command. If it's still set,
-        # detection failed, so send close with no items as fallback.
-        if self._pending_items_scan:
+        # Thread shares self — can access _pending_items_scan because only
+        # this callback sets it and _scan_items clears it (sequential flow).
+        def _items_scan_detection():
+            for attempt in range(3):
+                self._run_detection()
+                if not self._pending_items_scan:
+                    return
+                self.get_logger().warn(
+                    f"Items scan attempt {attempt + 1}/3 failed for {drawer_id}, retrying..."
+                )
+            # All retries failed — send close with no items.
             self.get_logger().warn(
-                f"Detection pass failed — sending close command with no items for {drawer_id}"
+                f"All detection attempts failed — sending close command with no items for {drawer_id}"
             )
             self._pending_items_scan = None
             self.drawer_items[drawer_id] = []
             self._send_close_drawer_command(drawer_id)
+
+        threading.Thread(target=_items_scan_detection, daemon=True).start()
 
     # UNUSED!!!
     # def _get_gripper_world_pos(self):
@@ -1128,9 +1139,14 @@ class DrawerDetectionNode(Node):
             time.sleep(0.1)
 
         if self.latest_rgb is None or self.latest_depth is None:
-            self.get_logger().warn("No fresh camera data — skipping detection")
+            self._detection_failures += 1
+            self.get_logger().warn(
+                f"No fresh camera data — skipping detection "
+                f"(successes={self._detection_successes}, failures={self._detection_failures})"
+            )
             return 0
         if self.camera_K is None:
+            self._detection_failures += 1
             self.get_logger().debug("Waiting for camera_info...")
             return 0
 
@@ -1144,8 +1160,10 @@ class DrawerDetectionNode(Node):
                 timeout=rclpy.duration.Duration(seconds=2.0),
             )
         except Exception as e:
+            self._detection_failures += 1
             self.get_logger().error(
-                f"TF lookup FAILED for stamp={stamp} — skipping detection: {e}"
+                f"TF lookup FAILED for stamp={stamp} — skipping detection: {e} "
+                f"(successes={self._detection_successes}, failures={self._detection_failures})"
             )
             return len(self.drawers)
 
@@ -1207,10 +1225,12 @@ class DrawerDetectionNode(Node):
 
         # self._save_debug_image(rgb, all_detections, drawer_bboxes)
 
+        self._detection_successes += 1
         self.get_logger().info(
             f"Detection pass: {new_detections} new | "
             f"{len(self.drawers)} closed | "
-            f"{len(self.interacted_drawers)} opened"
+            f"{len(self.interacted_drawers)} opened | "
+            f"successes={self._detection_successes}, failures={self._detection_failures}"
         )
 
         if new_detections > 0:
@@ -1296,6 +1316,7 @@ class DrawerDetectionNode(Node):
             drawer.reachable = reachable
             drawer.handle_orientation = orientation
             drawer.confidence = confidence
+            drawer.source_image = rgb.copy()
             drawer.annotated_image = self._annotate_image(
                 rgb, drawer_bbox, handle_bbox
             )
