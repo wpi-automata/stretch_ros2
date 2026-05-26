@@ -96,7 +96,7 @@ class DetectedDrawer:
         self.drawer_corners_world = None
         self.reachable = False
         self.handle_orientation = "horizontal"
-        self.ranking = 0.0
+        self.ranking = None
         self.distance_to_robot = float("inf")
         self.source_image = None
         self.annotated_image = None
@@ -140,6 +140,7 @@ class DrawerDetectionNode(Node):
         self.declare_parameter("edge_cutoff", 0.9)
         self.declare_parameter("gnn_det_min_score", 0.7)
         self.declare_parameter("rank_type", "scene_graph")
+        self.declare_parameter("found_threshold", 0.8)
 
         self.detection_confidence = self.get_parameter("detection_confidence").value
         self.enable_dedup = self.get_parameter("enable_dedup").value
@@ -159,6 +160,7 @@ class DrawerDetectionNode(Node):
         self.rank_type = self.get_parameter("rank_type").value
         assert self.rank_type in ("scene_graph", "clip_text_text", "clip_image_text"), \
             f"Invalid rank_type: {self.rank_type}"
+        self.found_threshold = self.get_parameter("found_threshold").value
 
         params = {p.name: p.value for p in self.get_parameters(
             [d.name for d in self._parameters.values()]
@@ -172,6 +174,7 @@ class DrawerDetectionNode(Node):
         self.drawers_lock = threading.Lock()
         self.chosen_drawer_id = None
         self._detection_mode = "detecting"
+        self._object_found = False
         self._pending_items_scan = None
         self.gripper_handle_locations = []
 
@@ -738,6 +741,30 @@ class DrawerDetectionNode(Node):
             f"Drawer cleanup: {len(cleanup_entries)} entries"
         )
 
+    def _push_containers_to_scene_graph(self):
+        """Push deduplicated drawer list to the scene graph as container nodes."""
+        container_list = []
+        with self.drawers_lock:
+            for d in self.drawers:
+                corners = d.drawer_corners_world
+                if corners is None:
+                    continue
+                cx = sum(c[0] for c in corners) / len(corners)
+                cy = sum(c[1] for c in corners) / len(corners)
+                cz = sum(c[2] for c in corners) / len(corners)
+                container_list.append({
+                    "instance_id": d.drawer_id,
+                    "obj_type": d.drawer_label or "Drawer",
+                    "position_3d": np.array([cx, cy, cz]),
+                    "source_image": d.source_image,
+                    "drawer_bbox": d.drawer_bbox,
+                    "score": d.confidence,
+                })
+        try:
+            self.ranker.update_containers(container_list)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to push containers to scene graph: {e}")
+
     # ─── Callbacks ────────────────────────────────────────────────────
 
     def _rgb_dds_callback(self, msg: RosImage):
@@ -796,6 +823,7 @@ class DrawerDetectionNode(Node):
         if ranking:
             n_matched = self._apply_gnn_rankings(ranking)
             self.get_logger().info(f"Auto GNN ranking: {n_matched} drawers matched")
+        self._check_scene_graph_for_query()
 
     def _clip_rank_drawers(self):
         """Rank drawers using CLIP cosine similarity (clip_text_text or clip_image_text)."""
@@ -823,15 +851,28 @@ class DrawerDetectionNode(Node):
                 score = float(torch.dot(img_emb, clip_text_query))
             else:
                 continue
-            drawer.ranking = max(0.0, score)
-
-        with self.drawers_lock:
-            self.drawers.sort(key=lambda d: -d.ranking)
+            drawer.ranking = score
 
         self.get_logger().info(
             f"CLIP ranking ({self.rank_type}): "
-            f"{[(d.drawer_id, f'{d.ranking:.3f}') for d in drawers_snapshot]}"
+            f"{[(d.drawer_id, f'{d.ranking:.3f}') for d in drawers_snapshot if d.ranking is not None]}"
         )
+        self._check_scene_graph_for_query()
+
+    def _check_scene_graph_for_query(self):
+        """Check if query object is already visible in the scene graph."""
+        if self._object_found or self.ranker is None:
+            return
+        match = self.ranker.check_labels_against_query(self.found_threshold)
+        if match:
+            label, score = match
+            self._object_found = True
+            query = self.get_parameter("query").value
+            self.get_logger().info(
+                f"FOUND '{query}' as '{label}' in scene graph "
+                f"(cosine_sim={score:.3f} > {self.found_threshold}). "
+                f"No need to open drawers."
+            )
 
     def _opened_drawers_json_callback(self, msg: String):
         """Handle opened drawer notification from Node 3.
@@ -1102,11 +1143,13 @@ class DrawerDetectionNode(Node):
 
             reachable = [d for d in self.drawers if d.reachable]
             candidates = reachable if reachable else self.drawers
-
-            candidates.sort(
-                key=lambda d: (-d.ranking, -d.confidence, d.distance_to_robot)
-            )
-            chosen = candidates[0]
+            scored = [d for d in candidates if d.ranking is not None]
+            if not scored:
+                response.success = False
+                response.message = "No drawers have been ranked yet"
+                return response
+            scored.sort(key=lambda d: d.ranking, reverse=True)
+            chosen = scored[0]
             self.chosen_drawer_id = chosen.drawer_id
 
         self._publish_chosen_marker(chosen)
@@ -1328,7 +1371,8 @@ class DrawerDetectionNode(Node):
         if new_detections > 0:
             self._save_debug_image(rgb, all_detections, drawer_bboxes)
             self._publish_drawers_via_rosbridge()
-            if self.rank_type == "scene_graph":
+            if self.rank_type == "scene_graph" and self.ranker is not None:
+                self._push_containers_to_scene_graph()
                 self._publish_drawer_cleanup()
 
         return len(self.drawers)
@@ -1628,6 +1672,17 @@ class DrawerDetectionNode(Node):
         )
         self._save_items_scan_debug_2d(rgb, all_detections, hull, items, drawer_id)
 
+        if items and not self._object_found and self.ranker is not None:
+            match = self.ranker.check_items_against_query(items, self.found_threshold)
+            if match:
+                label, score = match
+                self._object_found = True
+                query = self.get_parameter("query").value
+                self.get_logger().info(
+                    f"FOUND '{query}' as '{label}' in drawer {drawer_id} "
+                    f"(cosine_sim={score:.3f} > {self.found_threshold})"
+                )
+
         self._send_close_drawer_command(drawer_id)
 
     def _send_close_drawer_command(self, drawer_id):
@@ -1644,6 +1699,7 @@ class DrawerDetectionNode(Node):
             "pull_distance": interacted.get("pull_distance", 0.0),
             "reachable": interacted.get("reachable", True),
             "items": self.drawer_items.get(drawer_id, []),
+            "object_found": self._object_found,
         }
 
         if close_data["opened_handle"] is None:
@@ -2195,11 +2251,11 @@ class DrawerDetectionNode(Node):
 
             unmatched_drawers = [
                 d.drawer_id for d in self.drawers
-                if d.handle_center_world is not None and d.ranking == 0.0
+                if d.handle_center_world is not None and d.ranking is None
             ]
             if unmatched_drawers:
                 self.get_logger().info(
-                    f"Unmatched drawers (ranking=0): {unmatched_drawers}"
+                    f"Unmatched drawers (no GNN match): {unmatched_drawers}"
                 )
 
         matched_gnn_types = set()
@@ -2248,7 +2304,7 @@ class DrawerDetectionNode(Node):
         else:
             self._clip_rank_drawers()
             with self.drawers_lock:
-                ranked = [(d.drawer_id, d.ranking) for d in self.drawers]
+                ranked = [(d.drawer_id, d.ranking) for d in self.drawers if d.ranking is not None]
             response.success = len(ranked) > 0
             response.message = json.dumps(ranked)
         return response
@@ -2263,7 +2319,7 @@ class DrawerDetectionNode(Node):
                 ranked = [
                     {"drawer_id": d.drawer_id, "ranking": d.ranking,
                      "drawer_label": d.drawer_label}
-                    for d in self.drawers
+                    for d in self.drawers if d.ranking is not None
                 ]
             response.success = len(ranked) > 0
             response.message = json.dumps(ranked)
@@ -2561,16 +2617,18 @@ class DrawerDetectionNode(Node):
                 ma.markers.append(spatial_edges)
                 marker_id += 1
 
-        for rank in rankings:
-            pos = rank.get("position_3d")
-            if pos is None:
-                continue
+        ranked_with_pos = [(i, r) for i, r in enumerate(rankings) if r.get("position_3d") is not None]
+        n_ranked = len(ranked_with_pos)
+
+        for idx, (i, rank) in enumerate(ranked_with_pos):
+            pos = rank["position_3d"]
             score = rank.get("score", 0.0)
+            t = 1.0 - idx / max(n_ranked - 1, 1)
             px = pos[0]
             py = pos[1]
             pz = pos[2] if len(pos) > 2 else 0.5
             _make_sphere("ranked_containers", px, py, pz, 0.15,
-                         ColorRGBA(r=1.0 - score, g=score, b=0.0, a=0.9))
+                         ColorRGBA(r=1.0 - t, g=t, b=0.0, a=0.9))
             _make_label("ranked_labels", px, py, pz + 0.15,
                         f"{rank.get('container_type', '?')} ({score:.2f})",
                         ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0))

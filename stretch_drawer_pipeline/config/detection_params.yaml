@@ -24,5 +24,8 @@ drawer_detection_node:
     # Ranking mode: "scene_graph", "clip_text_text", or "clip_image_text"
     rank_type: "scene_graph"
 
+    # CLIP cosine similarity threshold to declare the query object found
+    found_threshold: 0.8
+
     # Environment
     use_sim: false

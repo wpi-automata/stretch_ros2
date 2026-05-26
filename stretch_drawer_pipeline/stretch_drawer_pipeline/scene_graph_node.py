@@ -270,6 +270,64 @@ class SceneGraphRanker:
                 f"Handle cleanup: removed {removed} handle node(s) from scene graph"
             )
 
+    # ── Container injection from drawer detection node ───────────────
+
+    def update_containers(self, containers):
+        """Replace scene graph container nodes from the drawer detection node's list.
+
+        Args:
+            containers: list of dicts with keys:
+                instance_id, obj_type, position_3d (np.ndarray),
+                source_image (HxWx3 uint8 or None), drawer_bbox ([x0,y0,x1,y1]),
+                score (float)
+        """
+        if not self._ensure_models_loaded():
+            return
+
+        import torch
+        from PIL import Image
+
+        built = []
+        for c in containers:
+            clip_emb = None
+            scene_clip = None
+            crop_area = 0.0
+
+            bbox = c.get("drawer_bbox")
+            src = c.get("source_image")
+            if bbox is not None and src is not None:
+                x0, y0, x1, y1 = bbox
+                crop_area = (x1 - x0) * (y1 - y0)
+                crop = src[y0:y1, x0:x1]
+                if crop.size > 0:
+                    pil_crop = Image.fromarray(crop)
+                    img_t = self._clip_preprocess(pil_crop).unsqueeze(0).to(self._device)
+                    with torch.no_grad():
+                        clip_emb = self._clip_model.encode_image(img_t).squeeze(0)
+                        clip_emb = (clip_emb / clip_emb.norm()).cpu()
+
+                pil_frame = Image.fromarray(src)
+                frame_t = self._clip_preprocess(pil_frame).unsqueeze(0).to(self._device)
+                with torch.no_grad():
+                    scene_clip = self._clip_model.encode_image(frame_t).squeeze(0)
+                    scene_clip = (scene_clip / scene_clip.norm()).cpu()
+
+            built.append({
+                "instance_id": c["instance_id"],
+                "obj_type": c["obj_type"],
+                "position_3d": c["position_3d"],
+                "clip_embedding": clip_emb,
+                "scene_frame_clip": scene_clip,
+                "crop_area": crop_area,
+                "score": c.get("score", 0.0),
+            })
+
+        self._ensure_type_text_embeddings([c["obj_type"] for c in containers])
+        self._builder.set_containers(built)
+        self._logger.info(
+            f"Containers updated from drawer list: {len(built)} containers"
+        )
+
     # ── Per-frame processing ────────────────────────────────────────
 
     def process_frame(self, rgb, depth, camera_pose, camera_K):
@@ -407,6 +465,50 @@ class SceneGraphRanker:
             embs = embs / embs.norm(dim=-1, keepdim=True)
         for i, key in enumerate(new_keys):
             self._text_embeddings[key] = embs[i].float().cpu()
+
+    # ── Query matching ─────────────────────────────────────────────
+
+    def check_labels_against_query(self, threshold=0.8):
+        """Check if any scene graph landmark label matches the query.
+
+        Returns (label, score) for the first match above threshold, or None.
+        """
+        import torch
+        if not self._ensure_models_loaded():
+            return None
+        if self._builder is None:
+            return None
+        if self._builder._dirty:
+            self._builder._recluster()
+        seen = set()
+        for node in self._builder.landmark_nodes.values():
+            if node.node_type in seen:
+                continue
+            seen.add(node.node_type)
+            label_emb = self.get_clip_text_embedding(node.node_type)
+            score = float(torch.dot(label_emb, self._clip_text_query))
+            if score > threshold:
+                return (node.node_type, score)
+        return None
+
+    def check_items_against_query(self, items, threshold=0.8):
+        """Check if any item label matches the query.
+
+        Args:
+            items: list of dicts with 'label' key
+            threshold: cosine similarity threshold
+
+        Returns (label, score) for the first match above threshold, or None.
+        """
+        import torch
+        if not self._ensure_models_loaded():
+            return None
+        for item in items:
+            item_emb = self.get_clip_text_embedding(item["label"])
+            score = float(torch.dot(item_emb, self._clip_text_query))
+            if score > threshold:
+                return (item["label"], score)
+        return None
 
     # ── GNN scoring ──────────────────────────────────────────────────
 

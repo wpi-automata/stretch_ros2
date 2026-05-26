@@ -571,7 +571,12 @@ class NavigateOpenNode(Node):
         handle_pos_d = data.get("opened_handle")
         items = data.get("items", [])
 
-        if items:
+        object_found = data.get("object_found", False)
+        if object_found and items:
+            labels = [i["label"] for i in items]
+            unique = list(dict.fromkeys(labels))
+            self._speak(f"I found the target object as {unique[0]} in the drawer. Closing the drawer now.")
+        elif items:
             labels = [i["label"] for i in items]
             unique = list(dict.fromkeys(labels))
             self._speak(f"I found {', '.join(unique)} in the drawer. Closing the drawer now.")
@@ -645,8 +650,13 @@ class NavigateOpenNode(Node):
         x, y, z = handle_pos[0], handle_pos[1], handle_pos[2]
         drawer_id = data.get("drawer_id", "?")
         items = data.get("items", [])
+        object_found = data.get("object_found", False)
 
-        if items:
+        if object_found and items:
+            labels = [i["label"] for i in items]
+            unique = list(dict.fromkeys(labels))
+            self._speak(f"I found the target object as {unique[0]} in the drawer.")
+        elif items:
             labels = [i["label"] for i in items]
             unique = list(dict.fromkeys(labels))
             self._speak(f"I found {', '.join(unique)} in the drawer.")
